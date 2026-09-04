@@ -168,14 +168,20 @@ tasks.withType<Test>().configureEach {
     }
 }
 
-// Dev-only single-bucket build harness (see graph-build-cli.kt): runs the
-// SAME pipeline the device's :graph service runs, under a heap the caller
+// Dev/CI bucket build harness (see graph-build-cli.kt): runs the SAME
+// pipeline the device's :graph service runs, under a heap the caller
 // controls — the default matches a typical Android largeHeap cap, so a green
-// run proves the on-device build fits.
+// run proves the on-device build fits. `-Pbucket=all` + `-Pzip=<file>`
+// builds every bucket in the archive's bbox and mints the prebuilt routing
+// ZIP the CI's `routing` job uploads (the app installs it via
+// adoptPrebuiltSegments and routing needs no on-device build).
 //
 //   ./gradlew :app:graphBuildCli \
 //     -Parchive=$HOME/atlas-prototype/tmp/australia.pmtiles \
 //     -Pbucket=140,-40 -Pout=/tmp/atlas-segments [-Pheap=576m]
+//   ./gradlew :app:graphBuildCli \
+//     -Parchive=out/atlas-australia.pmtiles -Pbucket=all \
+//     -Pout=out/segments -Pzip=out/atlas-australia-routing.zip -Pheap=4g
 // Dev-only route check over a built segments dir (see graph-route-cli.kt):
 // proves the .rd5 the device's :graph service produces is routable through
 // the stock engine. M5 acceptance: Melbourne CBD -> Geelong, car profile.
@@ -211,9 +217,10 @@ tasks.register<JavaExec>("graphRouteCli") {
 val graph_build_archive = providers.gradleProperty("archive")
 val graph_build_bucket = providers.gradleProperty("bucket").orElse("140,-40")
 val graph_build_out = providers.gradleProperty("out").orElse("/tmp/atlas-segments")
+val graph_build_zip = providers.gradleProperty("zip")
 tasks.register<JavaExec>("graphBuildCli") {
     group = "atlas-dev"
-    description = "Build one 5-degree bucket from a PMTiles archive under a bounded heap"
+    description = "Build one (or -Pbucket=all: every) 5-degree bucket from a PMTiles archive under a bounded heap"
     // AGP 9 registers the unit-test tasks only after this script evaluates,
     // so the test classpath and args are resolved lazily in doFirst.
     dependsOn("compileDebugUnitTestKotlin")
@@ -223,13 +230,13 @@ tasks.register<JavaExec>("graphBuildCli") {
     maxHeapSize = providers.gradleProperty("heap").orElse("576m").get()
     doFirst {
         classpath = tasks.named<Test>("testDebugUnitTest").get().classpath
-        val (lon_min, lat_min) = graph_build_bucket.get().split(",").map { it.trim() }
         args(
             graph_build_archive.orNull ?: error("-Parchive=<pmtiles path> is required"),
-            lon_min,
-            lat_min,
+            graph_build_bucket.get(),
             graph_build_out.get(),
         )
+        // Optional: bundle the built segments as the adoptable routing ZIP.
+        graph_build_zip.orNull?.let { args(it) }
     }
 }
 

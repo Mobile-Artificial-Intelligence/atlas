@@ -49,6 +49,7 @@ fun SettingsScreen(
     onToggleTtsMute: () -> Unit,
     onDismiss: () -> Unit,
     onReplaceArchive: (uri: android.net.Uri) -> Unit,
+    onInstallRoutingData: (uri: android.net.Uri) -> Unit,
     onPrepareAllRoutingData: () -> Unit,
     onRebuildRoutingData: () -> Unit,
     onRebuildSearchIndex: () -> Unit,
@@ -66,6 +67,12 @@ fun SettingsScreen(
     val archive_launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) onReplaceArchive(uri) }
+
+    // Same story for the routing ZIP: no registered MIME type for a file
+    // the user side-loads from a CI artifact download.
+    val routing_launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onInstallRoutingData(uri) }
 
     Surface(
         // pointerInput with an empty body is deliberate: Compose hit-testing
@@ -117,10 +124,26 @@ fun SettingsScreen(
                     HorizontalDivider(Modifier.padding(vertical = 12.dp))
                     SettingsSectionLabel("Routing data")
                     Text(
-                        "Routes are prepared per region on this device. " +
-                            "\"Prepare all\" builds every region the archive covers — " +
-                            "for a country-sized archive that is hours of background work.",
+                        "Routing data can be prepared on this device, or installed " +
+                            "from a prebuilt routing ZIP — the file published alongside " +
+                            "your map archive. Installing it makes routing ready " +
+                            "instantly: no background build. The ZIP must come from the " +
+                            "same download as the archive; Atlas refuses a mismatched pair.",
                         style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedButton(
+                        onClick = { routing_launcher.launch(arrayOf("*/*")) },
+                        modifier = Modifier.padding(top = 8.dp),
+                    ) {
+                        Text("Install routing data")
+                    }
+                    Text(
+                        "Without a routing ZIP, routes are prepared per region on " +
+                            "this device. \"Prepare all\" builds every region the " +
+                            "archive covers — for a country-sized archive that is " +
+                            "hours of background work.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(top = 12.dp),
                     )
                     OutlinedButton(
                         onClick = onPrepareAllRoutingData,

@@ -198,6 +198,16 @@ class GraphBuildService : Service() {
         sawBuildWork = false
         cancelRequested = false
         wakeLock.acquire(WAKE_LOCK_SLICE_MS)
+        // The first status write happens HERE, synchronously, not at the
+        // run coroutine's first progress tick: between intent delivery and
+        // that tick (cold :graph process start, archive open, bucket
+        // enumeration) the status file still holds the PREVIOUS run's
+        // terminal state, and a concurrent reader — installRoutingData's
+        // stop-the-build handshake, router-gateway's bucket poll — would
+        // conclude nothing is running and race the very build it is trying
+        // to avoid. bucket=null renders as the banner's neutral "reading
+        // the map archive…". A tiny main-thread file write, once per run.
+        reportStatus(running = true, bucket = null, built = 0, total = 0, error = null)
         runJob = scope.launch {
             // Heartbeat: the old single 6h wake lock could expire mid-build
             // for a long buildAll, so the lock is held in 10-minute slices

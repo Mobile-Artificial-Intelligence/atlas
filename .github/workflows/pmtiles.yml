@@ -22,7 +22,17 @@ name: PMTiles
 # per-source files, no countrywide) carry no address layer — search there
 # stays place/POI.
 #
-# The trailing `summarize` job indexes every artifact the run produced into
+# The trailing `routing` job replays the app's own graph build over each
+# finished archive — every 5° bucket the bbox touches, via the same
+# graphBuildCli Gradle task that proves the device heap — and uploads
+# `atlas-routing-<country>.zip` alongside the map archive. Installing that
+# ZIP in the app (Settings → Install routing data, which runs
+# adoptPrebuiltSegments) gives instant routing: no ~50-minute on-device
+# build. The ZIP's manifest pins the archive fingerprint, so a ZIP only
+# adopts against the archive from the same run — the two artifacts are a
+# pair.
+#
+# The final `summarize` job indexes every artifact the run produced into
 # the run's Summary tab (name, size, download link).
 #
 # Hosted-runner reality check (2026-09 calibration: 0.9 GB australia pbf ->
@@ -276,10 +286,109 @@ jobs:
           path: out/atlas-${{ matrix.country }}.pmtiles
           if-no-files-found: error
 
+  # Prebuilt routing ZIPs: the SAME graph-build pipeline the app's :graph
+  # service runs, executed over the archive the `countries` job just built
+  # — one .rd5 per 5-degree bucket, plus the manifest (archive fingerprint
+  # + the buckets that scanned empty) that adoptPrebuiltSegments checks
+  # before installing. Runs even when a sibling country failed (fail-fast
+  # false, if: always()): each leg only needs ITS country's archive.
+  routing:
+    needs: [select, countries]
+    # always() keeps each leg running when a sibling country failed, but a
+    # failed select job leaves its countries output empty and fromJSON('')
+    # would error the matrix — skip instead.
+    if: always() && needs.select.result == 'success'
+    name: routing-${{ matrix.country }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        country: ${{ fromJSON(needs.select.outputs.countries) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          # Keep the preinstalled Android SDK — gradle compiles the app's
+          # unit-test sources (graphBuildCli's classpath) and AGP needs it.
+          # The .NET/Haskell toolchains are dead weight here; the segments
+          # output plus a multi-GB archive is the disk-tight case.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+          df -h /
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;36.0.0" > /dev/null
+
+      - name: Download PMTiles artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: atlas-pmtiles-${{ matrix.country }}
+          path: pmtiles
+
+      # The paths must be $GITHUB_WORKSPACE-absolute: the graphBuildCli
+      # JavaExec's working dir is the :app module dir (the CLI's profiles2
+      # lookup depends on that cwd), so a relative -Parchive would resolve
+      # against app/ and never find the downloaded archive.
+      #
+      # -Pbucket=all walks the archive's bbox; each finished bucket leaves a
+      # .rd5 (or .empty marker), so a retry over a PERSISTENT out dir — a
+      # local CLI run or a self-hosted runner — only pays for the buckets it
+      # never reached. A hosted retry starts with an empty workspace and
+      # rebuilds from scratch.
+      - name: Build routing buckets
+        env:
+          COUNTRY: ${{ matrix.country }}
+        run: |
+          ./gradlew :app:graphBuildCli \
+            -Parchive="$GITHUB_WORKSPACE/pmtiles/atlas-$COUNTRY.pmtiles" \
+            -Pbucket=all \
+            -Pout="$GITHUB_WORKSPACE/out/segments" \
+            -Pzip="$GITHUB_WORKSPACE/out/atlas-$COUNTRY-routing.zip" \
+            -Pheap=4g
+
+      - name: Upload routing ZIP
+        env:
+          COUNTRY: ${{ matrix.country }}
+        run: |
+          # End-to-end proof the ZIP is adoptable: the manifest names this
+          # very archive and its bucket list parses.
+          unzip -p "out/atlas-$COUNTRY-routing.zip" manifest.json
+          unzip -l "out/atlas-$COUNTRY-routing.zip" | tail -3
+
+      - name: Upload routing artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-routing-${{ matrix.country }}
+          # The .rd5 segments are dense binary; storing beats re-deflating.
+          compression-level: 0
+          retention-days: 7
+          path: out/atlas-${{ matrix.country }}-routing.zip
+          if-no-files-found: error
+
   # The artifact sidebar is buried on the run page; put every artifact the
   # run produced (name, size, download link) in the run's Summary tab.
   summarize:
-    needs: countries
+    needs: [countries, routing]
     if: always()
     name: artifact summary
     runs-on: ubuntu-latest

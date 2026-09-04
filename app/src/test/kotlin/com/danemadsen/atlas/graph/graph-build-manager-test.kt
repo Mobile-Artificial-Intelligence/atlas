@@ -86,13 +86,22 @@ class GraphBuildManagerTest {
 
         // -- prebuilt routing-data adoption: the production import path.
         //    The E140_S40 rd5 captured above (before the wipe) comes back
-        //    through a ZIP and must land as an already-built bucket. --
+        //    through a ZIP and must land as an already-built bucket. The
+        //    manifest (the CI ZIP's fingerprint gate) carries a matching
+        //    fingerprint plus one empty bucket, which must be recorded
+        //    built — that is what stops the location trigger from
+        //    re-scanning ocean a CI build already scanned. --
         val zip_bytes = zipOf(
             "E140_S40.rd5" to built_rd5_bytes,
             "lookups.dat" to File(profiles, "lookups.dat").readBytes(),
+            "manifest.json" to renderRoutingManifest(
+                archiveFingerprintOf(archive),
+                emptyBuckets = listOf("E145_S40"),
+            ).toByteArray(),
         )
         val adoption = manager.adoptPrebuiltSegments(zip_bytes.inputStream())
         assertEquals(listOf("E140_S40"), adoption.buckets)
+        assertEquals(listOf("E145_S40"), adoption.emptyBuckets)
         assertTrue(adoption.replacedLookups)
         assertTrue(File(segments, "E140_S40.rd5").isFile, "adopted rd5 missing")
         assertEquals(
@@ -100,13 +109,29 @@ class GraphBuildManagerTest {
             manager.bucketState("E140_S40")?.rd5,
             "adopted bucket not recorded as built",
         )
+        assertNull(
+            manager.bucketState("E145_S40")?.rd5,
+            "manifest empty bucket not recorded with rd5: null",
+        )
+        assertTrue("E145_S40" in manager.builtBuckets(), "manifest empty bucket not recorded built")
         // The ocean bucket's record survived alongside the adoption, and a
-        // route-triggering ensure over the adopted area is a no-op.
+        // route-triggering ensure over the adopted area is a no-op — it
+        // returns every bucket now recorded built, which includes the
+        // manifest's empty one.
         assertNull(manager.bucketState("E140_S45")?.rd5, "adoption clobbered the empty-bucket record")
         assertEquals(
-            setOf("E140_S40", "E140_S45"),
+            setOf("E140_S40", "E140_S45", "E145_S40"),
             manager.ensureBucketsFor(144.9, -37.8),
         )
+
+        // -- a hand-made ZIP with NO manifest keeps the documented
+        //    trust-the-user path: same segments, no gate, no empties. --
+        val no_manifest = manager.adoptPrebuiltSegments(zipOf(
+            "E140_S40.rd5" to built_rd5_bytes,
+            "lookups.dat" to File(profiles, "lookups.dat").readBytes(),
+        ).inputStream())
+        assertEquals(listOf("E140_S40"), no_manifest.buckets)
+        assertTrue(no_manifest.emptyBuckets.isEmpty(), "manifest-less ZIP invented empty buckets")
 
         root.deleteRecursively()
     }
@@ -143,9 +168,16 @@ class GraphBuildManagerTest {
             assertTrue(segments.listFiles().isNullOrEmpty(), "rejected adoption left files behind")
             assertTrue(manager.builtBuckets().isEmpty(), "rejected adoption left state behind")
 
-            // a corner that is not a multiple of 5 is not a bucket
+            // a corner that is not a multiple of 5 is not a bucket — the
+            // message pins THIS gate: the garbage bytes would also fail
+            // the later integrity check, so isFailure alone is masked.
             val bad_corner = adopt(zipOf("E142_S40.rd5" to ByteArray(100)))
             assertTrue(bad_corner.isFailure, "non-5-degree corner accepted")
+            assertTrue(
+                "E142_S40 is not a 5-degree bucket corner" in
+                    (bad_corner.exceptionOrNull()?.message ?: ""),
+                "corner gate did not produce the actionable message",
+            )
 
             // mismatched lookups.dat: refused before anything is touched
             val mismatched = adopt(zipOf(
@@ -161,6 +193,113 @@ class GraphBuildManagerTest {
             // no .rd5 entries at all
             val empty = adopt(zipOf("readme.txt" to "hello".toByteArray()))
             assertTrue(empty.isFailure, "zip without segments accepted")
+
+            root.deleteRecursively()
+        }
+    }
+
+    /**
+     * The manifest gate — the reason a CI-built routing ZIP cannot mix
+     * archives. The manifest's fingerprint must match THIS archive (the
+     * actionable refusal, not a route-time surprise), its bucket list must
+     * be sane, and a manifest-only ZIP (every bucket scanned empty: an
+     * island-only archive) is a legitimate install that records its empties
+     * without touching any file.
+     */
+    @Test
+    fun adoptionManifestGate() {
+        runBlocking {
+            val root = createTempDirectory("atlas-manager-manifest-").toFile()
+            val profiles = findProfileDir()
+            val segments = File(root, "segments").apply { mkdirs() }
+            val archive = File(root, "atlas.pmtiles").apply { writeBytes(ByteArray(1024)) }
+            val manager = GraphBuildManager(
+                archiveFile = archive,
+                segmentsDir = segments,
+                workRoot = File(root, "work"),
+                assetsDir = profiles,
+            )
+            val fingerprint = archiveFingerprintOf(archive)
+            suspend fun adopt(bytes: ByteArray) =
+                runCatching { manager.adoptPrebuiltSegments(bytes.inputStream()) }
+            fun manifestBytes(fingerprint: String, empty: List<String>) =
+                renderRoutingManifest(fingerprint, empty).toByteArray()
+
+            // fingerprint for a different archive: the actionable refusal
+            val wrong_archive = adopt(zipOf(
+                "E140_S40.rd5" to ByteArray(50_000),
+                "manifest.json" to manifestBytes("f".repeat(64), listOf("E145_S40")),
+            ))
+            assertTrue(wrong_archive.isFailure, "manifest for another archive accepted")
+            val wrong_message = wrong_archive.exceptionOrNull()?.message ?: ""
+            assertTrue(
+                "different map archive" in wrong_message,
+                "fingerprint mismatch is not user-actionable: $wrong_message",
+            )
+            assertTrue(segments.listFiles().isNullOrEmpty(), "refused adoption left files behind")
+            assertTrue(manager.builtBuckets().isEmpty(), "refused adoption left state behind")
+
+            // a manifest without a fingerprint, or with a malformed one
+            val no_fingerprint = adopt(zipOf(
+                "manifest.json" to "{\"format\":1,\"empty\":[]}".toByteArray(),
+            ))
+            assertTrue(no_fingerprint.isFailure, "manifest without a fingerprint accepted")
+            assertTrue(
+                "manifest" in (no_fingerprint.exceptionOrNull()?.message ?: ""),
+                "missing-fingerprint message is not user-actionable",
+            )
+            val short_fingerprint = adopt(zipOf(
+                "manifest.json" to manifestBytes("deadbeef", emptyList()),
+            ))
+            assertTrue(short_fingerprint.isFailure, "short manifest fingerprint accepted")
+
+            // an empty bucket that also carries a segment: a broken ZIP
+            val both = adopt(zipOf(
+                "E140_S40.rd5" to ByteArray(50_000),
+                "manifest.json" to manifestBytes(fingerprint, listOf("E140_S40")),
+            ))
+            assertTrue(both.isFailure, "empty bucket listed alongside its own segment accepted")
+
+            // an empty-bucket name that is not a 5-degree corner
+            val bad_corner = adopt(zipOf(
+                "manifest.json" to manifestBytes(fingerprint, listOf("E142_S40")),
+            ))
+            assertTrue(bad_corner.isFailure, "non-5-degree empty bucket accepted")
+
+            // more empties than every 5-degree bucket on Earth (2592):
+            // the same wrong-file guard the segment count gets. All names
+            // are VALID corners (every one plus a duplicate) so the range
+            // check cannot mask the count gate — and the message pins
+            // which gate refused.
+            val every_corner = buildList {
+                for (lon in -180..175 step 5) {
+                    for (lat in -90..85 step 5) add(GraphPipeline.bucketName(lon, lat))
+                }
+            }
+            val too_many = adopt(zipOf(
+                "manifest.json" to manifestBytes(
+                    fingerprint,
+                    every_corner + every_corner.first(),
+                ),
+            ))
+            assertTrue(too_many.isFailure, "absurd manifest accepted")
+            assertTrue(
+                "wrong file" in (too_many.exceptionOrNull()?.message ?: ""),
+                "count gate did not refuse the manifest: ${too_many.exceptionOrNull()?.message}",
+            )
+
+            // the legitimate edge: a manifest-only ZIP (nothing but empty
+            // buckets) installs and records them built with rd5: null
+            val empties = adopt(zipOf(
+                "manifest.json" to manifestBytes(fingerprint, listOf("E140_S45", "E145_S40")),
+            ))
+            assertTrue(empties.isSuccess, "manifest-only ZIP refused: ${empties.exceptionOrNull()}")
+            val adoption = empties.getOrThrow()
+            assertTrue(adoption.buckets.isEmpty())
+            assertEquals(listOf("E140_S45", "E145_S40"), adoption.emptyBuckets)
+            assertNull(manager.bucketState("E140_S45")?.rd5, "empty bucket recorded with an rd5")
+            assertTrue("E140_S45" in manager.builtBuckets(), "empty bucket not recorded built")
+            assertNull(manager.bucketState("E145_S40")?.rd5, "second empty bucket recorded with an rd5")
 
             root.deleteRecursively()
         }
@@ -200,6 +339,40 @@ class GraphBuildManagerTest {
                 "lookups bomb message is not user-actionable",
             )
             assertTrue(segments.listFiles().isNullOrEmpty(), "rejected bomb left files behind")
+
+            // manifest.json past its own 4 MB cap: same bomb shape, same
+            // bounded read — deleting the cap would stream the entry whole
+            // onto the UI-process heap, and this test would still pass.
+            val manifest_bomb = adopt(zipOf("manifest.json" to ByteArray((4 shl 20) + 1)))
+            assertTrue(manifest_bomb.isFailure, "oversized manifest accepted")
+            assertTrue(
+                "manifest.json" in (manifest_bomb.exceptionOrNull()?.message ?: ""),
+                "manifest bomb message is not user-actionable",
+            )
+            assertTrue(segments.listFiles().isNullOrEmpty(), "rejected manifest bomb left files behind")
+
+            // more .rd5 entries than every 5-degree bucket on Earth
+            // (2592): the extraction-time count gate, with its message.
+            // All names are valid corners, and the 2593rd — a NESTED
+            // duplicate, which flattens to the same bucket key but is a
+            // distinct ZIP entry — trips the count require BEFORE the map
+            // put, so the corner gate cannot mask it. Tiny entries keep
+            // the ZIP small; integrity never runs.
+            val corner_entries = ArrayList<Pair<String, ByteArray>>()
+            for (lon in -180..175 step 5) {
+                for (lat in -90..85 step 5) {
+                    corner_entries.add(GraphPipeline.bucketName(lon, lat) + ".rd5" to ByteArray(8))
+                }
+            }
+            // (corner_entries.first().first already ends in ".rd5".)
+            corner_entries.add("nested/" + corner_entries.first().first to ByteArray(8))
+            val too_many_entries = adopt(zipOf(*corner_entries.toTypedArray()))
+            assertTrue(too_many_entries.isFailure, "absurd segment count accepted")
+            val count_message = too_many_entries.exceptionOrNull()?.message ?: ""
+            assertTrue(
+                "wrong file" in count_message,
+                "segment count gate did not refuse the ZIP: $count_message",
+            )
 
             // a bucket corner with a number too large to parse: the same
             // actionable "bad bucket name" message, not a raw toInt() error

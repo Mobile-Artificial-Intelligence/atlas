@@ -120,6 +120,9 @@ class AtlasViewModel(
     private var searchJob: Job? = null
     private var searchIndexJob: Job? = null
 
+    /** The in-flight routing-ZIP install — single flight, see installRoutingData. */
+    private var install_job: Job? = null
+
     /**
      * The background engine warmup: parses the routing profiles and runs
      * one throwaway route so the user's first real route is warm. The
@@ -529,6 +532,73 @@ class AtlasViewModel(
     }
 
     /**
+     * Settings' "Install routing data": adopts a prebuilt routing ZIP — the
+     * CI artifact paired with this map archive — instead of building every
+     * region on-device. The ZIP's manifest pins the archive fingerprint, so
+     * a ZIP from a different download is refused with the actionable
+     * message rather than silently installing roads the archive doesn't
+     * have. This is also the recovery path after "Replace map archive":
+     * replacing the archive alone leaves routing unbuilt, and this
+     * re-pairs it in one tap.
+     */
+    fun installRoutingData(uri: Uri) {
+        // Same rule as rebuild: a live session reads those segment files.
+        if (navState.value !is NavigationCoordinator.NavState.Idle) {
+            toast("Stop navigation before installing routing data")
+            return
+        }
+        // A route mid-Preparation is waiting on the very build this
+        // install would cancel — and unlike rebuildRoutingData, an install
+        // does not tear the route down, so the route would keep polling a
+        // build it can no longer observe and die with a misleading
+        // message. Make the user land the route first instead.
+        if (routeState.value is RouteUiState.Preparing) {
+            toast("Wait for the route to finish preparing before installing routing data")
+            return
+        }
+        // Single flight, like importArchive: two adoptions share the
+        // manager's fixed adopt-scratch dir and build-state tmp file, and
+        // the second would delete the first's extracted segments
+        // mid-validation.
+        if (install_job?.isActive == true) {
+            toast("Routing data install is already running")
+            return
+        }
+        install_job = viewModelScope.launch {
+            try {
+                // A live :graph build writes the same segments dir and
+                // build-state file the adoption renames into — stop it
+                // first. Cancel is cooperative (observed between buckets
+                // and at sub-step boundaries), so wait it out; a status
+                // older than the staleness budget means the :graph process
+                // already died mid-build and there is nothing to wait for.
+                if (GraphBuildCoordinator.readStatusAsync(app)?.running == true) {
+                    toast("Stopping the running build first…")
+                    GraphBuildCoordinator.cancel(app)
+                    while (true) {
+                        val status = GraphBuildCoordinator.readStatusAsync(app)
+                        if (status?.running != true) break
+                        if (System.currentTimeMillis() - status.timestampMs >
+                            BUILD_STOP_STALE_MS
+                        ) {
+                            break
+                        }
+                        delay(2_000)
+                    }
+                }
+                val buckets = GraphBuildCoordinator.installRoutingData(app, uri)
+                toast("Routing data installed for $buckets region(s) — routing is ready.")
+            } catch (e: CancellationException) {
+                // ViewModel cleared mid-install: not a user-facing failure.
+                throw e
+            } catch (e: Exception) {
+                val reason = e.message?.takeIf { it.isNotBlank() } ?: "an unexpected error"
+                toast("Routing data was not installed ($reason)")
+            }
+        }
+    }
+
+    /**
      * Settings' "Rebuild search index": the DBs are wiped and the cheap
      * pass re-runs (tens of seconds, surfaced through the search state).
      * Like the other two rebuild actions, it leaves the Settings tab —
@@ -701,3 +771,6 @@ private const val KEY_CAMERA_BEARING = "camera.bearing"
 private const val SEARCH_DEBOUNCE_MS = 250L
 private const val STAGE_COPY_ARCHIVE = "Copying map archive into app storage…"
 private const val STAGE_INSTALL_ROUTING = "Installing prebuilt routing data…"
+// Mirrors GraphPrepFlow's staleness budget: a running status older than
+// this means the :graph process died mid-build.
+private const val BUILD_STOP_STALE_MS = 90_000L

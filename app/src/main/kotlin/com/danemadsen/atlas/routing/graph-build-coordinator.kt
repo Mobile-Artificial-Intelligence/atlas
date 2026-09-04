@@ -175,6 +175,9 @@ object GraphBuildCoordinator {
      *
      * No build is started here; the buckets land in build-state as already
      * built, so the location-triggered and on-demand builds no-op for them.
+     * The manifest's empty buckets count too: they are regions the archive
+     * genuinely has no roads for, and marking them built is what stops the
+     * location trigger from re-scanning ocean.
      */
     suspend fun installRoutingData(context: Context, zip: android.net.Uri): Int =
         withContext(Dispatchers.IO) {
@@ -188,7 +191,8 @@ object GraphBuildCoordinator {
             val input = context.contentResolver.openInputStream(zip)
                 ?: error("the routing data file could not be opened")
             try {
-                manager.adoptPrebuiltSegments(input).buckets.size
+                val adoption = manager.adoptPrebuiltSegments(input)
+                adoption.buckets.size + adoption.emptyBuckets.size
             } finally {
                 input.close()
             }

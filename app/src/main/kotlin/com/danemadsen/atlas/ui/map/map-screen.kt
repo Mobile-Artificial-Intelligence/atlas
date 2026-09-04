@@ -190,6 +190,7 @@ fun MapScreen() {
                             onToggleTtsMute = view_model::toggleMute,
                             onDismiss = view_model::closeSettings,
                             onReplaceArchive = { uri -> view_model.importArchive(uri) },
+                            onInstallRoutingData = view_model::installRoutingData,
                             onPrepareAllRoutingData = view_model::prepareAllRoutingData,
                             onRebuildRoutingData = view_model::rebuildRoutingData,
                             onRebuildSearchIndex = view_model::rebuildSearchIndex,

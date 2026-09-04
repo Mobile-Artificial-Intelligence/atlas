@@ -42,6 +42,13 @@ class GraphBuildManager(
         public val buckets: List<String>,
         /** True when the ZIP carried a `lookups.dat` and it was installed. */
         public val replacedLookups: Boolean,
+        /**
+         * Buckets the ZIP's manifest declared empty (all-ocean/no roads):
+         * no `.rd5` exists for them, but recording them built is the whole
+         * point — otherwise the on-device build rescans every ocean cell
+         * in the country for nothing. Empty unless a manifest authenticated.
+         */
+        public val emptyBuckets: List<String> = emptyList(),
     )
 
     /** One bucket's recorded build state. */
@@ -298,6 +305,7 @@ class GraphBuildManager(
             try {
                 val segments = LinkedHashMap<String, File>()
                 var zip_lookups: ByteArray? = null
+                var zip_manifest: String? = null
                 ZipInputStream(BufferedInputStream(zip)).use { input ->
                     while (true) {
                         val entry = input.nextEntry ?: break
@@ -313,6 +321,14 @@ class GraphBuildManager(
                                 val out = java.io.ByteArrayOutputStream()
                                 copyBounded(input, out, MAX_LOOKUPS_BYTES, LOOKUPS_FILE)
                                 zip_lookups = out.toByteArray()
+                            }
+                            name == MANIFEST_FILE -> {
+                                // Bounded for the same bomb reason; the
+                                // real manifest is a fingerprint plus at
+                                // most a few thousand bucket names (~100 KB).
+                                val out = java.io.ByteArrayOutputStream()
+                                copyBounded(input, out, MAX_MANIFEST_BYTES, MANIFEST_FILE)
+                                zip_manifest = out.toString(Charsets.UTF_8)
                             }
                             RD5_ENTRY_RE.matchEntire(name) != null -> {
                                 val bucket = name.removeSuffix(RD5_SUFFIX)
@@ -350,8 +366,46 @@ class GraphBuildManager(
                         }
                     }
                 }
-                require(segments.isNotEmpty()) {
+                require(segments.isNotEmpty() || zip_manifest != null) {
                     "the routing data file contains no Atlas .rd5 segments"
+                }
+                // The manifest gate — the reason a CI-built ZIP cannot mix
+                // archives. Each daily run rebuilds a country's pmtiles
+                // from a fresh extract, so a ZIP from a different day
+                // describes roads the imported archive no longer has; the
+                // engine would only discover that at route time. The
+                // fingerprint check turns it into an actionable refusal.
+                // (A hand-made ZIP without a manifest keeps the old
+                // trust-the-user behavior.)
+                var empty_from_manifest = emptyList<String>()
+                if (zip_manifest != null) {
+                    // (The !! is required: the extraction loop's lambda
+                    // captured zip_manifest, so no smart cast applies.)
+                    val (zip_fingerprint, empty_names) = parseRoutingManifest(zip_manifest!!)
+                    require(zip_fingerprint == fingerprint()) {
+                        "this routing data was built from a different map " +
+                            "archive — use the routing ZIP from the same " +
+                            "download as your map archive"
+                    }
+                    require(empty_names.size <= MAX_ADOPT_BUCKETS) {
+                        "the routing data's manifest lists more than " +
+                            "$MAX_ADOPT_BUCKETS buckets — wrong file?"
+                    }
+                    for (bucket in empty_names) {
+                        // The same validation a .rd5 entry gets: garbage
+                        // names must fail with the actionable message.
+                        val (lon, lat) = parseBucketName(bucket)
+                        require(
+                            lon % GraphPipeline.BUCKET_DEGREES == 0 &&
+                                lat % GraphPipeline.BUCKET_DEGREES == 0 &&
+                                lon in -180..175 && lat in -90..85,
+                        ) { "$bucket is not a 5-degree bucket corner" }
+                    }
+                    require(segments.keys.none { it in empty_names }) {
+                        "the routing data's manifest lists a bucket that " +
+                            "also carries a segment: wrong file?"
+                    }
+                    empty_from_manifest = empty_names
                 }
                 if (zip_lookups != null) {
                     require(zip_lookups.contentEquals(lookupFile().readBytes())) {
@@ -409,8 +463,24 @@ class GraphBuildManager(
                         nodeCount = 0, // informational; not parsed from rd5
                     )
                 }
+                // The manifest's empty buckets: recorded built with
+                // rd5 = null, exactly like a bucket the on-device build
+                // scanned and found empty — so no ensure() ever rescans
+                // them. Only reached when the manifest's fingerprint
+                // matched the imported archive above.
+                for (bucket in empty_from_manifest) {
+                    committed.buckets[bucket] = BucketState(
+                        state = "built",
+                        rd5 = null,
+                        nodeCount = 0,
+                    )
+                }
                 writeState(committed)
-                Adoption(segments.keys.toList(), replacedLookups = zip_lookups != null)
+                Adoption(
+                    buckets = segments.keys.toList(),
+                    replacedLookups = zip_lookups != null,
+                    emptyBuckets = empty_from_manifest,
+                )
             } finally {
                 scratch.deleteRecursively()
             }
@@ -493,23 +563,7 @@ class GraphBuildManager(
     }
 
     /** SHA-256 over the PMTiles header bytes plus the file length. */
-    private fun fingerprint(): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        archiveFile.inputStream().use { input ->
-            val header = ByteArray(HEADER_BYTES)
-            // readFully semantics: a single InputStream.read may short-read,
-            // and a short header would silently hash a shifted window.
-            var read = 0
-            while (read < HEADER_BYTES) {
-                val n = input.read(header, read, HEADER_BYTES - read)
-                if (n < 0) error("archive too small: $archiveFile")
-                read += n
-            }
-            digest.update(header, 0, read)
-        }
-        digest.update(archiveFile.length().toString().toByteArray())
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
+    private fun fingerprint(): String = archiveFingerprintOf(archiveFile)
 
     private fun lookupFile(): File =
         assetFile(LOOKUPS_FILE) ?: error("missing asset $LOOKUPS_FILE")
@@ -532,8 +586,8 @@ class GraphBuildManager(
         const val STATE_FILE = "build-state.json"
         const val LOOKUPS_FILE = "lookups.dat"
         const val PROFILE_ALL = "all.brf"
-        const val HEADER_BYTES = 127
         const val RD5_SUFFIX = ".rd5"
+        const val MANIFEST_FILE = "manifest.json"
         const val TMP_SUFFIX = ".tmp"
         const val ADOPT_SCRATCH_DIR = "adopt-scratch"
         const val MAX_ADOPT_BUCKETS = 2_592 // 72*36: every 5-degree bucket on Earth
@@ -541,8 +595,11 @@ class GraphBuildManager(
         // Extraction bounds against decompression bombs (deflate expands
         // up to ~1032:1, so an unbounded read is a memory/disk-fill bomb
         // in a ZIP of a few MB). The real assets sit far below: lookups
-        // is ~28 KB, the densest 5° rd5 segment is hundreds of MB.
+        // is ~28 KB, the manifest is a fingerprint plus at most a few
+        // thousand bucket names, the densest 5° rd5 segment is hundreds
+        // of MB.
         const val MAX_LOOKUPS_BYTES = 1L shl 20 // 1 MB
+        const val MAX_MANIFEST_BYTES = 4L shl 20 // 4 MB
         const val MAX_SEGMENT_BYTES = 2_000_000_000L
         const val MIN_FREE_DISK_BYTES = 256L shl 20 // leave 256 MB free
 
@@ -562,8 +619,69 @@ class GraphBuildManager(
             val lat = number(match.groupValues[4]) * if (match.groupValues[3] == "S") -1 else 1
             return lon to lat
         }
+
     }
 }
+
+/**
+ * SHA-256 over the archive's 127-byte PMTiles header plus its file length —
+ * the identity `build-state.json` and the routing ZIP's manifest key on.
+ * Top-level so the CI-side build CLI (test source set) can mint manifests
+ * without instantiating a manager.
+ */
+internal fun archiveFingerprintOf(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val header = ByteArray(ARCHIVE_HEADER_BYTES)
+        // readFully semantics: a single InputStream.read may short-read,
+        // and a short header would silently hash a shifted window.
+        var read = 0
+        while (read < ARCHIVE_HEADER_BYTES) {
+            val n = input.read(header, read, ARCHIVE_HEADER_BYTES - read)
+            if (n < 0) error("archive too small: $file")
+            read += n
+        }
+        digest.update(header, 0, read)
+    }
+    digest.update(file.length().toString().toByteArray())
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+private const val ARCHIVE_HEADER_BYTES = 127
+
+/**
+ * The manifest a CI-built routing ZIP carries (see
+ * [GraphBuildManager.adoptPrebuiltSegments]): a safe-ASCII, hand-rolled-JSON
+ * pair of the archive fingerprint the segments were built from and the
+ * buckets that scanned empty. Both fields are load-bearing — the fingerprint
+ * stops a ZIP minted from a different daily archive from installing
+ * silently-wrong roads, and the empty list saves the on-device build from
+ * rescanning every ocean cell.
+ *
+ * internal: the CI-side build CLI (test source set) mints manifests with
+ * [renderRoutingManifest] and tests round-trip the pair.
+ */
+internal fun parseRoutingManifest(text: String): Pair<String, List<String>> {
+    val fingerprint_match =
+        Regex("\"archiveFingerprint\":\"([0-9a-f]+)\"").find(text)
+            ?: error("the routing data's manifest has no archive fingerprint")
+    val fingerprint = fingerprint_match.groupValues[1]
+    require(fingerprint.length == 64) {
+        "the routing data's manifest has a malformed archive fingerprint"
+    }
+    val array_match = Regex("\"empty\":\\[([^]]*)]").find(text)
+        ?: error("the routing data's manifest has no empty-bucket list")
+    val empty = ArrayList<String>()
+    for (match in Regex("\"([^\"]+)\"").findAll(array_match.groupValues[1])) {
+        empty.add(match.groupValues[1])
+    }
+    return fingerprint to empty
+}
+
+/** Renders what [parseRoutingManifest] reads — see its doc. */
+internal fun renderRoutingManifest(fingerprint: String, emptyBuckets: List<String>): String =
+    "{\"format\":1,\"archiveFingerprint\":\"$fingerprint\",\"empty\":" +
+        emptyBuckets.joinToString(",", "[", "]") { "\"$it\"" } + "}\n"
 
 /**
  * Copies [input] to [output], refusing after [capBytes] bytes. Used on
