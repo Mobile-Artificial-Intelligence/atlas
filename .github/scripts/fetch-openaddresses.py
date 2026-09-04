@@ -66,11 +66,27 @@ def download(url, destination):
     return False
 
 
-def pmtiles_url_for(job_id):
-    """The job's PMTiles URL; the v2 host mirrors the same path if the
-    metadata omits it."""
-    metadata = get_json(f"{API_BASE}/job/{job_id}?output=json")
-    return metadata.get("pmtiles_url") or V2_FALLBACK_URL.format(job=job_id)
+def pmtiles_url_for(source):
+    """A downloadable PMTiles URL for the source, or None.
+
+    The listing's `latest_job` can be Pending (a run in flight, no output
+    yet — its URL would 404); the `job` field is the last COMPLETED run, so
+    the fallback is latest-with-an-URL, then last-completed. The v2 host
+    mirrors the same path when the metadata omits the URL outright.
+    """
+    job_ids = []
+    for key in ("latest_job", "job"):
+        job_id = source.get(key)
+        if job_id and job_id not in job_ids:
+            job_ids.append(job_id)
+    for job_id in job_ids:
+        metadata = get_json(f"{API_BASE}/job/{job_id}?output=json")
+        url = metadata.get("pmtiles_url") or V2_FALLBACK_URL.format(job=job_id)
+        if metadata.get("status") == "Success" or metadata.get("pmtiles_url"):
+            return url
+        print(f"::warning::job {job_id} for {source['source']} is "
+              f"{metadata.get('status', 'unknown')} — trying an earlier job")
+    return None
 
 
 def main():
@@ -119,9 +135,13 @@ def main():
         name = source["source"].replace("/", "-") + ".pmtiles"
         destination = os.path.join(output_dir, name)
         try:
-            url = pmtiles_url_for(source["latest_job"])
+            url = pmtiles_url_for(source)
         except (urllib.error.URLError, OSError, ValueError) as error:
             print(f"::warning::could not resolve {source['source']}: {error}")
+            continue
+        if url is None:
+            print(f"::warning::{source['source']} has no downloadable PMTiles "
+                  "job; the merge is partial")
             continue
         print(f"fetching {source['source']} ({source.get('size', '?')} bytes)")
         if download(url, destination):
