@@ -1,0 +1,227 @@
+name: PMTiles
+
+# Builds OpenMapTiles-schema PMTiles archives from Geofabrik country extracts
+# with the SAME pinned Planetiler (0.10.2) and arguments used to mint the
+# original atlas australia.pmtiles — Atlas's import, search, and routing
+# pipelines are calibrated against exactly this output (MVT tiles, gzip,
+# z0-14).
+#
+# Each country builds in its own runner instance off the shared matrix; add
+# a country by appending one matrix entry (url from download.geofabrik.de).
+# A manual dispatch defaults to a 2-minute monaco smoke test of the whole
+# path (download -> planetiler -> pmtiles -> artifact); uncheck smoke_only
+# to build every country.
+#
+# Hosted-runner reality check (2026-09 calibration: 0.9 GB australia pbf ->
+# 1.3 GB pmtiles, ~1h45m on a fast dev machine; a 4-vcpu runner is slower):
+#   new-zealand   0.4 GB pbf -> fits comfortably
+#   australia     0.9 GB pbf -> fits
+#   great-britain 2.0 GB pbf -> borderline against the 6h hosted-job cap
+#   canada        6.0 GB pbf -> will likely hit the 6h cap
+#   united-states 11.3 GB pbf -> will hit the 6h cap (needs a larger or
+#     self-hosted runner — the disk math fits after freeing ~30 GB, the
+#     wall-clock does not)
+on:
+  schedule:
+    # Daily at 19:23 UTC = 05:23 Brisbane (off the :00/:30 marks).
+    - cron: '23 19 * * *'
+  workflow_dispatch:
+    inputs:
+      smoke_only:
+        description: 'Smoke test only (monaco, ~2 min) — uncheck to build every country'
+        type: boolean
+        default: true
+
+# A manually started run shouldn't cancel one already in flight, and vice
+# versa; the daily runs are hours long.
+concurrency:
+  group: pmtiles
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    # monaco proves the full path in ~2 minutes. Dispatch-only: the daily
+    # schedule builds real countries, and monaco adds nothing to those.
+    if: github.event_name == 'workflow_dispatch'
+    name: pmtiles-monaco
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Cache Planetiler sources
+        uses: actions/cache@v4
+        with:
+          path: data/sources
+          key: planetiler-sources-0.10.2
+
+      - name: Fetch Planetiler
+        run: |
+          wget -q https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar -O planetiler.jar
+          VER=$(unzip -p planetiler.jar META-INF/maven/com.onthegomap.planetiler/planetiler-core/pom.properties | grep -o 'version=.*' | cut -d= -f2)
+          test "$VER" = "0.10.2" || { echo "unexpected planetiler version: $VER"; exit 1; }
+
+      - name: Download extract
+        run: |
+          mkdir -p data/sources out
+          curl --fail --location --retry 5 --retry-delay 10 \
+               --output data/sources/monaco.osm.pbf \
+               https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+
+      - name: Build PMTiles
+        run: |
+          java -Xmx2g -jar planetiler.jar \
+            --osm_path=data/sources/monaco.osm.pbf \
+            --output=out/atlas-monaco.pmtiles \
+            --tmpdir=data/tmp \
+            --download \
+            --force
+
+      - name: Verify PMTiles
+        run: |
+          python3 - <<'EOF'
+          import struct, os
+          path = "out/atlas-monaco.pmtiles"
+          with open(path, "rb") as f:
+              d = f.read(127)
+          assert d[:7] == b"PMTiles" and d[7] == 3, f"bad magic/version: {d[:8]!r}"
+          assert d[100] == 0 and d[101] == 14, f"zooms must be 0-14, got {d[100]}-{d[101]}"
+          entries = struct.unpack_from("<Q", d, 80)[0]
+          size = os.path.getsize(path)
+          line = f"PMTiles v3, zooms 0-14, {entries} tiles, {size / 2**20:.1f} MiB"
+          print(f"{path}: {line}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### atlas-monaco.pmtiles\n\n{line}\n\n")
+          EOF
+
+      - name: Upload PMTiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-pmtiles-monaco
+          compression-level: 0
+          retention-days: 7
+          path: out/atlas-monaco.pmtiles
+          if-no-files-found: error
+
+  countries:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.smoke_only == false)
+    name: pmtiles-${{ matrix.country }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      # One country failing (disk, timeout) must not kill the others.
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - country: new-zealand
+            url: https://download.geofabrik.de/australia-oceania/new-zealand-latest.osm.pbf
+            heap: 6g
+            free_disk: false
+          - country: australia
+            url: https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf
+            heap: 8g
+            free_disk: false
+          - country: great-britain
+            url: https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
+            heap: 10g
+            free_disk: false
+          - country: canada
+            url: https://download.geofabrik.de/north-america/canada-latest.osm.pbf
+            heap: 12g
+            free_disk: true
+          - country: united-states
+            url: https://download.geofabrik.de/north-america/us-latest.osm.pbf
+            heap: 12g
+            free_disk: true
+
+    steps:
+      - name: Free disk space
+        if: matrix.free_disk
+        run: |
+          # ubuntu-latest ships ~14 GB free; the two multi-GB extracts need
+          # more than that. The Android SDK (~9 GB), .NET, and Haskell
+          # toolchains are dead weight for this job.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+          df -h /
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Planetiler's aux sources (lake centerlines, water polygons, natural
+      # earth) never change for a given release — cache them so only the OSM
+      # extract downloads fresh each run.
+      - name: Cache Planetiler sources
+        uses: actions/cache@v4
+        with:
+          path: data/sources
+          key: planetiler-sources-0.10.2
+
+      - name: Fetch Planetiler
+        run: |
+          wget -q https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar -O planetiler.jar
+          VER=$(unzip -p planetiler.jar META-INF/maven/com.onthegomap.planetiler/planetiler-core/pom.properties | grep -o 'version=.*' | cut -d= -f2)
+          test "$VER" = "0.10.2" || { echo "unexpected planetiler version: $VER"; exit 1; }
+
+      - name: Download extract
+        run: |
+          mkdir -p data/sources out
+          curl --fail --location --retry 5 --retry-delay 10 \
+               --output "data/sources/${{ matrix.country }}.osm.pbf" \
+               "${{ matrix.url }}"
+
+      - name: Build PMTiles
+        run: |
+          java -Xmx${{ matrix.heap }} -jar planetiler.jar \
+            --osm_path="data/sources/${{ matrix.country }}.osm.pbf" \
+            --output="out/atlas-${{ matrix.country }}.pmtiles" \
+            --tmpdir="data/tmp" \
+            --download \
+            --force
+          # Free the pbf before the artifact upload — the extract is the
+          # single biggest disk consumer and the archive is already written.
+          rm -f "data/sources/${{ matrix.country }}.osm.pbf"
+
+      - name: Verify PMTiles
+        env:
+          COUNTRY: ${{ matrix.country }}
+        run: |
+          python3 - <<'EOF'
+          import struct, os
+          country = os.environ["COUNTRY"]
+          path = f"out/atlas-{country}.pmtiles"
+          with open(path, "rb") as f:
+              d = f.read(127)
+          assert d[:7] == b"PMTiles" and d[7] == 3, f"bad magic/version: {d[:8]!r}"
+          assert d[100] == 0 and d[101] == 14, f"zooms must be 0-14, got {d[100]}-{d[101]}"
+          entries = struct.unpack_from("<Q", d, 80)[0]
+          size = os.path.getsize(path)
+          line = f"PMTiles v3, zooms 0-14, {entries} tiles, {size / 2**30:.2f} GiB"
+          print(f"{path}: {line}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### atlas-{country}.pmtiles\n\n{line}\n\n")
+          EOF
+
+      - name: Upload PMTiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-pmtiles-${{ matrix.country }}
+          # Tiles are already gzip-compressed inside the archive; storing
+          # beats re-deflating multiple GiB.
+          compression-level: 0
+          retention-days: 7
+          path: out/atlas-${{ matrix.country }}.pmtiles
+          if-no-files-found: error
