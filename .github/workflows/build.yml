@@ -1,0 +1,128 @@
+name: Build
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build.yml'
+      - 'app/**'
+      - 'lib/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build.yml'
+      - 'app/**'
+      - 'lib/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # versionCode comes from `git rev-list --count HEAD`; a shallow
+          # clone would freeze every build at versionCode 1.
+          fetch-depth: 0
+
+      - name: Setup Java (Gradle cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-37" \
+            "build-tools;36.0.0"
+          yes | sdkmanager --licenses
+
+      - name: Decode Keystore File
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_UPLOAD_KEYSTORE }}
+        run: echo "$KEYSTORE" | base64 --decode > app/key.jks
+
+      - name: Create key.properties
+        run: |
+          {
+            echo "storeFile=key.jks"
+            echo "storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}"
+            echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}"
+            echo "releasePassword=${{ secrets.ANDROID_KEY_PASSWORD }}"
+            echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}"
+            echo "releaseAlias=${{ secrets.ANDROID_KEY_ALIAS }}"
+          } > key.properties
+
+      - name: Install bundletool
+        run: wget -q https://github.com/google/bundletool/releases/download/1.15.6/bundletool-all-1.15.6.jar -O bundletool.jar
+
+      # :app:bundleRelease also runs the checkReleaseNoNetworkPermissions task,
+      # which fails the build if the merged manifest ever requests network
+      # access — the zero-internet guarantee is enforced in CI, not just
+      # locally.
+      - name: Build AAB
+        run: ./gradlew :app:bundleRelease
+
+      - name: Rename AAB
+        run: |
+          mkdir -p release
+          mv app/build/outputs/bundle/release/app-release.aab release/atlas-release.aab
+
+      - name: Build APK from AAB
+        run: |
+          java -jar bundletool.jar build-apks \
+            --bundle=release/atlas-release.aab \
+            --output=release/atlas.apks \
+            --mode=universal \
+            --ks=app/key.jks \
+            "--ks-pass=pass:${{ secrets.ANDROID_STORE_PASSWORD }}" \
+            "--ks-key-alias=${{ secrets.ANDROID_KEY_ALIAS }}" \
+            "--key-pass=pass:${{ secrets.ANDROID_KEY_PASSWORD }}"
+          unzip release/atlas.apks universal.apk -d release/
+          mv release/universal.apk release/atlas-universal.apk
+          rm release/atlas.apks
+
+      - name: Upload Android
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-android
+          path: release
+          if-no-files-found: error
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-apk
+          path: release/atlas-universal.apk
+          if-no-files-found: error
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-aab
+          path: release/atlas-release.aab
+          if-no-files-found: error

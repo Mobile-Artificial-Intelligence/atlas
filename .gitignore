@@ -94,6 +94,9 @@ lint/tmp/
 app/src/test/fixtures/melbourne.pbf
 app/src/test/fixtures/melbourne.pmtiles
 
+# Kotlin build/session files
+.kotlin/
+
 *.jks
 *.keystore
 key.properties

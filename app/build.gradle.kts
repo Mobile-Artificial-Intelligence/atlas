@@ -2,6 +2,37 @@ import com.android.build.api.artifact.SingleArtifact
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.TaskAction
+import java.util.Properties
+
+// Release signing, same scheme as maise: a local (gitignored) key.properties
+// at the repo root carries the upload keystore's location and passwords; CI
+// writes the same file from the org's ANDROID_* secrets (see
+// .github/workflows/build.yml). Missing or incomplete properties leave the
+// release build unsigned rather than pretending to be signed.
+val keystore_properties = Properties().apply {
+    val keystore_file = rootProject.file("key.properties")
+    if (keystore_file.exists()) keystore_file.inputStream().use { load(it) }
+}
+val release_store_file = keystore_properties.getProperty("storeFile")
+val release_store_password = keystore_properties.getProperty("storePassword")
+val release_alias = keystore_properties.getProperty("releaseAlias")
+val release_key_password = keystore_properties.getProperty("releasePassword")
+val release_signing_complete =
+    !release_store_file.isNullOrBlank() &&
+        !release_store_password.isNullOrBlank() &&
+        !release_alias.isNullOrBlank() &&
+        !release_key_password.isNullOrBlank()
+if (!release_signing_complete) {
+    logger.warn("key.properties missing or incomplete; release builds will be unsigned. " +
+        "See app/build.gradle.kts for the expected fields.")
+}
+
+// versionCode = commits reachable from HEAD, so every pushed change ships a
+// higher versionCode than the last without hand-editing (same as maise).
+// CI checks out with fetch-depth 0 to keep the count accurate.
+val git_commit_count = providers.exec {
+    commandLine("git", "rev-list", "--count", "HEAD")
+}.standardOutput.asText.get().trim().toInt()
 
 plugins {
     alias(libs.plugins.android.application)
@@ -17,12 +48,30 @@ android {
         applicationId = "com.danemadsen.atlas"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
+        versionCode = git_commit_count
         versionName = "0.1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            // storeFile resolves relative to the app module, matching CI's
+            // app/key.jks; the local file usually carries an absolute path.
+            if (release_signing_complete) {
+                storeFile = file(release_store_file!!)
+                storePassword = release_store_password
+                keyAlias = release_alias
+                keyPassword = release_key_password
+            }
+        }
     }
 
     buildTypes {
         release {
+            // Only sign when key.properties was complete — an unsigned
+            // release output is honest; a half-configured one is not.
+            if (release_signing_complete) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -193,7 +242,9 @@ androidComponents {
         ) {
             mergedManifest.set(variant.artifacts.get(SingleArtifact.MERGED_MANIFEST))
         }
-        tasks.matching { it.name == "assemble$capitalized_name" }.configureEach {
+        tasks.matching {
+            it.name == "assemble$capitalized_name" || it.name == "bundle$capitalized_name"
+        }.configureEach {
             dependsOn(check_task)
         }
     }
