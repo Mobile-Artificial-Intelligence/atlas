@@ -37,6 +37,25 @@ class MapColorsTest {
 
         assertNull(MapColors.parse("not-a-color"))
         assertNull(MapColors.parse("#12"))
+
+        // The teal vegetation literals added new notation variants:
+        // spaces inside rgba plus an integer alpha, and hsl without an
+        // alpha at hue 175.
+        assertEquals(0xFF5FD0C7.toInt(), MapColors.parse("rgba(95, 208, 199, 1)"))
+        assertEquals(175f, MapColors.argbToHsl(MapColors.parse("hsl(175, 37%, 81%)")!!).first, 1f)
+    }
+
+    @Test
+    fun everyThemeLiteralParses() {
+        // A literal MapColors cannot parse is silently DROPPED by the
+        // re-hue's fail-soft path — on device the layer just fails to
+        // render, and nothing else notices. So every token in both
+        // themes must survive a parse, no exceptions.
+        for (base in listOf(Themes.LIGHT, Themes.DARK)) {
+            for ((token, color) in base.colors) {
+                assertNotNull(MapColors.parse(color), "${base.name}.$token = $color must parse")
+            }
+        }
     }
 
     @Test

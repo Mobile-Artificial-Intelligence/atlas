@@ -1,6 +1,7 @@
 package com.danemadsen.atlas.ui.settings
 
 import android.content.Context
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -10,21 +11,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,18 +29,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.danemadsen.atlas.data.ArchiveInfo
 
 /**
- * The Settings overlay, opened from the gear next to the search field.
- * Full-screen (not a bottom sheet): the actions here are consequential —
- * replacing the archive, rebuilding routing data — and deserve the whole
- * screen, with the map hidden underneath rather than dimmed behind a
- * half-cover.
+ * The Settings tab of the bottom navigation. Inline content (not a
+ * dialog anymore — the tab bar stays reachable): the actions here are
+ * consequential — replacing the archive, rebuilding routing data — and
+ * deserve the whole screen with the map hidden underneath. Back and the
+ * Map tab are the same way out; there is no close button to duplicate
+ * them.
  */
 @Composable
 fun SettingsScreen(
@@ -55,7 +52,11 @@ fun SettingsScreen(
     onPrepareAllRoutingData: () -> Unit,
     onRebuildRoutingData: () -> Unit,
     onRebuildSearchIndex: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
+    // Back is the gesture way back to the Map tab.
+    BackHandler(onBack = onDismiss)
+
     // The rebuild wipes every prepared region; the destructive action
     // gets the same confirm step the destination picker would.
     var confirm_rebuild by remember { mutableStateOf(false) }
@@ -66,37 +67,38 @@ fun SettingsScreen(
         ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) onReplaceArchive(uri) }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
+    Surface(
+        // pointerInput with an empty body is deliberate: Compose hit-testing
+        // only dispatches along the topmost hit-testable node's path, and a
+        // plain Surface is NOT hit-testable — without this, every touch on
+        // the panel's blank areas falls through to the MapLibre view
+        // underneath (a long-press on the panel would drop a destination
+        // marker on the occluded map). The Settings tab must own its input.
+        modifier = modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {},
+        color = MaterialTheme.colorScheme.surface,
     ) {
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color = MaterialTheme.colorScheme.surface,
-        ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                // Header
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                ) {
-                    Text("Settings", style = MaterialTheme.typography.headlineSmall)
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Filled.Close, contentDescription = "Close settings")
-                    }
-                }
-                HorizontalDivider()
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Header
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text("Settings", style = MaterialTheme.typography.headlineSmall)
+            }
+            HorizontalDivider()
 
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp),
-                ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp),
+            ) {
                     SettingsSectionLabel("Map data")
                     Text(
                         "${archive.fileName} · ${formatBytes(archive.sizeBytes)}",
@@ -192,7 +194,6 @@ fun SettingsScreen(
                 }
             }
         }
-    }
 
     if (confirm_rebuild) {
         AlertDialog(

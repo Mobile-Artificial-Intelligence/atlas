@@ -445,6 +445,10 @@ class AtlasViewModel(
     /** The preview drawer's Start: hands the route to the navigation runtime. */
     fun startNavigation() {
         val result = (_routeState.value as? RouteUiState.Previewing)?.result ?: return
+        // Navigation owns the whole screen (banner + panel, no tab bar);
+        // leaving the Settings tab open behind it would resurface the
+        // moment the session ends.
+        _settingsOpen.value = false
         NavigationCoordinator.start(app, result, _ttsMuted.value)
     }
 
@@ -526,9 +530,13 @@ class AtlasViewModel(
     /**
      * Settings' "Rebuild search index": the DBs are wiped and the cheap
      * pass re-runs (tens of seconds, surfaced through the search state).
+     * Like the other two rebuild actions, it leaves the Settings tab —
+     * its only progress surface (the "Indexing places" chip) lives in
+     * the search bar on the Map tab.
      */
     fun rebuildSearchIndex() {
         val archive = (_state.value as? AtlasUiState.MapReady)?.archive ?: return
+        _settingsOpen.value = false
         searchIndexJob?.cancel()
         viewModelScope.launch {
             SearchCoordinator.deleteIndexes(app)

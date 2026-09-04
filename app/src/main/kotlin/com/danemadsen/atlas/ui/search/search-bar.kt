@@ -14,7 +14,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +31,7 @@ import com.danemadsen.atlas.ui.SearchUiState
 
 /**
  * The top search bar: rounded pill over the map, mic button on the right.
+ * Settings is NOT here — it lives on the bottom navigation's Settings tab.
  *
  * Voice input goes through the system speech recognizer activity
  * (ACTION_RECOGNIZE_SPEECH, offline preferred) — the recognizer runs in its
@@ -44,7 +44,6 @@ fun SearchBar(
     query: String,
     searchState: SearchUiState,
     onQueryChange: (String) -> Unit,
-    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -110,15 +109,6 @@ fun SearchBar(
                 Icon(
                     Icons.Filled.Mic,
                     contentDescription = "Search by voice",
-                    tint = MaterialTheme.colorScheme.primary,
-                )
-            }
-            // Settings lives beside search — both are "the things you
-            // reach from the map without navigating anywhere".
-            IconButton(onClick = onOpenSettings, modifier = Modifier.padding(end = 4.dp)) {
-                Icon(
-                    Icons.Filled.Settings,
-                    contentDescription = "Open settings",
                     tint = MaterialTheme.colorScheme.primary,
                 )
             }

@@ -26,7 +26,17 @@ class TtsSpeaker(context: Context) {
 
     private val ready = AtomicBoolean(false)
     private val tts: TextToSpeech = TextToSpeech(context.applicationContext) { status ->
-        if (status == TextToSpeech.SUCCESS) ready.set(true)
+        if (status == TextToSpeech.SUCCESS) {
+            ready.set(true)
+        } else {
+            // The AppsFilter/queries manifest issue, an engine that died,
+            // or no engine at all — the fallback text in the nav panel is
+            // the user-facing half; this line is the diagnosis half.
+            android.util.Log.w(
+                "TtsSpeaker",
+                "TTS engine init failed (status=$status) — voice guidance unavailable",
+            )
+        }
     }
 
     /** Speaks [text], replacing whatever was mid-announcement. */

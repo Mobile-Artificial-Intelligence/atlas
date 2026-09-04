@@ -29,6 +29,24 @@
          permission, no runtime grant needed. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Package visibility (Android 11+): without these the system's
+         AppsFilter hides other apps' speech components from Atlas, and the
+         TTS engine fails to bind even though it is installed and selected
+         as the system default — the init callback just gets ERROR. A
+         third-party engine (e.g. a custom TTS like the user's own) is
+         invisible without the query; preinstalled system engines are
+         exempt, which is why this only bites on real devices. -->
+    <queries>
+        <!-- TextToSpeech binds services handling this action. -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!-- Voice search resolves recognizer activities by this action. -->
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
+
     <application
         android:name=".AtlasApplication"
         android:label="@string/app_name"

@@ -11,8 +11,10 @@ data class AtlasMapTheme(
     val colors: Map<String, String>,
     /**
      * Layers to hide in this theme. The pedestrian-area and wetland fill
-     * patterns come from the (light) sprite, so they cannot be recolored —
-     * dark switches them off rather than showing light pinstripes.
+     * patterns come from the (light) sprite and can't be re-hued by the
+     * token mechanism — dark switches them off rather than showing light
+     * pinstripes. (The wetland sprite icon itself WAS re-hued to teal at
+     * the asset level, so light's wetlands match the teal vegetation.)
      */
     val hiddenLayers: Set<String> = emptySet(),
 ) {
@@ -59,16 +61,19 @@ object Themes {
         name = "OSM Liberty",
         colors = mapOf(
             "background" to "rgb(239,239,239)",
-            "park" to "#d8e8c8",
-            "parkOutlineFill" to "rgba(95, 208, 100, 1)",
-            "parkOutline" to "rgba(228, 241, 215, 1)",
+            // Vegetation in aqua/teal (hue ~175), not OSM Liberty's green:
+            // same saturation and lightness as the originals, so the map's
+            // balance holds while parks/woods/grass read as teal.
+            "park" to "#c8e8e5",
+            "parkOutlineFill" to "rgba(95, 208, 199, 1)",
+            "parkOutline" to "rgba(215, 241, 239, 1)",
             "residentialLow" to "hsla(0, 3%, 85%, 0.84)",
             "residentialHigh" to "hsla(35, 57%, 88%, 0.49)",
-            "wood" to "hsla(98, 61%, 72%, 0.7)",
-            "grass" to "rgba(176, 213, 154, 1)",
+            "wood" to "hsla(175, 61%, 72%, 0.7)",
+            "grass" to "rgba(154, 213, 208, 1)",
             "ice" to "rgba(224, 236, 236, 1)",
-            "pitch" to "#DEE3CD",
-            "cemetery" to "hsl(75, 37%, 81%)",
+            "pitch" to "#cde3e1",
+            "cemetery" to "hsl(175, 37%, 81%)",
             "hospital" to "#fde",
             "school" to "rgb(236,238,204)",
             "sand" to "rgba(247, 239, 195, 1)",
@@ -110,19 +115,19 @@ object Themes {
         name = "Dark Matter",
         colors = mapOf(
             "background" to "#0e0e0e",
-            // Vegetation goes aqua/teal, the way Google Maps' dark basemap
-            // shades its parks — a green-teal that reads as "plant life" on a
-            // near-black base without the CARTO greens' yellow cast.
-            "park" to "#10201c",
+            // Vegetation in true aqua/teal (hue ~188, the same saturation
+            // and lightness the green-teal originals had) — plant life on a
+            // near-black base that reads as teal, not CARTO green.
+            "park" to "#101e20",
             "parkOutlineFill" to "#0e0e0e",
             "parkOutline" to "#0e0e0e",
             "residentialLow" to "#080808",
             "residentialHigh" to "#0a0a0a",
-            "wood" to "#0e1a17",
-            "grass" to "#14261f",
+            "wood" to "#0e181a",
+            "grass" to "#142426",
             "ice" to "#1e262c",
-            "pitch" to "#12221d",
-            "cemetery" to "#11211d",
+            "pitch" to "#122022",
+            "cemetery" to "#111f21",
             "hospital" to "#1c1517",
             "school" to "#191b13",
             "sand" to "#1c1912",

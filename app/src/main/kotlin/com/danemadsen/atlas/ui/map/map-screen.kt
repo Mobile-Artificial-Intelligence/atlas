@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.statusBars
@@ -48,6 +47,7 @@ import com.danemadsen.atlas.search.PlaceHit
 import com.danemadsen.atlas.ui.AtlasUiState
 import com.danemadsen.atlas.ui.CameraSnapshot
 import com.danemadsen.atlas.ui.DebugCameraBus
+import com.danemadsen.atlas.ui.MainTabBar
 import com.danemadsen.atlas.ui.RouteUiState
 import com.danemadsen.atlas.ui.graph.GraphPrepFlow
 import com.danemadsen.atlas.ui.nav.NavigationPanel
@@ -137,18 +137,6 @@ fun MapScreen() {
         )
         val settings_open by view_model.settingsOpen.collectAsStateWithLifecycle()
         val tts_muted by view_model.ttsMuted.collectAsStateWithLifecycle()
-        if (settings_open && archive != null) {
-            SettingsScreen(
-                archive = archive,
-                ttsMuted = tts_muted,
-                onToggleTtsMute = view_model::toggleMute,
-                onDismiss = view_model::closeSettings,
-                onReplaceArchive = { uri -> view_model.importArchive(uri) },
-                onPrepareAllRoutingData = view_model::prepareAllRoutingData,
-                onRebuildRoutingData = view_model::rebuildRoutingData,
-                onRebuildSearchIndex = view_model::rebuildSearchIndex,
-            )
-        }
         if (archive != null) {
             Column(
                 modifier = Modifier
@@ -164,7 +152,10 @@ fun MapScreen() {
                     // what the user needs at a glance is the next maneuver,
                     // not a search field.
                     TurnBanner(snapshot = (nav_state as NavigationCoordinator.NavState.Navigating).snapshot)
-                } else {
+                } else if (!settings_open) {
+                    // The Settings tab owns the whole screen — a search
+                    // field floating over the map behind it would be an
+                    // interactive hole in an opaque panel.
                     SearchBar(
                         query = search_query,
                         searchState = search_state,
@@ -172,46 +163,85 @@ fun MapScreen() {
                             search_query = query
                             view_model.onSearchQueryChange(query)
                         },
-                        onOpenSettings = view_model::openSettings,
                     )
                 }
             }
         }
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                // Edge-to-edge is on: without this the drawer's Close
-                // button and profile chips sit underneath the system
-                // navigation bar, and on 3-button-nav devices the taps
-                // land on Back/Home/Recents instead.
-                .navigationBarsPadding(),
-        ) {
-            // Navigation owns the drawer from Start until it ends
-            // (arrived, failed, or Stop) — exactly one way out, never a
-            // route preview stacked under a live session.
+        if (archive != null) {
             if (nav_state is NavigationCoordinator.NavState.Idle) {
-                Column {
-                    RoutePreviewPanel(
-                        routeState = route_state,
-                        onProfileSelected = view_model::selectProfile,
-                        onStart = view_model::startNavigation,
-                        onRetry = view_model::reRoute,
-                        onDismiss = view_model::dismissRoute,
+                // The bottom chrome is a tab layout, not an overlay: the
+                // Settings tab fills everything above the tab bar (the
+                // weighted child expands this Column to full height), the
+                // Map tab stacks its panels there instead. The tab bar
+                // clears the system navigation bar itself
+                // (NavigationBarDefaults.windowInsets), so unlike the
+                // panels it needs no outer navigationBarsPadding.
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth(),
+                ) {
+                    if (settings_open) {
+                        SettingsScreen(
+                            archive = archive,
+                            ttsMuted = tts_muted,
+                            onToggleTtsMute = view_model::toggleMute,
+                            onDismiss = view_model::closeSettings,
+                            onReplaceArchive = { uri -> view_model.importArchive(uri) },
+                            onPrepareAllRoutingData = view_model::prepareAllRoutingData,
+                            onRebuildRoutingData = view_model::rebuildRoutingData,
+                            onRebuildSearchIndex = view_model::rebuildSearchIndex,
+                            modifier = Modifier.weight(1f),
+                        )
+                        // A routing build can also be running (or fail)
+                        // while the user sits on this tab — the banner and
+                        // its Cancel button must not unmount with the Map
+                        // tab, or a 30-minute job has no visible surface.
+                        GraphPrepFlow(state, route_state)
+                    } else {
+                        // Navigation owns the drawer from Start until it
+                        // ends (arrived, failed, or Stop) — exactly one
+                        // way out, never a route preview stacked under a
+                        // live session.
+                        Column {
+                            RoutePreviewPanel(
+                                routeState = route_state,
+                                onProfileSelected = view_model::selectProfile,
+                                onStart = view_model::startNavigation,
+                                onRetry = view_model::reRoute,
+                                onDismiss = view_model::dismissRoute,
+                            )
+                            SearchResultsPanel(
+                                searchState = search_state,
+                                onSelectPlace = view_model::selectPlace,
+                                onRouteToPlace = view_model::routeToPlace,
+                            )
+                            GraphPrepFlow(state, route_state)
+                        }
+                    }
+                    MainTabBar(
+                        settingsOpen = settings_open,
+                        onOpenMap = view_model::closeSettings,
+                        onOpenSettings = view_model::openSettings,
                     )
-                    SearchResultsPanel(
-                        searchState = search_state,
-                        onSelectPlace = view_model::selectPlace,
-                        onRouteToPlace = view_model::routeToPlace,
-                    )
-                    GraphPrepFlow(state, route_state)
                 }
             } else {
-                NavigationPanel(
-                    navState = nav_state,
-                    onStop = view_model::stopNavigation,
-                    onToggleMute = view_model::toggleMute,
-                )
+                // No inset on the Box: the panel's Surface must reach the
+                // physical bottom edge (a map sliver under the gesture bar
+                // looks like a rendering gap). NavigationPanel pads its
+                // own content clear of the bar. (No tab bar here:
+                // navigation owns the whole screen until it ends.)
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth(),
+                ) {
+                    NavigationPanel(
+                        navState = nav_state,
+                        onStop = view_model::stopNavigation,
+                        onToggleMute = view_model::toggleMute,
+                    )
+                }
             }
         }
     }

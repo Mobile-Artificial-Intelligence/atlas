@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -32,11 +33,18 @@ fun NavigationPanel(
     onToggleMute: () -> Unit,
 ) {
     Surface(
+        // No inset on the Surface: it paints all the way to the physical
+        // bottom edge (edge-to-edge), leaving no sliver of map under the
+        // gesture bar — the CONTENT below clears the bar instead.
         modifier = Modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surfaceContainer,
         shadowElevation = 4.dp,
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
+        Column(
+            modifier = Modifier
+                .navigationBarsPadding()
+                .padding(12.dp),
+        ) {
             when (navState) {
                 is NavigationCoordinator.NavState.Navigating -> {
                     val snapshot = navState.snapshot

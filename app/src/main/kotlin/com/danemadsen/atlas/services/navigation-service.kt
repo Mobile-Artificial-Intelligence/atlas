@@ -9,12 +9,14 @@ import android.content.pm.ServiceInfo
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.danemadsen.atlas.location.LocationTracker
 import com.danemadsen.atlas.nav.NavigationCoordinator
 import com.danemadsen.atlas.nav.NavigationProgress
 import com.danemadsen.atlas.nav.SoundPlayer
 import com.danemadsen.atlas.nav.TtsSpeaker
+import com.danemadsen.atlas.nav.metersBetween
 import com.danemadsen.atlas.nav.turnInstruction
 import com.danemadsen.atlas.routing.GeoPoint
 import com.danemadsen.atlas.routing.RouteResult
@@ -81,6 +83,18 @@ class NavigationService : Service() {
 
     /** True while a re-route job is in flight; blocks re-triggering. */
     @Volatile private var recalculating = false
+
+    /**
+     * When the last re-route STARTED, and from where. A re-route from a
+     * position the user hasn't left produces the same route again — and
+     * GPS drift at a standstill (indoors, a parking spot off the road) can
+     * read >40 m off forever, which used to re-fire the missed-turn cue
+     * every third fix. The next re-route waits until the fix has moved
+     * [REROUTE_MIN_DISPLACEMENT_METERS] from the last origin AND
+     * [REROUTE_COOLDOWN_MS] has passed; the first re-route is always live.
+     */
+    @Volatile private var last_reroute_at_ms = 0L
+    @Volatile private var last_reroute_origin: GeoPoint? = null
 
     /** True while the fix stream has been silent past the lost threshold. */
     @Volatile private var signalLost = false
@@ -155,6 +169,8 @@ class NavigationService : Service() {
         currentRoute = route
         progressEngine = NavigationProgress(route)
         recalculating = false
+        last_reroute_at_ms = 0L
+        last_reroute_origin = null
         signalLost = false
         latest_fix_ms.set(0)
 
@@ -219,7 +235,7 @@ class NavigationService : Service() {
                         recalculating = recalculating,
                     )
 
-                    if (step.events.recalculate && !recalculating) {
+                    if (step.events.recalculate && !recalculating && mayReroute(fix.point)) {
                         startReroute(session, fix.point, speaker, cues)
                     }
 
@@ -237,6 +253,24 @@ class NavigationService : Service() {
     }
 
     /**
+     * True when a new re-route is worth firing from [fix]: never while one
+     * is in flight ([recalculating]), and after one, only once the user has
+     * actually left its origin — re-routing the same spot can only produce
+     * the same route again, and stationary GPS drift must not loop the
+     * missed-turn cue. See [last_reroute_origin].
+     */
+    private fun mayReroute(fix: GeoPoint): Boolean {
+        val origin = last_reroute_origin ?: return true
+        val moved = metersBetween(origin, fix)
+        if (moved < REROUTE_MIN_DISPLACEMENT_METERS) return false
+        // elapsedRealtime, not the wall clock: this gate is the only thing
+        // standing between a stationary GPS cloud and the missed-turn loop,
+        // and an NTP correction or manual time change must not be able to
+        // open (or hold) it.
+        return SystemClock.elapsedRealtime() - last_reroute_at_ms >= REROUTE_COOLDOWN_MS
+    }
+
+    /**
      * Speaks "Recalculating.", plays the missed-turn cue, and swaps the
      * route when the corridor comes back. Runs as its OWN job so the fix
      * collector keeps consuming — every state it could interleave with is
@@ -244,6 +278,16 @@ class NavigationService : Service() {
      */
     private fun startReroute(session: Long, from: GeoPoint, speaker: TtsSpeaker, cues: SoundPlayer) {
         recalculating = true
+        last_reroute_at_ms = SystemClock.elapsedRealtime()
+        last_reroute_origin = from
+        // The one log the service emits: a user-visible cue (missed-turn
+        // sound, "Recalculating.") with nothing in logcat was undiagnosable
+        // when the cue looped at a standstill. Counts are how the reroute
+        // gate is verified — one fire per real departure, not one per fix.
+        android.util.Log.i(
+            "NavigationService",
+            "off-route reroute from (${from.lon}, ${from.lat}), session=$session",
+        )
         speaker.speak("Recalculating.")
         cues.play(SoundPlayer.Sound.TURN_MISSED)
         val previous_route = currentRoute
@@ -378,5 +422,15 @@ class NavigationService : Service() {
         private const val GPS_SIGNAL_LOST_MS = 10_000L
 
         private const val GPS_SIGNAL_POLL_MS = 2_000L
+
+        /**
+         * A follow-up re-route needs this much fix displacement from the
+         * last re-route's origin — see [mayReroute]. 25 m is beyond jitter
+         * at a standstill but a few seconds of real driving.
+         */
+        private const val REROUTE_MIN_DISPLACEMENT_METERS = 25.0
+
+        /** And at least this much time since the last re-route started. */
+        private const val REROUTE_COOLDOWN_MS = 10_000L
     }
 }
