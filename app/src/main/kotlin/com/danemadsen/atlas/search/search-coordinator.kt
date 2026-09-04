@@ -44,8 +44,17 @@ object SearchCoordinator {
     fun databaseFor(context: Context, archive: ArchiveInfo): File =
         SearchIndexer.databaseFile(searchDir(context), fingerprintFor(archive))
 
+    private fun completionFor(context: Context, archive: ArchiveInfo): File =
+        SearchIndexer.completionFile(searchDir(context), fingerprintFor(archive))
+
+    /**
+     * True only for a COMPLETE index: DB plus its completion marker. A
+     * cancelled or killed pass leaves a partial DB with no marker, which
+     * must count as "needs indexing" — the next launch re-runs the pass
+     * over it (inserts are idempotent on the unique keys).
+     */
     fun indexExists(context: Context, archive: ArchiveInfo): Boolean =
-        databaseFor(context, archive).isFile
+        databaseFor(context, archive).isFile && completionFor(context, archive).isFile
 
     /**
      * Deletes every index DB (a replaced archive must never read a stale
@@ -58,15 +67,18 @@ object SearchCoordinator {
     }
 
     /**
-     * Deletes index DBs other than the current archive's (an index-format
-     * bump orphans the previous fingerprint's DB — GBs of dead disk).
-     * Only called while the current DB does not exist yet, so no pass can
-     * hold an about-to-be-deleted file open.
+     * Deletes index DBs, markers and any other file other than the current
+     * archive's (an index-format bump orphans the previous fingerprint's DB
+     * — GBs of dead disk). Only called while the current index is NOT
+     * complete, and a pass never runs concurrently with this call, so no
+     * pass can hold an about-to-be-deleted file open. The current archive's
+     * own files are kept: a partial DB is worth resuming, not deleting.
      */
     fun deleteStaleIndexes(context: Context, archive: ArchiveInfo) {
-        val current = databaseFor(context, archive).name
+        val current_db = databaseFor(context, archive).name
+        val current_marker = completionFor(context, archive).name
         searchDir(context).listFiles()?.forEach { file ->
-            if (file.name != current) file.delete()
+            if (file.name != current_db && file.name != current_marker) file.delete()
         }
     }
 
@@ -81,12 +93,11 @@ object SearchCoordinator {
     ): SearchIndexer.PassResult? {
         if (!indexing.compareAndSet(false, true)) return null
         try {
-            // An index-format bump orphans the previous fingerprint's DB —
-            // GBs of dead disk. Only while the current DB does not exist
-            // yet, so no pass can hold an about-to-be-deleted file open.
-            val db_file = databaseFor(context, archive)
-            if (!db_file.isFile) deleteStaleIndexes(context, archive)
-            val indexer = SearchIndexer(context, db_file)
+            // An incomplete current index (partial DB, no marker) resumes;
+            // an index-format bump orphans the previous fingerprint's DB —
+            // GBs of dead disk — cleaned up while no pass holds it open.
+            if (!indexExists(context, archive)) deleteStaleIndexes(context, archive)
+            val indexer = SearchIndexer(context, databaseFor(context, archive))
             PmtilesReader(archiveFile.absolutePath).use { reader ->
                 val bounds = TileBounds(
                     west = archive.west,
@@ -110,16 +121,16 @@ object SearchCoordinator {
         centerLat: Double,
     ): List<PlaceHit> {
         if (!indexExists(context, archive)) return emptyList()
-        return searchPlaces(queryDao(context, archive), query, centerLon, centerLat)
+        return searchPlaces(queryDb(context, archive), query, centerLon, centerLat)
     }
 
-    private suspend fun queryDao(context: Context, archive: ArchiveInfo): PlaceDao {
+    private suspend fun queryDb(context: Context, archive: ArchiveInfo): PlaceDatabase {
         val fingerprint = fingerprintFor(archive)
-        cached_db?.takeIf { it.first == fingerprint }?.let { return it.second.placeDao() }
+        cached_db?.takeIf { it.first == fingerprint }?.let { return it.second }
         cached_db?.second?.close()
         cached_db = null
         val db = SearchIndexer(context, databaseFor(context, archive)).open()
         cached_db = fingerprint to db
-        return db.placeDao()
+        return db
     }
 }

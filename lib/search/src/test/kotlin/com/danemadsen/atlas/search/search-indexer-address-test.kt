@@ -1,6 +1,5 @@
 package com.danemadsen.atlas.search
 
-import com.danemadsen.atlas.pmtiles.mvt.MvtTile
 import com.danemadsen.atlas.pmtiles.mvt.TilePoint
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -10,7 +9,9 @@ import kotlin.test.assertTrue
  * The `address` layer extraction — hand-built MVT point tiles, no Android.
  * The protobuf writer is duplicated from lib/pmtiles' MvtDecoderTest (test
  * sources are not shared across modules; promoting it into pmtiles' main
- * sources would ship test-only code), extended with a POINT layer builder.
+ * sources would ship test-only code), extended with a POINT layer builder
+ * and non-string property values (the merge pipeline can emit house numbers
+ * as protobuf varints).
  */
 class SearchIndexerAddressTest {
 
@@ -54,12 +55,23 @@ class SearchIndexerAddressTest {
     )
 
     /**
+     * One MVT value cell — string_value (field 1) or int64_value (field 4),
+     * the shapes the merge pipeline and the extractor must both tolerate.
+     */
+    private fun mvtValue(value: Any): ByteArray = when (value) {
+        is String -> lenDelimited(1, value.toByteArray(Charsets.UTF_8))
+        is Long -> varintField(4, value)
+        is Int -> varintField(4, value.toLong())
+        else -> throw IllegalArgumentException("unsupported test value: $value")
+    }
+
+    /**
      * One MVT layer named [name], containing POINT features built from
      * (properties, tile-local point) pairs.
      */
     private fun buildLayer(
         name: String,
-        features: List<Pair<Map<String, String>, TilePoint>>,
+        features: List<Pair<Map<String, Any>, TilePoint>>,
     ): ByteArray {
         val out = java.io.ByteArrayOutputStream()
         out.write(varintField(15, 2L)) // version
@@ -79,7 +91,7 @@ class SearchIndexerAddressTest {
             out.write(lenDelimited(2, feature))
         }
         keys.forEach { out.write(lenDelimited(3, it.toByteArray(Charsets.UTF_8))) }
-        values.forEach { out.write(lenDelimited(4, lenDelimited(1, it.toByteArray(Charsets.UTF_8)))) }
+        values.forEach { out.write(lenDelimited(4, mvtValue(it))) }
         out.write(varintField(5, 4096L)) // extent
         return out.toByteArray()
     }
@@ -93,10 +105,10 @@ class SearchIndexerAddressTest {
 
     private val Z14_TILE = 14789 to 10053 // Melbourne CBD
 
-    private fun addressLayer(vararg features: Pair<Map<String, String>, TilePoint>): ByteArray =
+    private fun addressLayer(vararg features: Pair<Map<String, Any>, TilePoint>): ByteArray =
         buildLayer("address", features.toList())
 
-    private fun placeLayer(vararg features: Pair<Map<String, String>, TilePoint>): ByteArray =
+    private fun placeLayer(vararg features: Pair<Map<String, Any>, TilePoint>): ByteArray =
         buildLayer("place", features.toList())
 
     private val MELB = 144.9631 to -37.8142
@@ -115,24 +127,25 @@ class SearchIndexerAddressTest {
                 ),
             ),
         )
-        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile)
+        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile).addresses
         assertEquals(1, rows.size)
         val row = rows[0]
         assertEquals("69 Mott Street", row.name)
-        assertEquals("address", row.kind)
-        assertEquals("Singapore", row.subclass)
-        assertEquals(SearchIndexer.ADDRESS_RANK, row.rank)
-        assertEquals(14, row.zoom)
+        assertEquals("Singapore", row.city)
         assertTrue(row.dedupeKey.startsWith("address|"), row.dedupeKey)
+        assertTrue(row.lon in MELB.first - 0.01..MELB.first + 0.01, "lon was ${row.lon}")
+        assertTrue(row.lat in MELB.second - 0.01..MELB.second + 0.01, "lat was ${row.lat}")
     }
 
     @Test
-    fun `numeric number encodings read without a decimal tail`() {
+    fun `varint-encoded number reads without a decimal tail`() {
+        // A merge pipeline can encode the house number as a protobuf varint;
+        // the extractor must read it as a whole number ("69", never "69.0").
         val tile = buildTile(
             listOf(
                 addressLayer(
                     mapOf(
-                        "number" to "69",
+                        "number" to 69L,
                         "street" to "MOTT STREET",
                         "unit" to "",
                         "city" to "",
@@ -140,10 +153,10 @@ class SearchIndexerAddressTest {
                 ),
             ),
         )
-        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile)
+        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile).addresses
         assertEquals(1, rows.size)
         assertEquals("69 Mott Street", rows[0].name)
-        assertEquals(null, rows[0].subclass)
+        assertEquals(null, rows[0].city)
     }
 
     @Test
@@ -160,10 +173,10 @@ class SearchIndexerAddressTest {
                 ),
             ),
         )
-        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile)
+        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile).addresses
         assertEquals(1, rows.size)
         assertEquals("12/45 Harbour Rd", rows[0].name)
-        assertEquals("Sydney", rows[0].subclass)
+        assertEquals("Sydney", rows[0].city)
     }
 
     @Test
@@ -176,7 +189,7 @@ class SearchIndexerAddressTest {
                 ),
             ),
         )
-        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile)
+        val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile).addresses
         assertTrue(rows.isEmpty(), "blank number/street rows must be skipped")
     }
 
@@ -193,8 +206,8 @@ class SearchIndexerAddressTest {
                 mapOf("number" to "69", "street" to "HIGH ST", "city" to "") to TilePoint(4096, 2048),
             )),
         )
-        val row_a = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile_a)[0]
-        val row_b = SearchIndexer.candidatesFromTile(14, Z14_TILE.first + 1, Z14_TILE.second, tile_b)[0]
+        val row_a = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, tile_a).addresses[0]
+        val row_b = SearchIndexer.candidatesFromTile(14, Z14_TILE.first + 1, Z14_TILE.second, tile_b).addresses[0]
         assertTrue(row_a.dedupeKey != row_b.dedupeKey, "same text 4 km apart must not collapse")
     }
 
@@ -211,11 +224,11 @@ class SearchIndexerAddressTest {
             ),
         )
         val at_13 = SearchIndexer.candidatesFromTile(13, Z14_TILE.first, Z14_TILE.second, bytes)
-        assertTrue(at_13.none { it.kind == "address" }, "z13 must not yield address rows")
-        assertEquals(1, at_13.size)
+        assertTrue(at_13.addresses.isEmpty(), "z13 must not yield address rows")
+        assertEquals(1, at_13.places.size)
         val at_14 = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, bytes)
-        assertEquals(2, at_14.size)
-        assertTrue(at_14.any { it.kind == "address" })
+        assertEquals(1, at_14.places.size)
+        assertEquals(1, at_14.addresses.size)
     }
 
     @Test
@@ -224,6 +237,7 @@ class SearchIndexerAddressTest {
             mapOf("name" to "Melbourne", "class" to "city", "rank" to "3") to TilePoint(2048, 2048),
         )))
         val rows = SearchIndexer.candidatesFromTile(14, Z14_TILE.first, Z14_TILE.second, bytes)
-        assertTrue(rows.none { it.kind == "address" })
+        assertTrue(rows.addresses.isEmpty())
+        assertEquals(1, rows.places.size)
     }
 }

@@ -8,10 +8,12 @@ Selection: the `<cc>/countrywide` source when its latest job produced PMTiles
 (~14M G-NAF points in one archive for au); otherwise every per-source archive
 the country has (capped — a cap drop is printed, never silent).
 
-Exit status: 0 when at least one archive was downloaded or the country has no
-address data (logged — the caller skips the merge), 1 when the country has
-sources but not one archive could be fetched (a country silently losing its
-whole address layer must fail the build, not pass quietly).
+Exit status: 0 when at least one archive was downloaded; 1 otherwise. The
+caller runs this script only for countries the merge matrix expects address
+data for and then merges out/oa/*.pmtiles unconditionally — so "no sources"
+or "sources but no PMTiles" must fail the build here, not pass quietly for
+the glob to blow up (or silently skip) later. Partial per-source failures
+keep the job green with the drop warned.
 """
 import json
 import os
@@ -85,9 +87,10 @@ def main():
         and (source.get("source") or "").startswith(f"{country_code}/")
     ]
     if not in_country:
-        print(f"no OpenAddresses sources for {country_code} "
-              "(UK-style closed address data) — the merge is skipped")
-        return 0
+        print(f"::error::no OpenAddresses sources for {country_code} — the "
+              "workflow ran this step because the matrix expects an address "
+              "merge; fix the matrix entry or the source list")
+        return 1
 
     countrywide = next((
         source for source in in_country
@@ -106,6 +109,10 @@ def main():
                   f"of {len(per_source)} per-source archives "
                   f"(cap {MAX_FALLBACK_SOURCES}); the merge is partial")
         chosen = per_source[:MAX_FALLBACK_SOURCES]
+        if not chosen:
+            print(f"::error::{country_code} has address sources but none "
+                  "produced PMTiles — the merge cannot run")
+            return 1
 
     downloaded = 0
     for source in chosen:

@@ -27,6 +27,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -537,8 +538,13 @@ class AtlasViewModel(
     fun rebuildSearchIndex() {
         val archive = (_state.value as? AtlasUiState.MapReady)?.archive ?: return
         _settingsOpen.value = false
-        searchIndexJob?.cancel()
         viewModelScope.launch {
+            // cancel() alone is asynchronous — ensureSearchIndex below would
+            // see the old job still "active" and return without scheduling
+            // anything, leaving search dead until the next launch. Wait for
+            // the pass to unwind (it checks cancellation every 256 tiles /
+            // zoom bracket) before wiping the DBs it may still hold open.
+            searchIndexJob?.cancelAndJoin()
             SearchCoordinator.deleteIndexes(app)
             _searchState.value = SearchUiState.Idle
             ensureSearchIndex(archive)
@@ -626,9 +632,14 @@ class AtlasViewModel(
                     .remove(KEY_PROFILE)
                     .apply()
                 initial_camera = null
-                // Nor its search index: wipe the old DBs, then build the
-                // cheap pass for the new archive (tens of seconds, surface
-                // it through the search state).
+                // Nor its search index: unwind the old archive's running
+                // pass (if any) BEFORE wiping the DBs — cancel() alone is
+                // asynchronous, and the still-"active" job would make
+                // ensureSearchIndex return early and leave the new archive
+                // unindexed until the next launch. Then wipe the old DBs and
+                // build the cheap pass for the new archive (tens of
+                // seconds, surfaced through the search state).
+                searchIndexJob?.cancelAndJoin()
                 SearchCoordinator.deleteIndexes(app)
                 ensureSearchIndex(info)
                 // The warmup is keyed to nothing archive-specific — but a

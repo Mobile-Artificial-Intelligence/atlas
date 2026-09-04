@@ -23,7 +23,10 @@ import java.security.MessageDigest
  *
  * One DB per archive fingerprint ([databaseFile]): a new import never reads
  * a stale index, and replacing the archive wipes the old DB with the
- * archive-scoped directory.
+ * archive-scoped directory. A [completion marker][completionFile] is written
+ * only after a pass runs to the end — a cancelled or killed pass leaves a
+ * partial DB with no marker, which the resume check treats as "not indexed
+ * yet" (the pass re-runs; inserts are idempotent on the unique keys).
  *
  * The import-time pass runs in two stages: first the `place` layer at zooms
  * [MIN_INDEX_ZOOM]..[MAX_CHEAP_ZOOM] — countries down to neighbourhoods —
@@ -31,18 +34,26 @@ import java.security.MessageDigest
  * useful immediately; then the `address` layer (OpenAddresses points merged
  * into the archive by the tile CI) at [ADDRESS_INDEX_ZOOM] — a full
  * continental z14 sweep over millions of rows, committing in batches so a
- * cancelled import loses minutes, not the whole pass. [candidatesFromTile]
- * is also called by the graph build's scan hook (deep pass: `poi` + z14
- * `place` + `address`), which already holds the decompressed tiles in
- * memory and must not re-read the archive.
+ * cancelled import loses minutes, not the whole pass. Address rows go to
+ * their own table ([AddressEntity]), never the place table.
+ *
+ * [candidatesFromTile] is also called by the graph build's scan hook (deep
+ * pass: `place` + `poi` at the tile's own zoom plus `address` rows), which
+ * already holds the decompressed tiles in memory and must not re-read the
+ * archive.
  */
 class SearchIndexer(
     private val context: Context,
     private val databaseFile: File,
 ) {
 
-    /** Rows a pass offered vs. rows it genuinely added. */
-    data class PassResult(val placesSeen: Int, val placesInserted: Int)
+    /** Rows a pass offered vs. rows it genuinely added, per table. */
+    data class PassResult(
+        val placesSeen: Int,
+        val placesInserted: Int,
+        val addressesSeen: Int = 0,
+        val addressesInserted: Int = 0,
+    )
 
     /** A fresh DB handle; the caller owns closing it. */
     fun open(): PlaceDatabase {
@@ -57,7 +68,9 @@ class SearchIndexer(
     /**
      * The import-time pass: stage 1 indexes every `place`/`poi` feature in
      * zooms [MIN_INDEX_ZOOM]..min([MAX_CHEAP_ZOOM], archive maxZoom); stage
-     * 2 sweeps the `address` layer at [ADDRESS_INDEX_ZOOM].
+     * 2 sweeps the `address` layer at [ADDRESS_INDEX_ZOOM] when the archive
+     * carries one (GB/US builds merge no addresses; their sweep would spend
+     * minutes walking z14 tiles to find no `address` layer).
      */
     suspend fun indexCheapPass(
         reader: PmtilesReader,
@@ -65,10 +78,7 @@ class SearchIndexer(
     ): PassResult = withContext(Dispatchers.IO) {
         val db = open()
         try {
-            // Address rows bypass this map entirely (14M entries would OOM;
-            // their dedupe is the unique dedupeKey index + insert-or-ignore),
-            // so it only ever holds place/poi keys.
-            val existing = existingZooms(db, exceptKind = KIND_ADDRESS)
+            val existing = existingZooms(db)
             val offered = HashMap<String, Int>(existing.size)
             var seen = 0
             var inserted = 0
@@ -88,91 +98,81 @@ class SearchIndexer(
                 // visitor cannot suspend, and one zoom is the bounded window
                 // a cancelled import waits out.
                 currentCoroutineContext().ensureActive()
-                inserted += flush(db, batch)
+                inserted += flushPlaces(db, batch)
             }
             // Stage 1 commits (and its FTS rows) BEFORE the address sweep:
             // Room creates the DB file at open(), so search is already
             // serving against these rows while millions of addresses index.
             db.placeDao().rebuildFts()
 
-            // Stage 2: the address sweep at one zoom — the tile visitor
-            // cannot suspend, so batching and cancellation both happen
-            // off-visitor: candidates stream through an unbounded channel
-            // (trySend never blocks or fails into it) drained by a flusher,
-            // and the Job handle is checked non-suspendingly every
-            // [CANCEL_CHECK_TILES] tiles.
-            val job = currentCoroutineContext()[Job]
-            coroutineScope {
-                val channel = Channel<PlaceEntity>(Channel.UNLIMITED)
-                val drain = launch(start = CoroutineStart.LAZY) {
-                    val address_batch = ArrayList<PlaceEntity>(ADDRESS_BATCH_ROWS)
-                    for (entity in channel) {
-                        address_batch.add(entity)
-                        if (address_batch.size >= ADDRESS_BATCH_ROWS) {
-                            inserted += flush(db, address_batch)
+            var addresses_seen = 0
+            var addresses_inserted = 0
+            if (archiveHasAddressLayer(reader)) {
+                // Stage 2: the address sweep at one zoom — the tile visitor
+                // cannot suspend, so batching and cancellation both happen
+                // off-visitor: candidates stream through an unbounded channel
+                // (trySend never blocks or fails into it) drained by a
+                // flusher, and the Job handle is checked non-suspendingly
+                // every [CANCEL_CHECK_TILES] tiles.
+                val job = currentCoroutineContext()[Job]
+                coroutineScope {
+                    val channel = Channel<AddressEntity>(Channel.UNLIMITED)
+                    val drain = launch(start = CoroutineStart.LAZY) {
+                        val address_batch = ArrayList<AddressEntity>(ADDRESS_BATCH_ROWS)
+                        for (entity in channel) {
+                            address_batch.add(entity)
+                            if (address_batch.size >= ADDRESS_BATCH_ROWS) {
+                                addresses_inserted += flushAddresses(db, address_batch)
+                            }
+                        }
+                        addresses_inserted += flushAddresses(db, address_batch)
+                    }
+                    drain.start()
+                    var since_check = 0
+                    reader.forEachTileInBounds(ADDRESS_INDEX_ZOOM, bounds) { zoom, x, y, bytes ->
+                        for (candidate in addressCandidates(MvtTile.decode(bytes), zoom, x, y)) {
+                            addresses_seen++
+                            channel.trySend(candidate)
+                        }
+                        if (++since_check >= CANCEL_CHECK_TILES) {
+                            since_check = 0
+                            job?.ensureActive()
                         }
                     }
-                    inserted += flush(db, address_batch)
+                    channel.close()
+                    drain.join()
                 }
-                drain.start()
-                var since_check = 0
-                reader.forEachTileInBounds(ADDRESS_INDEX_ZOOM, bounds) { zoom, x, y, bytes ->
-                    for (candidate in addressCandidates(MvtTile.decode(bytes), zoom, x, y)) {
-                        seen++
-                        channel.trySend(candidate)
-                    }
-                    if (++since_check >= CANCEL_CHECK_TILES) {
-                        since_check = 0
-                        job?.ensureActive()
-                    }
-                }
-                channel.close()
-                drain.join()
+                // No address_fts rebuild: Room's content-entity triggers
+                // already kept the FTS shadow in sync per insert, and a
+                // rebuild would re-index all millions of rows from scratch —
+                // a full extra pass that buys nothing.
             }
-            db.placeDao().rebuildFts()
-            PassResult(seen, inserted)
+            // Only a pass that ran to the end marks the index complete — a
+            // cancellation unwinds before this line, so the partial DB stays
+            // unmarked and the next launch resumes it.
+            completionMarkerFile.writeText("")
+            PassResult(seen, inserted, addresses_seen, addresses_inserted)
         } finally {
             db.close()
         }
     }
 
     /**
-     * The deep pass over already-read tiles (the graph build's scan hook):
-     * `place` + `poi` features in the tiles' own zooms, plus `address`
-     * features at [ADDRESS_INDEX_ZOOM]-and-above tiles.
+     * True when the archive's metadata advertises the merged `address`
+     * layer. The needle is the compact vector_layers id tile-join writes
+     * (`"id":"address"`); tilestats carries sample street/number values but
+     * never that quoted form.
      */
-    suspend fun indexDeepPass(
-        db: PlaceDatabase,
-        tiles: Sequence<DeepPassTile>,
-    ): PassResult = withContext(Dispatchers.IO) {
-        val existing = existingZooms(db, exceptKind = KIND_ADDRESS)
-        val offered = HashMap<String, Int>(existing.size)
-        var seen = 0
-        var inserted = 0
-        val batch = ArrayList<PlaceEntity>(BATCH_ROWS)
-        for (tile in tiles) {
-            for (candidate in candidatesFromTile(tile.zoom, tile.x, tile.y, tile.bytes)) {
-                seen++
-                // Addresses bypass the in-memory dedupe (see [indexCheapPass]);
-                // their unique dedupeKey index + insert-or-ignore absorbs the
-                // overlap with the cheap pass and re-scanned buckets.
-                if (candidate.kind == KIND_ADDRESS || beatsExisting(candidate, existing, offered)) {
-                    if (candidate.kind != KIND_ADDRESS) {
-                        offered[candidate.dedupeKey] = candidate.zoom
-                    }
-                    batch.add(candidate)
-                }
-            }
-            currentCoroutineContext().ensureActive()
-            if (batch.size >= BATCH_ROWS) inserted += flush(db, batch)
-        }
-        inserted += flush(db, batch)
-        db.placeDao().rebuildFts()
-        PassResult(seen, inserted)
-    }
+    private fun archiveHasAddressLayer(reader: PmtilesReader): Boolean =
+        reader.header.maxZoom >= ADDRESS_INDEX_ZOOM &&
+            reader.metadata().contains(ADDRESS_LAYER_NEEDLE)
 
-    /** One already-decompressed tile handed to [indexDeepPass]. */
-    class DeepPassTile(val zoom: Int, val x: Int, val y: Int, val bytes: ByteArray)
+    /**
+     * The completion marker beside the DB — written only by a pass that
+     * finished, so [indexExists] semantics stay "fully indexed or absent".
+     */
+    private val completionMarkerFile: File
+        get() = File(databaseFile.parentFile, databaseFile.name.removeSuffix(".db") + ".done")
 
     /**
      * True when [candidate] is the best zoom seen for its key so far —
@@ -191,23 +191,28 @@ class SearchIndexer(
         return candidate.zoom < best_zoom
     }
 
-    /** The unique dedupeKey -> zoom map already in the DB, minus [exceptKind]. */
-    private suspend fun existingZooms(
-        db: PlaceDatabase,
-        exceptKind: String,
-    ): HashMap<String, Int> {
+    /** The unique dedupeKey -> zoom map already in the place table. */
+    private suspend fun existingZooms(db: PlaceDatabase): HashMap<String, Int> {
         val existing = HashMap<String, Int>()
-        db.placeDao().existingZoomsExcept(exceptKind).forEach { row ->
+        db.placeDao().existingZooms().forEach { row ->
             existing[dedupeKey(row.name, row.kind)] = row.zoom
         }
         return existing
     }
 
-    private suspend fun flush(db: PlaceDatabase, batch: MutableList<PlaceEntity>): Int {
+    private suspend fun flushPlaces(db: PlaceDatabase, batch: MutableList<PlaceEntity>): Int {
         if (batch.isEmpty()) return 0
         val rows = batch.toList()
         batch.clear()
         db.placeDao().insertBatch(rows)
+        return rows.size
+    }
+
+    private suspend fun flushAddresses(db: PlaceDatabase, batch: MutableList<AddressEntity>): Int {
+        if (batch.isEmpty()) return 0
+        val rows = batch.toList()
+        batch.clear()
+        db.addressDao().insertAll(rows)
         return rows.size
     }
 
@@ -237,7 +242,7 @@ class SearchIndexer(
         const val ADDRESS_INDEX_ZOOM = 14
 
         /**
-         * Rank for address rows: above OMT's unranked places/POIs (MAX_RANK
+         * Rank for address hits: above OMT's unranked places/POIs (MAX_RANK
          * = 20) but below every ranked place (OMT places rank 1..11), so a
          * broad query like "melbourne" still surfaces the city ahead of
          * thousands of "69 Melbourne St" rows.
@@ -258,31 +263,48 @@ class SearchIndexer(
         const val CANCEL_CHECK_TILES = 256
 
         /**
-         * Bumped whenever the extraction rules change in a way an existing
-         * index cannot absorb — folded into [archiveFingerprint] so every
-         * archive re-indexes exactly once per format change.
+         * The metadata needle proving an archive carries the merged
+         * `address` layer — see [archiveHasAddressLayer].
          */
-        const val INDEX_FORMAT = 2
+        const val ADDRESS_LAYER_NEEDLE = "\"id\":\"address\""
+
+        /**
+         * Bumped whenever the extraction or schema rules change in a way an
+         * existing index cannot absorb — folded into [archiveFingerprint]
+         * so every archive re-indexes exactly once per format change. 3:
+         * addresses moved to their own table + FTS (split from the place
+         * schema).
+         */
+        const val INDEX_FORMAT = 3
 
         /** `"<name>|<kind>"` — the unique key place rows dedupe on. */
         fun dedupeKey(name: String, kind: String): String = "$name|$kind"
 
         /**
          * Every indexable place, POI and (at [ADDRESS_INDEX_ZOOM] and up)
-         * address from one decompressed MVT tile. Point features only: area
-         * places are point-represented by OpenMapTiles, and the picker
-         * wants a flyable coordinate, not an outline.
+         * address from one decompressed MVT tile — decoded once, split by
+         * table. Point features only: area places are point-represented by
+         * OpenMapTiles, and the picker wants a flyable coordinate, not an
+         * outline.
          */
-        fun candidatesFromTile(zoom: Int, x: Int, y: Int, bytes: ByteArray) : List<PlaceEntity> {
+        fun candidatesFromTile(zoom: Int, x: Int, y: Int, bytes: ByteArray): TileCandidates {
             val tile = MvtTile.decode(bytes)
-            val result = ArrayList(placeCandidates(tile, zoom, x, y))
-            if (zoom >= ADDRESS_INDEX_ZOOM) {
-                result.addAll(addressCandidates(tile, zoom, x, y))
+            val places = placeCandidates(tile, zoom, x, y)
+            val addresses = if (zoom >= ADDRESS_INDEX_ZOOM) {
+                addressCandidates(tile, zoom, x, y)
+            } else {
+                emptyList()
             }
-            return result
+            return TileCandidates(places, addresses)
         }
 
-        /** Named points of the `place` and `poi` layers — today's place rows. */
+        /** The per-tile extraction result, split by destination table. */
+        class TileCandidates(
+            val places: List<PlaceEntity>,
+            val addresses: List<AddressEntity>,
+        )
+
+        /** Named points of the `place` and `poi` layers — the place table's rows. */
         private fun placeCandidates(tile: MvtTile, zoom: Int, x: Int, y: Int): List<PlaceEntity> {
             val result = ArrayList<PlaceEntity>(16)
             for (layer_name in listOf(LAYER_PLACE, LAYER_POI)) {
@@ -318,12 +340,12 @@ class SearchIndexer(
         /**
          * OpenAddresses rows from the `address` layer. Only features with
          * both a number and a street are indexed — a lone "69" would flood
-         * FTS with unsearchable tokens. Rows keep the city (title-cased) as
-         * their subclass so the results drawer shows a useful subtitle.
+         * FTS with unsearchable tokens. Rows keep the city (title-cased) for
+         * the results drawer's subtitle.
          */
-        internal fun addressCandidates(tile: MvtTile, zoom: Int, x: Int, y: Int): List<PlaceEntity> {
+        internal fun addressCandidates(tile: MvtTile, zoom: Int, x: Int, y: Int): List<AddressEntity> {
             val layer = tile.layer(LAYER_ADDRESS) ?: return emptyList()
-            val result = ArrayList<PlaceEntity>(8)
+            val result = ArrayList<AddressEntity>(8)
             for (feature in layer.features) {
                 if (feature.geomType != MvtGeomType.POINT) continue
                 val props = layer.properties(feature)
@@ -337,14 +359,11 @@ class SearchIndexer(
                 val unit = addressText(props, PROP_UNIT)
                 val city = addressText(props, PROP_CITY)
                 result.add(
-                    PlaceEntity(
+                    AddressEntity(
                         name = addressName(number, unit, street),
-                        kind = KIND_ADDRESS,
-                        subclass = city.takeIf { it.isNotEmpty() }?.let { titleCaseAddressText(it) },
-                        rank = ADDRESS_RANK,
+                        city = city.takeIf { it.isNotEmpty() }?.let { titleCaseAddressText(it) },
                         lon = lon,
                         lat = lat,
-                        zoom = zoom,
                         dedupeKey = addressDedupeKey(number, unit, street, lat, lon),
                     ),
                 )
@@ -393,7 +412,16 @@ class SearchIndexer(
         fun databaseFile(searchDir: File, fingerprint: String): File =
             File(searchDir, "search-$fingerprint.db")
 
-        /** Deletes every index DB under [searchDir] (a replaced archive). */
+        /**
+         * The completion marker for [databaseFile]'s fingerprint — written
+         * only by a pass that ran to the end. [indexExists] requires BOTH
+         * files; the marker alone (DB deleted by hand) or the DB alone
+         * (cancelled or killed pass) must count as "needs indexing".
+         */
+        fun completionFile(searchDir: File, fingerprint: String): File =
+            File(searchDir, "search-$fingerprint.done")
+
+        /** Deletes every index DB and marker under [searchDir] (a replaced archive). */
         fun deleteAll(searchDir: File) {
             searchDir.listFiles()?.forEach { it.delete() }
             searchDir.delete()

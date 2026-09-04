@@ -41,13 +41,13 @@ interface PlaceDao {
 
     /**
      * The dedupe probe for incremental indexing: the lowest zoom each
-     * existing (name, kind) pair was already indexed at, EXCLUDING
-     * [exceptKind] rows. Address rows (millions) must never be loaded into
-     * an in-memory dedupe map — their dedupe is the unique dedupeKey index
-     * plus insert-or-ignore — so passes filter them out in SQL.
+     * existing (name, kind) pair was already indexed at. This only ever sees
+     * place/poi rows — address rows live in their own table
+     * ([AddressEntity]) and dedupe on their unique key in SQL, never in an
+     * in-memory map.
      */
-    @Query("SELECT name, kind, zoom FROM place WHERE kind <> :exceptKind")
-    suspend fun existingZoomsExcept(exceptKind: String): List<PlaceZoomRow>
+    @Query("SELECT name, kind, zoom FROM place")
+    suspend fun existingZooms(): List<PlaceZoomRow>
 
     /**
      * Insert-or-ignore on the unique dedupeKey: a rebuilt or overlapping
@@ -78,7 +78,22 @@ interface PlaceDao {
 /** Row shape of [PlaceDao.existingZooms]. */
 data class PlaceZoomRow(val name: String, val kind: String, val zoom: Int)
 
-@Database(entities = [PlaceEntity::class, PlaceFtsEntity::class], version = 1, exportSchema = false)
+/**
+ * The search index for one archive. Version stays 1 with no migrations on
+ * purpose: every DB file is named after the archive fingerprint (which folds
+ * in [SearchIndexer.INDEX_FORMAT]), so a schema change bumps the format, gets
+ * a brand-new file name, and never opens a stale file — migrations would be
+ * dead code.
+ */
+@Database(
+    entities = [
+        PlaceEntity::class, PlaceFtsEntity::class,
+        AddressEntity::class, AddressFtsEntity::class,
+    ],
+    version = 1,
+    exportSchema = false,
+)
 abstract class PlaceDatabase : RoomDatabase() {
     abstract fun placeDao(): PlaceDao
+    abstract fun addressDao(): AddressDao
 }

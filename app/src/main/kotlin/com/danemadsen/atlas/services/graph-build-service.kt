@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.danemadsen.atlas.data.ArchiveStore
 import com.danemadsen.atlas.graph.GraphBuildManager
+import com.danemadsen.atlas.search.AddressEntity
 import com.danemadsen.atlas.search.PlaceDatabase
 import com.danemadsen.atlas.search.PlaceEntity
 import com.danemadsen.atlas.search.SearchCoordinator
@@ -294,29 +295,50 @@ class GraphBuildService : Service() {
         if (!SearchCoordinator.indexExists(this, archive)) return null
         val indexer = SearchIndexer(this, SearchCoordinator.databaseFor(this, archive))
         val db = indexer.open()
-        val channel = Channel<PlaceEntity>(Channel.UNLIMITED)
+        val place_channel = Channel<PlaceEntity>(Channel.UNLIMITED)
+        val address_channel = Channel<AddressEntity>(Channel.UNLIMITED)
         // The sink runs inline in the build thread's scan visitor (it must
-        // not block); the DB writes happen here, off the build thread.
+        // not block); the DB writes happen here, off the build thread. Places
+        // and addresses drain to their own tables — addresses are the bulk
+        // (a bucket scan re-offers them constantly) and their FTS shadow
+        // syncs per insert via Room's content-entity triggers, so there is
+        // no rebuild here: the place_fts rebuild is a small-table compaction
+        // run only when this pass offered place rows at all.
         val drain = scope.launch(Dispatchers.IO) {
-            val batch = ArrayList<PlaceEntity>(SearchIndexer.BATCH_ROWS)
-            for (entity in channel) {
-                batch.add(entity)
-                if (batch.size >= SearchIndexer.BATCH_ROWS) {
-                    db.placeDao().insertBatch(batch)
-                    batch.clear()
+            val place_batch = ArrayList<PlaceEntity>(SearchIndexer.BATCH_ROWS)
+            var place_rows = 0
+            for (entity in place_channel) {
+                place_batch.add(entity)
+                if (place_batch.size >= SearchIndexer.BATCH_ROWS) {
+                    db.placeDao().insertBatch(place_batch)
+                    place_rows += place_batch.size
+                    place_batch.clear()
                 }
             }
-            if (batch.isNotEmpty()) db.placeDao().insertBatch(batch)
-            db.placeDao().rebuildFts()
+            if (place_batch.isNotEmpty()) {
+                db.placeDao().insertBatch(place_batch)
+                place_rows += place_batch.size
+            }
+            if (place_rows > 0) db.placeDao().rebuildFts()
+            val address_batch = ArrayList<AddressEntity>(SearchIndexer.ADDRESS_BATCH_ROWS)
+            for (entity in address_channel) {
+                address_batch.add(entity)
+                if (address_batch.size >= SearchIndexer.ADDRESS_BATCH_ROWS) {
+                    db.addressDao().insertAll(address_batch)
+                    address_batch.clear()
+                }
+            }
+            if (address_batch.isNotEmpty()) db.addressDao().insertAll(address_batch)
         }
         return DeepPass(
             db = db,
-            channel = channel,
+            placeChannel = place_channel,
+            addressChannel = address_channel,
             drain = drain,
             sink = { zoom, x, y, bytes ->
-                for (candidate in SearchIndexer.candidatesFromTile(zoom, x, y, bytes)) {
-                    channel.trySend(candidate)
-                }
+                val candidates = SearchIndexer.candidatesFromTile(zoom, x, y, bytes)
+                for (place in candidates.places) place_channel.trySend(place)
+                for (address in candidates.addresses) address_channel.trySend(address)
             },
         )
     }
@@ -324,7 +346,8 @@ class GraphBuildService : Service() {
     /** One run's deep pass: the sink the scan calls, drained and closed by [finish]. */
     private class DeepPass(
         private val db: PlaceDatabase,
-        private val channel: Channel<PlaceEntity>,
+        private val placeChannel: Channel<PlaceEntity>,
+        private val addressChannel: Channel<AddressEntity>,
         private val drain: Job,
         val sink: (zoom: Int, x: Int, y: Int, bytes: ByteArray) -> Unit,
     ) {
@@ -335,7 +358,8 @@ class GraphBuildService : Service() {
          */
         suspend fun finish() {
             withContext(NonCancellable) {
-                channel.close()
+                placeChannel.close()
+                addressChannel.close()
                 drain.join()
                 db.close()
             }

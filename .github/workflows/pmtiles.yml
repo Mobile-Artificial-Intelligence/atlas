@@ -107,15 +107,23 @@ jobs:
       # The mapbox tippecanoe can't read or write PMTiles; the felt fork's
       # tile-join can do both, which is what makes the one-file merge
       # possible without an mbtiles round-trip.
+      # tile-join 2.79 rejects --version (exit 101) — "can I run it" is
+      # proved by the usage banner instead.
       - name: Build tile-join
         run: |
           if [ -x tippecanoe/tile-join ]; then
-            tippecanoe/tile-join --version && exit 0
+            usage=$(tippecanoe/tile-join 2>&1 || true)
+            if echo "$usage" | grep -q "Usage:"; then
+              echo "tile-join restored from cache"
+              exit 0
+            fi
+            echo "cached tile-join is broken; rebuilding"
           fi
           sudo apt-get install -y -qq libsqlite3-dev
           git clone --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git
           make -C tippecanoe -j"$(nproc)" tile-join
-          tippecanoe/tile-join --version
+          usage=$(tippecanoe/tile-join 2>&1 || true)
+          echo "$usage" | grep -q "Usage:" || { echo "tile-join build failed"; exit 1; }
 
       - name: Fetch OpenAddresses
         run: python3 .github/scripts/fetch-openaddresses.py sg out/oa
@@ -270,16 +278,24 @@ jobs:
       # The mapbox tippecanoe can't read or write PMTiles; the felt fork's
       # tile-join can do both, which is what makes the one-file merge
       # possible without an mbtiles round-trip.
+      # tile-join 2.79 rejects --version (exit 101) — "can I run it" is
+      # proved by the usage banner instead.
       - name: Build tile-join
         if: matrix.oa_cc != ''
         run: |
           if [ -x tippecanoe/tile-join ]; then
-            tippecanoe/tile-join --version && exit 0
+            usage=$(tippecanoe/tile-join 2>&1 || true)
+            if echo "$usage" | grep -q "Usage:"; then
+              echo "tile-join restored from cache"
+              exit 0
+            fi
+            echo "cached tile-join is broken; rebuilding"
           fi
           sudo apt-get install -y -qq libsqlite3-dev
           git clone --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git
           make -C tippecanoe -j"$(nproc)" tile-join
-          tippecanoe/tile-join --version
+          usage=$(tippecanoe/tile-join 2>&1 || true)
+          echo "$usage" | grep -q "Usage:" || { echo "tile-join build failed"; exit 1; }
 
       - name: Fetch OpenAddresses
         if: matrix.oa_cc != ''

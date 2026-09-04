@@ -108,3 +108,5 @@ key.properties
 *.fls
 *.fdb_latexmk
 *.toc
+# python byte-cache from the CI scripts
+__pycache__/

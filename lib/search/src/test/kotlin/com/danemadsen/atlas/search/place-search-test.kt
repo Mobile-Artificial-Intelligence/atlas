@@ -2,23 +2,48 @@ package com.danemadsen.atlas.search
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class PlaceSearchTest {
 
     @Test
-    fun `prefix star is appended to every token`() {
-        assertEquals("melb*", ftsPattern("melb"))
-        assertEquals("port* macqu*", ftsPattern("  port   macqu "))
+    fun `every token becomes a quoted prefix`() {
+        assertEquals("\"melb\"*", ftsPattern("melb"))
+        assertEquals("\"port\"* \"macqu\"*", ftsPattern("  port   macqu "))
     }
 
     @Test
-    fun `quotes are stripped so match syntax cannot be injected`() {
-        // The appended star also disarms bare operators: "OR*" is a term,
-        // not FTS's OR operator (which must be bare uppercase "OR").
-        assertEquals("port* OR*", ftsPattern("\"port\" OR*"))
-        assertEquals("near*", ftsPattern("near\"*"))
+    fun `match syntax cannot be injected`() {
+        // Every token is wrapped in quotes before the star, so a bare OR is
+        // a term (never FTS's OR operator) and user quotes are stripped
+        // first so they cannot break out of the wrapping.
+        assertEquals("\"port\"* \"OR\"*", ftsPattern("\"port\" OR"))
+        assertEquals("\"near\"*", ftsPattern("near\"*"))
+    }
+
+    @Test
+    fun `dash-prefixed and hyphenated tokens stay literal terms`() {
+        // A leading dash would otherwise read as FTS's NOT operator (or
+        // crash the parser); a mid-token hyphen splits into an adjacent
+        // phrase, matching the same shape the unicode61 tokenizer stored
+        // for the hyphenated name.
+        assertEquals("\"-north\"* \"st\"*", ftsPattern("-north st"))
+        assertEquals("\"north-west\"* \"rd\"*", ftsPattern("north-west rd"))
+    }
+
+    @Test
+    fun `address-shaped queries hit the address table, others do not`() {
+        assertTrue(isAddressQuery("69 mott street"), "number + street")
+        assertTrue(isAddressQuery("12/45 harbour"), "unit-slash-number + street")
+        assertTrue(isAddressQuery("69 mott"), "partial number + street")
+        // No word token: a bare number stays on the place-only path (it
+        // would be a huge address prefix for no useful result).
+        assertFalse(isAddressQuery("69"), "bare number")
+        // No digit token: a street or place name never enumerates addresses.
+        assertFalse(isAddressQuery("melbourne"), "single token")
+        assertFalse(isAddressQuery("queen st"), "street name only")
     }
 
     @Test
@@ -67,23 +92,19 @@ class PlaceSearchTest {
 
     @Test
     fun `fingerprint embeds the index format`() {
-        val base = SearchIndexer.archiveFingerprint(
-            "australia.pmtiles", 1317773274L,
-            68.1, -57.1, 169.0, -8.8, 0, 14,
-        )
-        // Bumping INDEX_FORMAT must rebuild every index exactly once. The
-        // digest cannot be varied from the test (a companion const), so
-        // this asserts the contract that matters: the format is part of
-        // the fingerprint's canonical string and a stable constant.
-        assertTrue(SearchIndexer.INDEX_FORMAT >= 2, "index format bumped for address rows")
-        assertEquals(64, base.length)
+        // INDEX_FORMAT is folded into the fingerprint's canonical string:
+        // bumping it rebuilds every index exactly once (new DB file name,
+        // new completion marker). The exact value is asserted on purpose —
+        // a bump must be a conscious change that fails this line, not a
+        // silent edit that strands old DBs as unexplained stale disk.
+        assertEquals(3, SearchIndexer.INDEX_FORMAT, "index format — 3: address table split")
     }
 
     @Test
     fun `street address queries tokenize into the address row`() {
-        // ANDed tokens over the composed name "69 Mott Street": the number
-        // is a first-class FTS token, not punctuation to strip.
-        assertEquals("69* mott* street*", ftsPattern("69 mott street"))
+        // ANDed quoted prefixes over the composed name "69 Mott Street":
+        // the number is a first-class FTS token, not punctuation to strip.
+        assertEquals("\"69\"* \"mott\"* \"street\"*", ftsPattern("69 mott street"))
     }
 
     @Test
@@ -95,6 +116,15 @@ class PlaceSearchTest {
         val same_cell = addressDedupeKey("69", "", "MOTT ST", -37.81425, 144.96315)
         assertTrue(here != nearby, "same text 4 km apart must have different keys")
         assertEquals(here, same_cell, "the same ~100 m cell must reproduce the key")
+    }
+
+    @Test
+    fun `the unit participates in the address dedupe key`() {
+        // Unit 12 and street-level 45 of the same building are two rows —
+        // the unit is part of the key, not folded into the number.
+        val with_unit = addressDedupeKey("45", "12", "HARBOUR RD", -37.8142, 144.9631)
+        val without_unit = addressDedupeKey("45", "", "HARBOUR RD", -37.8142, 144.9631)
+        assertTrue(with_unit != without_unit, "unit vs no-unit must be different rows")
     }
 
     @Test
@@ -111,8 +141,11 @@ class PlaceSearchTest {
     }
 
     @Test
-    fun `database file name embeds the fingerprint`() {
-        val file = SearchIndexer.databaseFile(java.io.File("/tmp/search"), "abc123")
-        assertEquals(java.io.File("/tmp/search/search-abc123.db"), file)
+    fun `database and completion-marker names embed the fingerprint`() {
+        val dir = java.io.File("/tmp/search")
+        assertEquals(java.io.File("/tmp/search/search-abc123.db"), SearchIndexer.databaseFile(dir, "abc123"))
+        // The marker is written only by a pass that ran to the end, and
+        // lives beside the DB it completes.
+        assertEquals(java.io.File("/tmp/search/search-abc123.done"), SearchIndexer.completionFile(dir, "abc123"))
     }
 }
