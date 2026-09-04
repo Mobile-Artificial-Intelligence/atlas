@@ -112,7 +112,15 @@ object SearchCoordinator {
         }
     }
 
-    /** Top hits for [query] around the center; empty without an index. */
+    /**
+     * Top hits for [query] around the center; empty without an index.
+     *
+     * Serves from a PARTIAL index too: stage 1's place rows commit before
+     * the address sweep starts (its own doc contract), so search works
+     * during the minutes-to-hours the address stage runs — gating on the
+     * completion marker instead would dead-search the whole import. The
+     * DB file's presence is the gate, NOT the marker.
+     */
     suspend fun search(
         context: Context,
         archive: ArchiveInfo,
@@ -120,7 +128,7 @@ object SearchCoordinator {
         centerLon: Double,
         centerLat: Double,
     ): List<PlaceHit> {
-        if (!indexExists(context, archive)) return emptyList()
+        if (!databaseFor(context, archive).isFile) return emptyList()
         return searchPlaces(queryDb(context, archive), query, centerLon, centerLat)
     }
 
