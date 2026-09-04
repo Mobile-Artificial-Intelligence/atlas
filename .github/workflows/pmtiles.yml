@@ -85,9 +85,9 @@ jobs:
       - name: Download extract
         run: |
           mkdir -p data/sources out
-          curl --fail --location --retry 5 --retry-delay 10 \
-               --output data/sources/monaco.osm.pbf \
-               https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+          bash .github/scripts/fetch-extract.sh \
+               https://download.geofabrik.de/europe/monaco-latest.osm.pbf \
+               data/sources/monaco.osm.pbf
 
       - name: Build PMTiles
         run: |
@@ -252,9 +252,9 @@ jobs:
       - name: Download extract
         run: |
           mkdir -p data/sources out
-          curl --fail --location --retry 5 --retry-delay 10 \
-               --output "data/sources/${{ matrix.country }}.osm.pbf" \
-               "${{ matrix.url }}"
+          bash .github/scripts/fetch-extract.sh \
+               "${{ matrix.url }}" \
+               "data/sources/${{ matrix.country }}.osm.pbf"
 
       - name: Build PMTiles
         run: |
