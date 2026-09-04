@@ -7,10 +7,10 @@ name: PMTiles
 # z0-14).
 #
 # Every country — monaco included — is one matrix entry under the `countries`
-# job; a manual dispatch defaults to a monaco-only smoke test of the whole
-# path (download -> planetiler -> merge with sg addresses -> verify), and
-# unchecking smoke_only builds the real countries. A `select` job picks the
-# matrix up front because GitHub can't drop matrix entries conditionally.
+# job, and every workflow run builds the full matrix: a manual dispatch
+# produces exactly what the daily schedule produces, so artifacts from every
+# run are complete. The country list appears twice (countries + routing
+# matrices); keep the two in sync.
 #
 # After Planetiler, countries with an oa_cc merge OpenAddresses address
 # points into the archive (one file to download, one search index over it):
@@ -49,50 +49,16 @@ on:
     # Daily at 19:23 UTC = 05:23 Brisbane (off the :00/:30 marks).
     - cron: '23 19 * * *'
   workflow_dispatch:
-    inputs:
-      smoke_only:
-        description: 'Smoke test only (monaco + sg address merge, ~5 min) — uncheck to build every country'
-        type: boolean
-        default: true
 
-# Smoke dispatches get their OWN concurrency lane: a ~5-minute monaco run
-# must not queue behind the hours-long country builds (a queued smoke used
-# to wait out an in-progress full run — and a dispatch with smoke_only
-# unchecked waits out anything). Full runs (schedule, or dispatch with
-# smoke_only unchecked) still serialize against each other — a manual
-# country rebuild shouldn't cancel one already in flight, and vice versa.
-# inputs.smoke_only is empty on schedule, which is falsy, so the daily
-# lands in the full lane.
+# Every run is a full-matrix run (hours long, all countries), so runs
+# serialize: a queued dispatch waits for one already in flight rather than
+# cancelling it — and vice versa.
 concurrency:
-  group: pmtiles-${{ inputs.smoke_only && 'smoke' || 'full' }}
+  group: pmtiles
   cancel-in-progress: false
 
 jobs:
-  # monaco is a matrix entry like any other, but the matrix can only shrink
-  # before it exists — so the entry list is picked here: a smoke dispatch
-  # gets ["monaco"], everything else gets the real countries (monaco adds
-  # nothing to a full run).
-  select:
-    name: select countries
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      countries: ${{ steps.pick.outputs.countries }}
-    steps:
-      - name: Pick matrix
-        id: pick
-        env:
-          EVENT: ${{ github.event_name }}
-          SMOKE_ONLY: ${{ inputs.smoke_only }}
-        run: |
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "$SMOKE_ONLY" = "true" ]; then
-            echo 'countries=["monaco"]' >> "$GITHUB_OUTPUT"
-          else
-            echo 'countries=["new-zealand","australia","great-britain","canada","united-states","malaysia-singapore-brunei"]' >> "$GITHUB_OUTPUT"
-          fi
-
   countries:
-    needs: select
     name: pmtiles-${{ matrix.country }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -103,7 +69,8 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        country: ${{ fromJSON(needs.select.outputs.countries) }}
+        # Keep in sync with the routing job's matrix below.
+        country: ["monaco", "new-zealand", "australia", "great-britain", "canada", "united-states", "malaysia-singapore-brunei"]
         # oa_cc: the country's OpenAddresses code — empty means the country
         #   gets no address merge (GB: no OA data exists; US: no countrywide
         #   archive, 2295 per-source files would blow the 6h cap).
@@ -299,11 +266,8 @@ jobs:
   # before installing. Runs even when a sibling country failed (fail-fast
   # false, if: always()): each leg only needs ITS country's archive.
   routing:
-    needs: [select, countries]
-    # always() keeps each leg running when a sibling country failed, but a
-    # failed select job leaves its countries output empty and fromJSON('')
-    # would error the matrix — skip instead.
-    if: always() && needs.select.result == 'success'
+    needs: [countries]
+    if: always()
     name: routing-${{ matrix.country }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -313,7 +277,8 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        country: ${{ fromJSON(needs.select.outputs.countries) }}
+        # Keep in sync with the countries job's matrix above.
+        country: ["monaco", "new-zealand", "australia", "great-britain", "canada", "united-states", "malaysia-singapore-brunei"]
 
     steps:
       - name: Checkout
