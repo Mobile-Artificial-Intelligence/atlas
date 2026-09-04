@@ -6,21 +6,24 @@ name: PMTiles
 # pipelines are calibrated against exactly this output (MVT tiles, gzip,
 # z0-14).
 #
-# Each country builds in its own runner instance off the shared matrix; add
-# a country by appending one matrix entry (url from download.geofabrik.de,
-# oa_cc = its OpenAddresses country code, address_at = a city center the
-# merged address layer is probed at).
+# Every country — monaco included — is one matrix entry under the `countries`
+# job; a manual dispatch defaults to a monaco-only smoke test of the whole
+# path (download -> planetiler -> merge with sg addresses -> verify), and
+# unchecking smoke_only builds the real countries. A `select` job picks the
+# matrix up front because GitHub can't drop matrix entries conditionally.
 #
 # After Planetiler, countries with an oa_cc merge OpenAddresses address
 # points into the archive (one file to download, one search index over it):
 # the felt/tippecanoe fork's tile-join clips the OA archive to z14, drops
-# the bulk properties, renames its `data` layer to `address`, and joins it
-# with the base. GB (closed address data) and US (2295 per-source files,
-# no countrywide) carry no address layer — search there stays place/POI.
+# the bulk properties, renames its `data` layer to `address`, joins it with
+# the base, and the header's geography block (which tile-join widens to the
+# whole world) is patched back to the base's — the app bounds its tile
+# sweeps by the archive bbox. GB (closed address data) and US (2295
+# per-source files, no countrywide) carry no address layer — search there
+# stays place/POI.
 #
-# A manual dispatch defaults to a monaco smoke test of the whole path
-# (download -> planetiler -> merge with sg addresses -> verify -> artifact);
-# uncheck smoke_only to build every country.
+# The trailing `summarize` job indexes every artifact the run produced into
+# the run's Summary tab (name, size, download link).
 #
 # Hosted-runner reality check (2026-09 calibration: 0.9 GB australia pbf ->
 # 1.3 GB pmtiles, ~1h45m on a fast dev machine; a 4-vcpu runner is slower):
@@ -49,124 +52,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  smoke:
-    # monaco (merged with sg's countrywide addresses) proves the full path
-    # — download -> planetiler -> address merge -> verify — in ~5 minutes.
-    # Dispatch-only: the daily schedule builds real countries, and monaco
-    # adds nothing to those.
-    if: github.event_name == 'workflow_dispatch'
-    name: pmtiles-monaco
+  # monaco is a matrix entry like any other, but the matrix can only shrink
+  # before it exists — so the entry list is picked here: a smoke dispatch
+  # gets ["monaco"], everything else gets the real countries (monaco adds
+  # nothing to a full run).
+  select:
+    name: select countries
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
+    timeout-minutes: 5
+    outputs:
+      countries: ${{ steps.pick.outputs.countries }}
     steps:
-      - name: Checkout scripts
-        uses: actions/checkout@v4
-
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 21
-
-      - name: Cache Planetiler sources
-        uses: actions/cache@v4
-        with:
-          path: data/sources
-          key: planetiler-sources-0.10.2
-
-      - name: Fetch Planetiler
+      - name: Pick matrix
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          SMOKE_ONLY: ${{ inputs.smoke_only }}
         run: |
-          wget -q https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar -O planetiler.jar
-          VER=$(unzip -p planetiler.jar META-INF/maven/com.onthegomap.planetiler/planetiler-core/pom.properties | grep -o 'version=.*' | cut -d= -f2)
-          test "$VER" = "0.10.2" || { echo "unexpected planetiler version: $VER"; exit 1; }
-
-      - name: Download extract
-        run: |
-          mkdir -p data/sources out
-          bash .github/scripts/fetch-extract.sh \
-               https://download.geofabrik.de/europe/monaco-latest.osm.pbf \
-               data/sources/monaco.osm.pbf
-
-      - name: Build PMTiles
-        run: |
-          java -Xmx2g -jar planetiler.jar \
-            --osm_path=data/sources/monaco.osm.pbf \
-            --output=out/atlas-monaco.pmtiles \
-            --tmpdir=data/tmp \
-            --download \
-            --force
-
-      - name: Cache tile-join build
-        uses: actions/cache@v4
-        with:
-          path: tippecanoe
-          key: tippecanoe-2.79.0-ubuntu-latest
-
-      # The mapbox tippecanoe can't read or write PMTiles; the felt fork's
-      # tile-join can do both, which is what makes the one-file merge
-      # possible without an mbtiles round-trip.
-      # tile-join 2.79 rejects --version (exit 101) — "can I run it" is
-      # proved by the usage banner instead.
-      - name: Build tile-join
-        run: |
-          if [ -x tippecanoe/tile-join ]; then
-            usage=$(tippecanoe/tile-join 2>&1 || true)
-            if echo "$usage" | grep -q "Usage:"; then
-              echo "tile-join restored from cache"
-              exit 0
-            fi
-            echo "cached tile-join is broken; rebuilding"
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$SMOKE_ONLY" = "true" ]; then
+            echo 'countries=["monaco"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'countries=["new-zealand","australia","great-britain","canada","united-states","malaysia-singapore-brunei"]' >> "$GITHUB_OUTPUT"
           fi
-          sudo apt-get install -y -qq libsqlite3-dev
-          git clone --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git
-          make -C tippecanoe -j"$(nproc)" tile-join
-          usage=$(tippecanoe/tile-join 2>&1 || true)
-          echo "$usage" | grep -q "Usage:" || { echo "tile-join build failed"; exit 1; }
-
-      - name: Fetch OpenAddresses
-        run: python3 .github/scripts/fetch-openaddresses.py sg out/oa
-
-      # The smoke merge proves the whole path on a country pair small enough
-      # to finish in minutes: monaco's base + sg's countrywide addresses.
-      - name: Merge address layer
-        run: |
-          mv out/atlas-monaco.pmtiles out/atlas-monaco-base.pmtiles
-          # Clip the OA archive to z14 (the only zoom the app indexes the
-          # address layer at) and drop the bulk properties (accuracy, hash,
-          # id, postcode, ...) — search reads number/street/unit/city only.
-          tippecanoe/tile-join -Z14 -z14 -y number -y street -y unit -y city -pk \
-            -o out/addr-z14.pmtiles out/oa/*.pmtiles
-          # -R renames the OA `data` layer to the `address` layer the app's
-          # search indexer reads; zoom flags are per-invocation, so the base
-          # needs its own join without them.
-          tippecanoe/tile-join -R data:address -pk \
-            -o out/atlas-monaco.pmtiles out/atlas-monaco-base.pmtiles out/addr-z14.pmtiles
-          # tile-join widens the bbox to its inputs' union (the OA archive's
-          # own header is global); the app bounds its tile sweeps with the
-          # archive bbox, so it must stay the base's.
-          python3 .github/scripts/patch-pmtiles-bbox.py \
-            out/atlas-monaco-base.pmtiles out/atlas-monaco.pmtiles
-
-      - name: Verify PMTiles
-        run: |
-          python3 .github/scripts/verify-pmtiles.py out/atlas-monaco.pmtiles \
-            --address-at "103.8495,1.2900"
-
-      - name: Upload PMTiles
-        uses: actions/upload-artifact@v4
-        with:
-          name: atlas-pmtiles-monaco
-          compression-level: 0
-          retention-days: 7
-          path: out/atlas-monaco.pmtiles
-          if-no-files-found: error
 
   countries:
-    if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.smoke_only == false)
+    needs: select
     name: pmtiles-${{ matrix.country }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -177,12 +87,19 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
+        country: ${{ fromJSON(needs.select.outputs.countries) }}
         # oa_cc: the country's OpenAddresses code — empty means the country
         #   gets no address merge (GB: no OA data exists; US: no countrywide
         #   archive, 2295 per-source files would blow the 6h cap).
         # address_at: a city center whose z14 tile must carry the merged
         #   address layer — the verify step's proof the merge landed.
         include:
+          - country: monaco
+            url: https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+            heap: 2g
+            free_disk: false
+            oa_cc: sg
+            address_at: "103.8495,1.2900"
           - country: new-zealand
             url: https://download.geofabrik.de/australia-oceania/new-zealand-latest.osm.pbf
             heap: 6g
@@ -358,3 +275,22 @@ jobs:
           retention-days: 7
           path: out/atlas-${{ matrix.country }}.pmtiles
           if-no-files-found: error
+
+  # The artifact sidebar is buried on the run page; put every artifact the
+  # run produced (name, size, download link) in the run's Summary tab.
+  summarize:
+    needs: countries
+    if: always()
+    name: artifact summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+
+      - name: Index artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/artifact-summary.py
