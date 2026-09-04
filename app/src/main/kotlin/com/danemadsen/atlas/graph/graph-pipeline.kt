@@ -73,6 +73,7 @@ class GraphPipeline(private val workDir: File) {
         bucketLatMin: Int,
         segmentsDir: File,
         onTileScanned: ((zoom: Int, x: Int, y: Int, bytes: ByteArray) -> Unit)? = null,
+        onSubProgress: ((label: String, fraction: Float?) -> Unit)? = null,
     ): BuildResult {
         require(bucketLonMin % BUCKET_DEGREES == 0 && bucketLatMin % BUCKET_DEGREES == 0) {
             "bucket corners must be multiples of $BUCKET_DEGREES degrees"
@@ -116,6 +117,7 @@ class GraphPipeline(private val workDir: File) {
             bucketLatMin = bucketLatMin,
             zoom = scanZoom(reader),
             onTileScanned = onTileScanned,
+            onSubProgress = onSubProgress,
         )
 
         if (scan.featuresAccepted == 0) {
@@ -126,6 +128,7 @@ class GraphPipeline(private val workDir: File) {
         }
 
         // ---- phase 2: 45-degree tiles -> 5-degree buckets ----
+        onSubProgress?.invoke(REBUCKETING_LABEL, null)
         WayCutter5().apply {
             this.nodeFilter = requireNotNull(scan.nodeFilter) {
                 "scan phase always provides the node filter"
@@ -141,6 +144,7 @@ class GraphPipeline(private val workDir: File) {
         scan.nodeFilter = null
 
         // ---- phase 3: position dedup + (no) elevation ----
+        onSubProgress?.invoke(UNIFYING_LABEL, null)
         PosUnifier().process(
             nodeTilesIn = nodes55,
             nodeTilesOut = unodes55,
@@ -151,6 +155,7 @@ class GraphPipeline(private val workDir: File) {
         )
 
         // ---- phase 4: link into the staging dir ----
+        onSubProgress?.invoke(LINKING_LABEL, null)
         WayLinker().process(
             nodeTilesIn = unodes55,
             wayTilesIn = ways55,
@@ -167,6 +172,7 @@ class GraphPipeline(private val workDir: File) {
         )
 
         val staged_rd5 = File(staging, "$bucket_name$RD5_SUFFIX")
+        onSubProgress?.invoke(PUBLISHING_LABEL, null)
         require(staged_rd5.isFile) { "WayLinker produced no $bucket_name$RD5_SUFFIX" }
         validateRd5(staged_rd5)
 
@@ -209,6 +215,7 @@ class GraphPipeline(private val workDir: File) {
         bucketLatMin: Int,
         zoom: Int,
         onTileScanned: ((Int, Int, Int, ByteArray) -> Unit)?,
+        onSubProgress: ((String, Float?) -> Unit)?,
     ): ScanPhaseResult {
         val nodeFilter = NodeFilter().also { it.init() }
         val wayCutter = WayCutter().also { it.init(ways45) }
@@ -216,6 +223,7 @@ class GraphPipeline(private val workDir: File) {
             it.wayCutter = wayCutter
             it.nodeFilter = nodeFilter
             it.onTileScanned = onTileScanned
+            it.onSubProgress = onSubProgress
         }
         cutter.process(
             reader = reader,
@@ -294,5 +302,13 @@ class GraphPipeline(private val workDir: File) {
         private const val LAT_OFFSET = 90
         private const val RD5_SUFFIX = ".rd5"
         private const val LOOKUPS_FILE = "lookups.dat"
+
+        // Sub-progress phase labels for the vendored stages (the cutter
+        // emits its own from inside scanPhase). User-facing: they surface
+        // through the service's status file, notification and banner.
+        private const val REBUCKETING_LABEL = "Rebucketing ways"
+        private const val UNIFYING_LABEL = "Unifying node positions"
+        private const val LINKING_LABEL = "Linking the road graph"
+        private const val PUBLISHING_LABEL = "Publishing routing segment"
     }
 }

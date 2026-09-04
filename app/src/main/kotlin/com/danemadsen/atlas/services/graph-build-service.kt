@@ -3,6 +3,7 @@ package com.danemadsen.atlas.services
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -79,6 +80,12 @@ class GraphBuildService : Service() {
 
     /** Set before the timeout teardown so the cancellation path does not overwrite the timeout status. */
     @Volatile private var timedOut = false
+
+    /**
+     * True once this run actually built something: a run whose buckets were
+     * all already built (the routine no-op case) must not announce itself.
+     */
+    @Volatile private var sawBuildWork = false
 
     /**
      * Set by ACTION_CANCEL while a run is live: when that run ends, its
@@ -175,6 +182,7 @@ class GraphBuildService : Service() {
             return
         }
         timedOut = false
+        sawBuildWork = false
         wakeLock.acquire(WAKE_LOCK_SLICE_MS)
         runJob = scope.launch {
             // Heartbeat: the old single 6h wake lock could expire mid-build
@@ -240,17 +248,39 @@ class GraphBuildService : Service() {
                 // directly in the gap between this coroutine's end and
                 // the post's execution.
                 main_handler.post {
-                    val pending = if (cancelRequested) null else pendingIntent
+                    val cancelled = cancelRequested
+                    val pending = if (cancelled) null else pendingIntent
                     pendingIntent = null
                     cancelRequested = false
                     if (pending != null) {
+                        // A queued build takes over: the handoff belongs to
+                        // ITS terminal state, not this run's.
                         run(pending)
-                    } else if (runJob?.isActive != true) {
-                        // A run that started in the gap owns the wake
-                        // lock and the service now — do not release or
-                        // stop under it.
-                        if (wakeLock.isHeld) wakeLock.release()
-                        stopSelf()
+                    } else {
+                        // The run's end is only now final (no follow-on):
+                        // announce it. Failure beats success; a cancelled
+                        // run says nothing (the user just asked for it);
+                        // a no-op run (everything already built) never
+                        // announces. Posted under NOTIFICATION_DONE_ID so it
+                        // survives stopSelf() removing the foreground one.
+                        if (terminalError != null) {
+                            notifyDone(
+                                "Routing data preparation failed",
+                                terminalError,
+                            )
+                        } else if (!cancelled && sawBuildWork) {
+                            notifyDone(
+                                "Routing data ready",
+                                "Routing in your prepared area is available.",
+                            )
+                        }
+                        if (runJob?.isActive != true) {
+                            // A run that started in the gap owns the wake
+                            // lock and the service now — do not release or
+                            // stop under it.
+                            if (wakeLock.isHeld) wakeLock.release()
+                            stopSelf()
+                        }
                     }
                 }
             }
@@ -392,12 +422,15 @@ class GraphBuildService : Service() {
     // ---- status + notification plumbing ----
 
     private fun reportProgress(progress: GraphBuildManager.Progress) {
+        if (progress.building) sawBuildWork = true
         writeStatus(BuildSnapshot(
             running = true,
             bucket = progress.bucket,
             built = progress.built,
             total = progress.total,
             error = null,
+            label = progress.label,
+            fraction = progress.fraction,
         ))
         updateNotification(progress)
     }
@@ -409,7 +442,7 @@ class GraphBuildService : Service() {
         total: Int,
         error: String?,
     ) {
-        writeStatus(BuildSnapshot(running, bucket, built, total, error))
+        writeStatus(BuildSnapshot(running, bucket, built, total, error, label = null, fraction = null))
     }
 
     private data class BuildSnapshot(
@@ -418,6 +451,10 @@ class GraphBuildService : Service() {
         val built: Int,
         val total: Int,
         val error: String?,
+        /** The current step within the bucket build, or null at boundaries. */
+        val label: String? = null,
+        /** 0..1 through [label]'s step, or null while its size is unknown. */
+        val fraction: Float? = null,
     )
 
     /**
@@ -438,6 +475,8 @@ class GraphBuildService : Service() {
                     .put("built", snapshot.built)
                     .put("total", snapshot.total)
                     .put("error", snapshot.error ?: "")
+                    .put("label", snapshot.label ?: "")
+                    .put("fraction", snapshot.fraction?.toDouble() ?: -1.0)
                     .put("ts", System.currentTimeMillis())
                     .toString(),
             )
@@ -499,14 +538,56 @@ class GraphBuildService : Service() {
     }
 
     private fun updateNotification(progress: GraphBuildManager.Progress) {
-        getSystemService(NotificationManager::class.java).notify(
-            NOTIFICATION_ID,
-            NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("Preparing routing data")
-                .setContentText("${progress.bucket} (${progress.built + 1}/${progress.total})")
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
+        val text = when {
+            progress.label != null -> buildString {
+                append(progress.bucket).append(" — ").append(progress.label)
+                progress.fraction?.let {
+                    append(" (").append((it * 100).toInt()).append("%)")
+                }
+            }
+            else -> "${progress.bucket} (${progress.built + 1}/${progress.total})"
+        }
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentTitle("Preparing routing data")
+            .setContentText(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+        // A determinate bar needs a real fraction; the label-only phases
+        // (and the pre-scan gap) stay honest with an indeterminate one.
+        if (progress.fraction != null) {
+            builder.setProgress(100, (progress.fraction * 100).toInt().coerceIn(0, 100), false)
+        } else {
+            builder.setProgress(0, 0, true)
+        }
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, builder.build())
+    }
+
+    /**
+     * The one-shot end-of-build notification. Separate ID and channel from
+     * the ongoing progress one: it must survive stopSelf() (which removes
+     * the foreground notification) and it is meant to be seen, not tracked.
+     * AutoCancel + the launcher's pending intent so a tap opens the app.
+     */
+    private fun notifyDone(title: String, text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= 26) {
+            manager.createNotificationChannel(
+                NotificationChannel(DONE_CHANNEL_ID, DONE_CHANNEL_NAME, NotificationManager.IMPORTANCE_DEFAULT),
+            )
+        }
+        val intent = packageManager.getLaunchIntentForPackage(packageName)
+        val pending = intent?.let {
+            PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE)
+        }
+        manager.notify(
+            NOTIFICATION_DONE_ID,
+            NotificationCompat.Builder(this, DONE_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setAutoCancel(true)
+                .setContentIntent(pending)
                 .build(),
         )
     }
@@ -530,6 +611,13 @@ class GraphBuildService : Service() {
         private const val CHANNEL_ID = "graph_build"
         private const val CHANNEL_NAME = "Routing data preparation"
         private const val NOTIFICATION_ID = 2
+
+        // The end-of-build notification: its own channel (the ongoing one is
+        // IMPORTANCE_LOW; "it finished" is meant to be noticed) and its own
+        // ID, so it outlives stopSelf() dropping the foreground notification.
+        private const val DONE_CHANNEL_ID = "graph_build_done"
+        private const val DONE_CHANNEL_NAME = "Routing data ready"
+        private const val NOTIFICATION_DONE_ID = 3
         private const val STATUS_FILE = "build-status.json"
         private const val WAKE_LOCK_TAG = "atlas:graph-build"
         private const val WAKE_LOCK_SLICE_MS = 10L * 60 * 1000 // renewed by the heartbeat

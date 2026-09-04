@@ -196,7 +196,18 @@ private fun BuildStatusBanner() {
                             val s = status
                             Text("Preparing routing data", style = MaterialTheme.typography.titleSmall)
                             Text(
-                                if (s != null && s.total > 0) {
+                                if (s != null && s.total > 0 && s.label != null) {
+                                    // Bucket — step (NN%): the sub-step progress
+                                    // is the only honest signal during a
+                                    // minutes-long single-bucket build.
+                                    buildString {
+                                        append(s.bucket ?: "")
+                                        append(" — ").append(s.label)
+                                        s.fraction?.let {
+                                            append(" (").append((it * 100).toInt()).append("%)")
+                                        }
+                                    }
+                                } else if (s != null && s.total > 0) {
                                     "${s.bucket ?: ""} (${s.built + 1}/${s.total})"
                                 } else {
                                     "reading the map archive…"
@@ -228,12 +239,22 @@ private fun BuildStatusBanner() {
             }
             if (running && !interrupted) {
                 val s = status
-                LinearProgressIndicator(
-                    progress = {
-                        if (s != null && s.total > 0) (s.built + 1f) / s.total else 0f
-                    },
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                )
+                // Determinate only when the current sub-step reports a real
+                // fraction — the old (built + 1)/total bar sat pinned at
+                // 100% through the whole minutes-long single-bucket build.
+                // A fraction inside bucket `built` of `total` is the honest
+                // overall position; a label-only phase is indeterminate.
+                val fraction = s?.fraction
+                if (fraction != null && s.total > 0) {
+                    LinearProgressIndicator(
+                        progress = { ((s.built + fraction) / s.total).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    )
+                }
             }
         }
     }

@@ -66,6 +66,14 @@ class GraphBuildManager(
         public val built: Int,
         public val total: Int,
         public val building: Boolean, // false once this bucket finished
+        /**
+         * The current step WITHIN the bucket build ("Stitching road
+         * junctions", ...), or null at bucket boundaries and before the
+         * first step reports.
+         */
+        public val label: String? = null,
+        /** 0..1 through the labeled step, or null while its size is unknown. */
+        public val fraction: Float? = null,
     )
 
     private val stateFile: File get() = File(segmentsDir, STATE_FILE)
@@ -177,7 +185,16 @@ class GraphBuildManager(
                 for (bucket in todo) {
                     if (cancelled.get()) break
                     onProgress(Progress(bucket, built, total, building = true))
-                    val result = buildOne(bucket, onTileScanned = onTileScanned)
+                    val result = buildOne(
+                        bucket,
+                        onTileScanned = onTileScanned,
+                        onSubProgress = { label, fraction ->
+                            // Forwarded from the build thread: the sub-steps
+                            // inside one bucket are minutes each, and the
+                            // bucket-level ticks alone read as a stuck bar.
+                            onProgress(Progress(bucket, built, total, building = true, label, fraction))
+                        },
+                    )
                     built++
                     val fresh = readState() // re-read: a concurrent run may have written
                     fresh.buckets[bucket] = BucketState(
@@ -204,6 +221,7 @@ class GraphBuildManager(
     private suspend fun buildOne(
         bucketName: String,
         onTileScanned: ((zoom: Int, x: Int, y: Int, bytes: ByteArray) -> Unit)? = null,
+        onSubProgress: ((label: String, fraction: Float?) -> Unit)? = null,
     ): GraphPipeline.BuildResult? =
         withContext(Dispatchers.Default) {
             val (lonMin, latMin) = parseBucketName(bucketName)
@@ -218,6 +236,7 @@ class GraphBuildManager(
                         bucketLatMin = latMin,
                         segmentsDir = segmentsDir,
                         onTileScanned = onTileScanned,
+                        onSubProgress = onSubProgress,
                     )
                 }
             } finally {

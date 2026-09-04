@@ -93,6 +93,24 @@ class PmtilesCutter : GeneratorBase() {
      */
     public var onTileScanned: ((zoom: Int, x: Int, y: Int, bytes: ByteArray) -> Unit)? = null
 
+    /**
+     * Set by the caller before [process]; coarse progress WITHIN the cutter
+     * phase: [label] names the current step and [fraction] is 0..1, or null
+     * while the step's size is not known (indeterminate). The cutter's
+     * phases are minutes each on-device and the bucket-level progress the
+     * service reports would otherwise sit frozen at one value the whole
+     * time — the exact "always 100%" complaint this exists to fix.
+     *
+     * Like [onTileScanned] it runs inline on the build thread: no
+     * suspending, no throwing, keep it cheap.
+     */
+    public var onSubProgress: ((label: String, fraction: Float?) -> Unit)? = null
+
+    /** Emits one sub-progress tick; null-fraction means the phase is indeterminate. */
+    private fun subProgress(label: String, fraction: Float? = null) {
+        onSubProgress?.invoke(label, fraction)
+    }
+
     private lateinit var expctxWay: BExpressionContextWay
 
     /** One buffered path-fragment of an accepted feature. */
@@ -192,6 +210,7 @@ class PmtilesCutter : GeneratorBase() {
         )
 
         val canonical = mergeFragmentEndpoints(zoom)
+        subProgress(EMITTING_LABEL)
         val elided = MutableLongSet(canonical.size * 2)
         canonical.forEach { nid, _ -> elided.add(nid) }
 
@@ -249,7 +268,16 @@ class PmtilesCutter : GeneratorBase() {
      */
     private fun scan(reader: PmtilesReader, bounds: TileBounds, zoom: Int) {
         val tile_observer = onTileScanned
-        reader.forEachTileInBounds(zoom, bounds) { z, x, y, bytes ->
+        subProgress(SCANNING_LABEL)
+        reader.forEachTileInBounds(
+            zoom,
+            bounds,
+            onCellsProbed = { probed, total ->
+                // Probed cells (hits and misses) over the grid: monotonic,
+                // and at detail zooms the walk is minutes of work.
+                subProgress(SCANNING_LABEL, probed.toFloat() / total)
+            },
+        ) { z, x, y, bytes ->
             tiles_scanned++
             tile_observer?.invoke(z, x, y, bytes)
             val tile = MvtTile.decode(bytes)
@@ -424,7 +452,11 @@ class PmtilesCutter : GeneratorBase() {
         }
 
         val parent = MutableLongLongMap()
+        subProgress(MERGING_LABEL)
         for (i in 0 until endpoint_count) {
+            if ((i + 1) % STITCH_PROGRESS_EVERY == 0) {
+                subProgress(MERGING_LABEL, (i + 1).toFloat() / endpoint_count)
+            }
             val pos_i = ep_pos[i]
             val lon_i = (pos_i shr 32)
             val lat_i = (pos_i and 0xFFFFFFFFL)
@@ -516,6 +548,7 @@ class PmtilesCutter : GeneratorBase() {
         // ---- segment index: counting sort of every fragment's segments
         // into the grid cells the segment traverses (DDA walk; cells are
         // ~2x the stitch threshold so a 3x3 lookup sees every candidate) ----
+        subProgress(INDEXING_LABEL)
         var segment_count = 0
         for (fragment in fragments) segment_count += fragment.nodes.size - 1
         if (segment_count == 0) return
@@ -585,6 +618,7 @@ class PmtilesCutter : GeneratorBase() {
         var frag_inserted = IntArray(16)
         var frag_inserted_count = 0
         val insertions = ArrayList<Insertion>(1024)
+        subProgress(STITCHING_LABEL)
         for (i in 0 until endpoint_count) {
             epoch++
             val nid = ep_nid[i]
@@ -693,6 +727,7 @@ class PmtilesCutter : GeneratorBase() {
                 }
             }
             if ((i + 1) % STITCH_PROGRESS_EVERY == 0) {
+                subProgress(STITCHING_LABEL, (i + 1).toFloat() / endpoint_count)
                 dbg(
                     "stitch: ${i + 1}/$endpoint_count endpoints, " +
                         "pairs=$pairs_checked, unions=$unions_done, " +
@@ -1005,7 +1040,21 @@ class PmtilesCutter : GeneratorBase() {
          * stays tens of segments.
          */
         private const val SEG_INDEX_GRID_E6 = 5_000L
-        private const val STITCH_PROGRESS_EVERY = 250_000
+
+        /**
+         * Sub-progress tick interval for the merge and stitch endpoint
+         * loops, and the dbg-line throttle. 250k endpoints was ~11 min of
+         * on-device stitch — too coarse for a progress bar; 50k is ~2 min.
+         */
+        private const val STITCH_PROGRESS_EVERY = 50_000
+
+        // Sub-progress phase labels — user-facing strings surfaced through
+        // the service's status file, notification and banner.
+        private const val SCANNING_LABEL = "Reading map tiles"
+        private const val MERGING_LABEL = "Merging tile fragments"
+        private const val INDEXING_LABEL = "Indexing road segments"
+        private const val STITCHING_LABEL = "Stitching road junctions"
+        private const val EMITTING_LABEL = "Writing graph tiles"
 
         private const val LON_45_E6 = 45_000_000
         private const val LAT_30_E6 = 30_000_000

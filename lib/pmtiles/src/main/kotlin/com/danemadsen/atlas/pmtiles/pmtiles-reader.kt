@@ -55,16 +55,31 @@ class PmtilesReader(
     fun tileOffset(z: Int, x: Int, y: Int): Long? = findTileEntry(z, x, y)?.offset
 
     fun tileLength(z: Int, x: Int, y: Int): Int? = findTileEntry(z, x, y)?.length
-    /** Iterate every tile in [bounds] at [zoom], in curve order, passing the
-     *  decompressed tile bytes. Skips missing tiles. */
+    /**
+     * Iterate every tile in [bounds] at [zoom], in curve order, passing the
+     * decompressed tile bytes. Skips missing tiles.
+     *
+     * [onCellsProbed], when given, receives (cells visited so far, total
+     * cells in the bounds' raster grid) every [PROBE_PROGRESS_EVERY] cells:
+     * a bounds walk is minutes of work at detail zooms and the misses are
+     * silent, so the caller can report an honest fraction. The callback must
+     * not suspend or throw.
+     */
     fun forEachTileInBounds(
         zoom: Int,
         bounds: TileBounds,
+        onCellsProbed: ((probed: Long, total: Long) -> Unit)? = null,
         visitor: (z: Int, x: Int, y: Int, bytes: ByteArray) -> Unit,
     ) {
         val (minX, minY, maxX, maxY) = tileRange(zoom, bounds)
+        val total = (maxX - minX + 1L) * (maxY - minY + 1L)
+        var probed = 0L
         for (x in minX..maxX) {
             for (y in minY..maxY) {
+                probed++
+                if (onCellsProbed != null && probed % PROBE_PROGRESS_EVERY == 0L) {
+                    onCellsProbed(probed, total)
+                }
                 val bytes = tile(zoom, x, y) ?: continue
                 visitor(zoom, x, y, bytes)
             }
@@ -125,6 +140,7 @@ class PmtilesReader(
 
     companion object {
         private const val LEAF_CACHE_LIMIT = 64
+        private const val PROBE_PROGRESS_EVERY = 4096L
 
         fun open(path: String): PmtilesReader = PmtilesReader(path)
 

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
@@ -30,7 +31,8 @@ import androidx.compose.ui.unit.dp
 import com.danemadsen.atlas.ui.SearchUiState
 
 /**
- * The top search bar: rounded pill over the map, mic button on the right.
+ * The top search bar: rounded pill over the map. The right-hand button is
+ * a clear (X) while the field holds text, the mic while it is empty.
  * Settings is NOT here — it lives on the bottom navigation's Settings tab.
  *
  * Voice input goes through the system speech recognizer activity
@@ -82,35 +84,50 @@ fun SearchBar(
                     unfocusedIndicatorColor = Color.Transparent,
                 ),
             )
-            IconButton(
-                onClick = {
-                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                        putExtra(
-                            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-                        )
-                        // Ask, don't require: a device with only a network
-                        // recognizer should still offer what it has rather
-                        // than nothing — Atlas itself never talks to it.
-                        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                    }
-                    try {
-                        voice_launcher.launch(intent)
-                    } catch (_: ActivityNotFoundException) {
-                        Toast.makeText(
-                            context,
-                            "No speech recognizer is installed on this device",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                },
-                modifier = Modifier.padding(end = 4.dp),
-            ) {
-                Icon(
-                    Icons.Filled.Mic,
-                    contentDescription = "Search by voice",
-                    tint = MaterialTheme.colorScheme.primary,
-                )
+            // With text in the field the button clears it (the common
+            // next action while typing); the empty field keeps the mic.
+            if (query.isNotEmpty()) {
+                IconButton(
+                    onClick = { onQueryChange("") },
+                    modifier = Modifier.padding(end = 4.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = "Clear search",
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            } else {
+                IconButton(
+                    onClick = {
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(
+                                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                            )
+                            // Ask, don't require: a device with only a network
+                            // recognizer should still offer what it has rather
+                            // than nothing — Atlas itself never talks to it.
+                            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                        }
+                        try {
+                            voice_launcher.launch(intent)
+                        } catch (_: ActivityNotFoundException) {
+                            Toast.makeText(
+                                context,
+                                "No speech recognizer is installed on this device",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    },
+                    modifier = Modifier.padding(end = 4.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Mic,
+                        contentDescription = "Search by voice",
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         }
     }

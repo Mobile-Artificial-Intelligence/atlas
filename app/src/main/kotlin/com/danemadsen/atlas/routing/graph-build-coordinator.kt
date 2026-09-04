@@ -44,6 +44,10 @@ object GraphBuildCoordinator {
         val built: Int,
         val total: Int,
         val error: String? = null,
+        /** The current step within the bucket build, or null at bucket boundaries. */
+        val label: String? = null,
+        /** 0..1 through [label]'s step, or null while its size is unknown. */
+        val fraction: Float? = null,
         /** When the service last wrote the status (0 when the field is absent). */
         val timestampMs: Long = 0,
     ) {
@@ -216,6 +220,10 @@ object GraphBuildCoordinator {
                 built = json.optInt("built"),
                 total = json.optInt("total"),
                 error = json.optString("error").ifEmpty { null },
+                label = json.optString("label").ifEmpty { null },
+                // The service writes -1.0 for "no fraction"; a status file
+                // from an older build omits the field entirely.
+                fraction = json.optDouble("fraction", -1.0).takeIf { it >= 0.0 }?.toFloat(),
                 timestampMs = json.optLong("ts"),
             )
         }.getOrNull()
