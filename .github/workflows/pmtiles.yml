@@ -7,10 +7,20 @@ name: PMTiles
 # z0-14).
 #
 # Each country builds in its own runner instance off the shared matrix; add
-# a country by appending one matrix entry (url from download.geofabrik.de).
-# A manual dispatch defaults to a 2-minute monaco smoke test of the whole
-# path (download -> planetiler -> pmtiles -> artifact); uncheck smoke_only
-# to build every country.
+# a country by appending one matrix entry (url from download.geofabrik.de,
+# oa_cc = its OpenAddresses country code, address_at = a city center the
+# merged address layer is probed at).
+#
+# After Planetiler, countries with an oa_cc merge OpenAddresses address
+# points into the archive (one file to download, one search index over it):
+# the felt/tippecanoe fork's tile-join clips the OA archive to z14, drops
+# the bulk properties, renames its `data` layer to `address`, and joins it
+# with the base. GB (closed address data) and US (2295 per-source files,
+# no countrywide) carry no address layer — search there stays place/POI.
+#
+# A manual dispatch defaults to a monaco smoke test of the whole path
+# (download -> planetiler -> merge with sg addresses -> verify -> artifact);
+# uncheck smoke_only to build every country.
 #
 # Hosted-runner reality check (2026-09 calibration: 0.9 GB australia pbf ->
 # 1.3 GB pmtiles, ~1h45m on a fast dev machine; a 4-vcpu runner is slower):
@@ -28,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       smoke_only:
-        description: 'Smoke test only (monaco, ~2 min) — uncheck to build every country'
+        description: 'Smoke test only (monaco + sg address merge, ~5 min) — uncheck to build every country'
         type: boolean
         default: true
 
@@ -40,15 +50,20 @@ concurrency:
 
 jobs:
   smoke:
-    # monaco proves the full path in ~2 minutes. Dispatch-only: the daily
-    # schedule builds real countries, and monaco adds nothing to those.
+    # monaco (merged with sg's countrywide addresses) proves the full path
+    # — download -> planetiler -> address merge -> verify — in ~5 minutes.
+    # Dispatch-only: the daily schedule builds real countries, and monaco
+    # adds nothing to those.
     if: github.event_name == 'workflow_dispatch'
     name: pmtiles-monaco
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
@@ -83,22 +98,48 @@ jobs:
             --download \
             --force
 
+      - name: Cache tile-join build
+        uses: actions/cache@v4
+        with:
+          path: tippecanoe
+          key: tippecanoe-2.79.0-ubuntu-latest
+
+      # The mapbox tippecanoe can't read or write PMTiles; the felt fork's
+      # tile-join can do both, which is what makes the one-file merge
+      # possible without an mbtiles round-trip.
+      - name: Build tile-join
+        run: |
+          if [ -x tippecanoe/tile-join ]; then
+            tippecanoe/tile-join --version && exit 0
+          fi
+          sudo apt-get install -y -qq libsqlite3-dev
+          git clone --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git
+          make -C tippecanoe -j"$(nproc)" tile-join
+          tippecanoe/tile-join --version
+
+      - name: Fetch OpenAddresses
+        run: python3 .github/scripts/fetch-openaddresses.py sg out/oa
+
+      # The smoke merge proves the whole path on a country pair small enough
+      # to finish in minutes: monaco's base + sg's countrywide addresses.
+      - name: Merge address layer
+        run: |
+          mv out/atlas-monaco.pmtiles out/atlas-monaco-base.pmtiles
+          # Clip the OA archive to z14 (the only zoom the app indexes the
+          # address layer at) and drop the bulk properties (accuracy, hash,
+          # id, postcode, ...) — search reads number/street/unit/city only.
+          tippecanoe/tile-join -Z14 -z14 -y number -y street -y unit -y city -pk \
+            -o out/addr-z14.pmtiles out/oa/*.pmtiles
+          # -R renames the OA `data` layer to the `address` layer the app's
+          # search indexer reads; zoom flags are per-invocation, so the base
+          # needs its own join without them.
+          tippecanoe/tile-join -R data:address -pk \
+            -o out/atlas-monaco.pmtiles out/atlas-monaco-base.pmtiles out/addr-z14.pmtiles
+
       - name: Verify PMTiles
         run: |
-          python3 - <<'EOF'
-          import struct, os
-          path = "out/atlas-monaco.pmtiles"
-          with open(path, "rb") as f:
-              d = f.read(127)
-          assert d[:7] == b"PMTiles" and d[7] == 3, f"bad magic/version: {d[:8]!r}"
-          assert d[100] == 0 and d[101] == 14, f"zooms must be 0-14, got {d[100]}-{d[101]}"
-          entries = struct.unpack_from("<Q", d, 80)[0]
-          size = os.path.getsize(path)
-          line = f"PMTiles v3, zooms 0-14, {entries} tiles, {size / 2**20:.1f} MiB"
-          print(f"{path}: {line}")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
-              s.write(f"### atlas-monaco.pmtiles\n\n{line}\n\n")
-          EOF
+          python3 .github/scripts/verify-pmtiles.py out/atlas-monaco.pmtiles \
+            --address-at "103.8495,1.2900"
 
       - name: Upload PMTiles
         uses: actions/upload-artifact@v4
@@ -123,29 +164,53 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
+        # oa_cc: the country's OpenAddresses code — empty means the country
+        #   gets no address merge (GB: no OA data exists; US: no countrywide
+        #   archive, 2295 per-source files would blow the 6h cap).
+        # address_at: a city center whose z14 tile must carry the merged
+        #   address layer — the verify step's proof the merge landed.
         include:
           - country: new-zealand
             url: https://download.geofabrik.de/australia-oceania/new-zealand-latest.osm.pbf
             heap: 6g
             free_disk: false
+            oa_cc: nz
+            address_at: "174.7645,-36.8509"
           - country: australia
             url: https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf
             heap: 8g
             free_disk: false
+            oa_cc: au
+            address_at: "144.9631,-37.8142"
           - country: great-britain
             url: https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
             heap: 10g
             free_disk: false
+            oa_cc: ''
+            address_at: ''
           - country: canada
             url: https://download.geofabrik.de/north-america/canada-latest.osm.pbf
             heap: 12g
             free_disk: true
+            oa_cc: ca
+            address_at: "-79.3832,43.6532"
           - country: united-states
             url: https://download.geofabrik.de/north-america/us-latest.osm.pbf
             heap: 12g
             free_disk: true
+            oa_cc: ''
+            address_at: ''
+          - country: singapore
+            url: https://download.geofabrik.de/asia/singapore-latest.osm.pbf
+            heap: 2g
+            free_disk: false
+            oa_cc: sg
+            address_at: "103.8495,1.2900"
 
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+
       - name: Free disk space
         if: matrix.free_disk
         run: |
@@ -191,29 +256,66 @@ jobs:
             --tmpdir="data/tmp" \
             --download \
             --force
-          # Free the pbf before the artifact upload — the extract is the
+          # Free the pbf before the address merge — the extract is the
           # single biggest disk consumer and the archive is already written.
           rm -f "data/sources/${{ matrix.country }}.osm.pbf"
+
+      - name: Cache tile-join build
+        if: matrix.oa_cc != ''
+        uses: actions/cache@v4
+        with:
+          path: tippecanoe
+          key: tippecanoe-2.79.0-ubuntu-latest
+
+      # The mapbox tippecanoe can't read or write PMTiles; the felt fork's
+      # tile-join can do both, which is what makes the one-file merge
+      # possible without an mbtiles round-trip.
+      - name: Build tile-join
+        if: matrix.oa_cc != ''
+        run: |
+          if [ -x tippecanoe/tile-join ]; then
+            tippecanoe/tile-join --version && exit 0
+          fi
+          sudo apt-get install -y -qq libsqlite3-dev
+          git clone --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git
+          make -C tippecanoe -j"$(nproc)" tile-join
+          tippecanoe/tile-join --version
+
+      - name: Fetch OpenAddresses
+        if: matrix.oa_cc != ''
+        run: python3 .github/scripts/fetch-openaddresses.py "${{ matrix.oa_cc }}" out/oa
+
+      - name: Merge address layer
+        if: matrix.oa_cc != ''
+        env:
+          COUNTRY: ${{ matrix.country }}
+        run: |
+          mv "out/atlas-$COUNTRY.pmtiles" "out/atlas-$COUNTRY-base.pmtiles"
+          # Clip the OA archive(s) to z14 (the only zoom the app indexes
+          # the address layer at) and drop the bulk properties (accuracy,
+          # hash, id, postcode, ...) — search reads number/street/unit/city
+          # only. au/countrywide alone adds ~14M features at this step.
+          tippecanoe/tile-join -Z14 -z14 -y number -y street -y unit -y city -pk \
+            -o out/addr-z14.pmtiles out/oa/*.pmtiles
+          # -R renames the OA `data` layer to the `address` layer the app's
+          # search indexer reads; zoom flags are per-invocation, so the base
+          # needs its own join without them.
+          tippecanoe/tile-join -R data:address -pk \
+            -o "out/atlas-$COUNTRY.pmtiles" "out/atlas-$COUNTRY-base.pmtiles" out/addr-z14.pmtiles
+          # The intermediates are the archive's size all over again — free
+          # them before the upload.
+          rm -f "out/atlas-$COUNTRY-base.pmtiles" out/addr-z14.pmtiles
 
       - name: Verify PMTiles
         env:
           COUNTRY: ${{ matrix.country }}
+          ADDRESS_AT: ${{ matrix.address_at }}
         run: |
-          python3 - <<'EOF'
-          import struct, os
-          country = os.environ["COUNTRY"]
-          path = f"out/atlas-{country}.pmtiles"
-          with open(path, "rb") as f:
-              d = f.read(127)
-          assert d[:7] == b"PMTiles" and d[7] == 3, f"bad magic/version: {d[:8]!r}"
-          assert d[100] == 0 and d[101] == 14, f"zooms must be 0-14, got {d[100]}-{d[101]}"
-          entries = struct.unpack_from("<Q", d, 80)[0]
-          size = os.path.getsize(path)
-          line = f"PMTiles v3, zooms 0-14, {entries} tiles, {size / 2**30:.2f} GiB"
-          print(f"{path}: {line}")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
-              s.write(f"### atlas-{country}.pmtiles\n\n{line}\n\n")
-          EOF
+          if [ -n "$ADDRESS_AT" ]; then
+            python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles" --address-at "$ADDRESS_AT"
+          else
+            python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles"
+          fi
 
       - name: Upload PMTiles
         uses: actions/upload-artifact@v4

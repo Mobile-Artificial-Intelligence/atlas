@@ -58,6 +58,19 @@ object SearchCoordinator {
     }
 
     /**
+     * Deletes index DBs other than the current archive's (an index-format
+     * bump orphans the previous fingerprint's DB — GBs of dead disk).
+     * Only called while the current DB does not exist yet, so no pass can
+     * hold an about-to-be-deleted file open.
+     */
+    fun deleteStaleIndexes(context: Context, archive: ArchiveInfo) {
+        val current = databaseFor(context, archive).name
+        searchDir(context).listFiles()?.forEach { file ->
+            if (file.name != current) file.delete()
+        }
+    }
+
+    /**
      * The import-time (or lazy-resume) pass over the archive's place zooms
      * 0-9. Null when another pass is already running.
      */
@@ -68,7 +81,12 @@ object SearchCoordinator {
     ): SearchIndexer.PassResult? {
         if (!indexing.compareAndSet(false, true)) return null
         try {
-            val indexer = SearchIndexer(context, databaseFor(context, archive))
+            // An index-format bump orphans the previous fingerprint's DB —
+            // GBs of dead disk. Only while the current DB does not exist
+            // yet, so no pass can hold an about-to-be-deleted file open.
+            val db_file = databaseFor(context, archive)
+            if (!db_file.isFile) deleteStaleIndexes(context, archive)
+            val indexer = SearchIndexer(context, db_file)
             PmtilesReader(archiveFile.absolutePath).use { reader ->
                 val bounds = TileBounds(
                     west = archive.west,

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.statusBars
@@ -49,6 +50,7 @@ import com.danemadsen.atlas.ui.CameraSnapshot
 import com.danemadsen.atlas.ui.DebugCameraBus
 import com.danemadsen.atlas.ui.MainTabBar
 import com.danemadsen.atlas.ui.RouteUiState
+import com.danemadsen.atlas.ui.TAB_BAR_HEIGHT
 import com.danemadsen.atlas.ui.graph.GraphPrepFlow
 import com.danemadsen.atlas.ui.nav.NavigationPanel
 import com.danemadsen.atlas.ui.nav.TurnBanner
@@ -294,22 +296,27 @@ fun AtlasMap(
     }
 
     // The stock compass position (top-right) sits in the search bar's
-    // corner; park it bottom-left instead, inset by the safe area so it
-    // clears the gesture-nav bar and any display cutout. The MapLibre
-    // attribution and logo go away entirely — data credits live on the
-    // attribution screen, not on the map.
+    // corner; park it bottom-left instead, above the tab bar — the bar
+    // paints over the map, so the compass must clear its full height
+    // (gesture-bar inset included), not just the safe area. The left inset
+    // uses safeDrawing for display cutouts, but the bottom deliberately
+    // uses navigationBars + the bar height: safeDrawing also tracks the
+    // IME, which would bounce the compass up with the keyboard. The
+    // MapLibre attribution and logo go away entirely — data credits live
+    // on the attribution screen, not on the map.
     val density = LocalDensity.current
     val layout_direction = LocalLayoutDirection.current
     val safe_left_px = WindowInsets.safeDrawing.getLeft(density, layout_direction)
-    val safe_bottom_px = WindowInsets.safeDrawing.getBottom(density)
-    LaunchedEffect(map_libre, safe_left_px, safe_bottom_px) {
+    val tab_bar_px = WindowInsets.navigationBars.getBottom(density) +
+        with(density) { TAB_BAR_HEIGHT.roundToPx() }
+    LaunchedEffect(map_libre, safe_left_px, tab_bar_px) {
         val map = map_libre ?: return@LaunchedEffect
         val margin_px = with(density) { 8.dp.roundToPx() }
         map.uiSettings.apply {
             isAttributionEnabled = false
             isLogoEnabled = false
             compassGravity = Gravity.BOTTOM or Gravity.START
-            setCompassMargins(safe_left_px + margin_px, 0, 0, safe_bottom_px + margin_px)
+            setCompassMargins(safe_left_px + margin_px, 0, 0, tab_bar_px + margin_px)
         }
     }
 

@@ -25,24 +25,29 @@ data class PlaceCandidate(
 interface PlaceDao {
 
     /**
-     * Raw FTS hits for a MATCH pattern. The pattern is built by
-     * [ftsPattern]; callers score the returned candidates themselves
-     * (rank-then-distance) because ORDER BY in SQL cannot express that.
+     * Raw FTS hits for a MATCH pattern, pre-ordered so a broad query cannot
+     * evict the important rows from the returned window: ranked places
+     * first, then rows closest to the map center (Manhattan order — the
+     * exact haversine re-sort happens in [searchPlaces] over the returned
+     * window). The pattern is built by [ftsPattern].
      */
     @Query(
         "SELECT p.id, p.name, p.kind, p.subclass, p.rank, p.lon, p.lat " +
             "FROM place p JOIN place_fts fts ON p.id = fts.rowid " +
-            "WHERE place_fts MATCH :pattern LIMIT :limit",
+            "WHERE place_fts MATCH :pattern " +
+            "ORDER BY p.rank, (abs(p.lat - :centerLat) + abs(p.lon - :centerLon)) LIMIT :limit",
     )
-    suspend fun match(pattern: String, limit: Int): List<PlaceCandidate>
+    suspend fun match(pattern: String, centerLon: Double, centerLat: Double, limit: Int): List<PlaceCandidate>
 
     /**
      * The dedupe probe for incremental indexing: the lowest zoom each
-     * existing (name, kind) pair was already indexed at. Loading all pairs
-     * (tens of thousands at most) once per pass beats a query per feature.
+     * existing (name, kind) pair was already indexed at, EXCLUDING
+     * [exceptKind] rows. Address rows (millions) must never be loaded into
+     * an in-memory dedupe map — their dedupe is the unique dedupeKey index
+     * plus insert-or-ignore — so passes filter them out in SQL.
      */
-    @Query("SELECT name, kind, zoom FROM place")
-    suspend fun existingZooms(): List<PlaceZoomRow>
+    @Query("SELECT name, kind, zoom FROM place WHERE kind <> :exceptKind")
+    suspend fun existingZoomsExcept(exceptKind: String): List<PlaceZoomRow>
 
     /**
      * Insert-or-ignore on the unique dedupeKey: a rebuilt or overlapping

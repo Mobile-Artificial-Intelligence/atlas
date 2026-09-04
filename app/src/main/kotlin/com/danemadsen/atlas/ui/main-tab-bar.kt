@@ -27,7 +27,7 @@ import androidx.compose.ui.unit.dp
  */
 
 /** The bar itself, above the gesture-bar inset. M3's default is a taller 80 dp. */
-private val TAB_BAR_HEIGHT = 64.dp
+internal val TAB_BAR_HEIGHT = 64.dp
 
 @Composable
 fun MainTabBar(

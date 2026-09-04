@@ -256,6 +256,11 @@ fun AttributionDialog(open: Boolean, onDismiss: () -> Unit) {
                         "Map data © OpenStreetMap contributors (ODbL).",
                 )
                 AttributionBlock(
+                    "Address search",
+                    "Address points from OpenAddresses (CC-BY) — merged into " +
+                        "the country archives at build time. openaddresses.io",
+                )
+                AttributionBlock(
                     "Routing",
                     "BeeRouter (MPL-2.0) by Jan Gillich — a Kotlin fork of BRouter. " +
                         "BRouter by A. Menzel et al. Car, bike and foot profiles " +

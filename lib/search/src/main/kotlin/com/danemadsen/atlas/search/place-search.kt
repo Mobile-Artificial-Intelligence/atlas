@@ -30,7 +30,7 @@ suspend fun searchPlaces(
     limit: Int = RESULT_LIMIT,
 ): List<PlaceHit> = withContext(Dispatchers.IO) {
     val pattern = ftsPattern(rawQuery) ?: return@withContext emptyList()
-    dao.match(pattern, HARD_LIMIT)
+    dao.match(pattern, centerLon, centerLat, HARD_LIMIT)
         .sortedWith(
             compareBy({ it.rank }, { distanceMeters(it.lon, it.lat, centerLon, centerLat) }),
         )
@@ -39,7 +39,7 @@ suspend fun searchPlaces(
 }
 
 const val RESULT_LIMIT = 20
-const val HARD_LIMIT = 200
+const val HARD_LIMIT = 500
 
 /**
  * The FTS MATCH pattern for a user query, or null when it holds no usable

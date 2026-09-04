@@ -314,7 +314,7 @@ class GraphBuildService : Service() {
             channel = channel,
             drain = drain,
             sink = { zoom, x, y, bytes ->
-                for (candidate in indexer.candidatesFromTile(zoom, x, y, bytes)) {
+                for (candidate in SearchIndexer.candidatesFromTile(zoom, x, y, bytes)) {
                     channel.trySend(candidate)
                 }
             },

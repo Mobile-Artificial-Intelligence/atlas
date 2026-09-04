@@ -56,19 +56,72 @@ class MvtDecoderTest {
         val type = varintField(3, MvtGeomType.LINESTRING.code.toLong())
         val geometry = packedVarintField(4, linestringGeometry())
         val featureBytes = varintField(1, 42L) + tags + type + geometry
+        return buildLayer(
+            "transportation",
+            featureBytes,
+            keys = listOf("class", "name"),
+            values = listOf("primary", "Swanston Street"),
+            extent = 4096,
+        )
+    }
 
-        // Layer: version=2, name, features, keys, values, extent
+    /** One-layer tile with a single feature's bytes plus keys/values tables. */
+    private fun buildLayer(
+        name: String,
+        featureBytes: ByteArray,
+        keys: List<String>,
+        values: List<String>,
+        extent: Int,
+    ): ByteArray {
         val version = varintField(15, 2L)
-        val name = lenDelimited(1, "transportation".toByteArray(Charsets.UTF_8))
+        val layerName = lenDelimited(1, name.toByteArray(Charsets.UTF_8))
         val features = lenDelimited(2, featureBytes)
-        val key0 = lenDelimited(3, "class".toByteArray(Charsets.UTF_8))
-        val key1 = lenDelimited(3, "name".toByteArray(Charsets.UTF_8))
-        val value0 = lenDelimited(4, lenDelimited(1, "primary".toByteArray(Charsets.UTF_8)))
-        val value1 = lenDelimited(4, lenDelimited(1, "Swanston Street".toByteArray(Charsets.UTF_8)))
-        val extent = varintField(5, 4096L)
+        val keyFields = keys.map { lenDelimited(3, it.toByteArray(Charsets.UTF_8)) }
+        val valueFields = values.map { lenDelimited(4, lenDelimited(1, it.toByteArray(Charsets.UTF_8))) }
+        val out = ByteArrayOutputStream()
+        out.write(version)
+        out.write(layerName)
+        out.write(features)
+        keyFields.forEach { out.write(it) }
+        valueFields.forEach { out.write(it) }
+        out.write(varintField(5, extent.toLong()))
+        return lenDelimited(3, out.toByteArray())
+    }
 
-        val layer = version + name + features + key0 + key1 + value0 + value1 + extent
-        return lenDelimited(3, layer)
+    /** Geometry: one MoveTo — a POINT at tile-local (px, py). */
+    private fun pointGeometry(px: Int, py: Int): List<Int> = listOf(
+        (1 shl 3) or 1, // MoveTo, 1 pair
+        zigzag(px), zigzag(py),
+    )
+
+    private fun buildPointTile(): ByteArray {
+        // Feature: id=1, tags (packed), type=POINT, geometry (packed).
+        val tags = packedVarintField(2, listOf(0, 0, 1, 1))
+        val type = varintField(3, MvtGeomType.POINT.code.toLong())
+        val geometry = packedVarintField(4, pointGeometry(2048, 2048))
+        val featureBytes = varintField(1, 42L) + tags + type + geometry
+        return buildLayer(
+            "address",
+            featureBytes,
+            keys = listOf("number", "street"),
+            values = listOf("69", "Mott Street"),
+            extent = 4096,
+        )
+    }
+
+    @Test
+    fun decodesPointFeatures() {
+        val tile = MvtTile.decode(buildPointTile())
+        val layer = tile.layer("address")!!
+        assertEquals(1, layer.features.size)
+        val feature = layer.features[0]
+        assertEquals(MvtGeomType.POINT, feature.geomType)
+        assertEquals(
+            mapOf("number" to "69", "street" to "Mott Street"),
+            layer.properties(feature),
+        )
+        val paths = layer.pathsLocal(feature)
+        assertEquals(listOf(listOf(TilePoint(2048, 2048))), paths)
     }
 
     @Test
