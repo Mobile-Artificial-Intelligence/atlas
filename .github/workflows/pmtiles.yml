@@ -55,10 +55,16 @@ on:
         type: boolean
         default: true
 
-# A manually started run shouldn't cancel one already in flight, and vice
-# versa; the daily runs are hours long.
+# Smoke dispatches get their OWN concurrency lane: a ~5-minute monaco run
+# must not queue behind the hours-long country builds (a queued smoke used
+# to wait out an in-progress full run — and a dispatch with smoke_only
+# unchecked waits out anything). Full runs (schedule, or dispatch with
+# smoke_only unchecked) still serialize against each other — a manual
+# country rebuild shouldn't cancel one already in flight, and vice versa.
+# inputs.smoke_only is empty on schedule, which is falsy, so the daily
+# lands in the full lane.
 concurrency:
-  group: pmtiles
+  group: pmtiles-${{ inputs.smoke_only && 'smoke' || 'full' }}
   cancel-in-progress: false
 
 jobs:
