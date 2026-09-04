@@ -88,6 +88,12 @@ lint/tmp/
 .idea/
 .DS_Store
 
+# Dev-machine test corpus: too heavy for git (125 MB / 75 MB). Regenerate
+# from the atlas-prototype pipeline (planetiler bbox extract + osmium).
+# Tests that need them skip gracefully when absent (see graph/*-test.kt).
+app/src/test/fixtures/melbourne.pbf
+app/src/test/fixtures/melbourne.pmtiles
+
 *.jks
 *.keystore
 key.properties
