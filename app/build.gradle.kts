@@ -1,0 +1,200 @@
+import com.android.build.api.artifact.SingleArtifact
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.TaskAction
+
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+}
+
+android {
+    namespace = "com.danemadsen.atlas"
+    compileSdk = 37
+
+    defaultConfig {
+        applicationId = "com.danemadsen.atlas"
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 1
+        versionName = "0.1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        compose = true
+    }
+}
+
+dependencies {
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons)
+    debugImplementation(libs.compose.ui.tooling)
+
+    implementation(libs.core.ktx)
+    implementation(libs.activity.compose)
+    implementation(libs.lifecycle.runtime.compose)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.viewmodel.savedstate)
+
+    implementation(libs.maplibre.android)
+
+    implementation(project(":lib:pmtiles"))
+    implementation(project(":lib:map-style"))
+    implementation(project(":lib:search"))
+
+    implementation(libs.coroutines.android)
+
+    // ---- beerouter (integrated source, see beerouter/VENDORING.md) ----
+    implementation(libs.coroutines.core)
+    implementation(libs.kotlinx.io.core)
+    implementation(libs.spatialk.geojson)
+    implementation(libs.spatialk.turf)
+    implementation(libs.spatialk.units)
+    implementation(libs.androidx.collection)
+    // The generator's PBF parsing (test fixtures + upstream parity tooling)
+    implementation("org.openstreetmap.osmosis:osmosis-osm-binary:0.48.3")
+
+    testImplementation(libs.junit)
+    testImplementation(kotlin("test"))
+    testImplementation(libs.coroutines.core)
+    testImplementation(libs.coroutines.test)
+    androidTestImplementation(libs.androidx.test.junit)
+}
+
+/** Fails the build if the merged manifest still requests network access —
+ *  the hard guarantee that Atlas never gains INTERNET back via some
+ *  dependency's manifest. */
+abstract class NoNetworkPermissionCheck : DefaultTask() {
+    @get:InputFile
+    abstract val mergedManifest: RegularFileProperty
+
+    @TaskAction
+    fun check() {
+        val manifest_text = mergedManifest.get().asFile.readText()
+        val forbidden = listOf(
+            "android.permission.INTERNET",
+            "android.permission.ACCESS_NETWORK_STATE",
+            "android.permission.ACCESS_WIFI_STATE",
+        ).filter { manifest_text.contains(it) }
+        check(forbidden.isEmpty()) {
+            "Atlas must be fully offline, but the merged manifest requests: $forbidden. " +
+                "Add uses-permission tools:node=\"remove\" entries in the app manifest."
+        }
+    }
+}
+
+// A full-bucket pipeline run (two cutters + linker over a metro rectangle)
+// holds the whole node set in memory; the Gradle default 512m cannot.
+// 8g + a heap dump on OOM: the full-fixture Melbourne diagnostic has OOMed
+// at 4g during the stitch index build, and the dump (plus the cutter's
+// file instrumentation at /tmp/atlas-cutter-dbg.log) is what identifies the
+// actual consumer. 16g of dev-machine RAM makes 8g safe.
+tasks.withType<Test>().configureEach {
+    maxHeapSize = "8g"
+    jvmArgs("-XX:+HeapDumpOnOutOfMemoryError")
+    // The pipeline diagnostic streams phase stats as it goes — without
+    // this, stdout only surfaces in the JUnit XML after the test exits.
+    testLogging {
+        showStandardStreams = true
+    }
+}
+
+// Dev-only single-bucket build harness (see graph-build-cli.kt): runs the
+// SAME pipeline the device's :graph service runs, under a heap the caller
+// controls — the default matches a typical Android largeHeap cap, so a green
+// run proves the on-device build fits.
+//
+//   ./gradlew :app:graphBuildCli \
+//     -Parchive=$HOME/atlas-prototype/tmp/australia.pmtiles \
+//     -Pbucket=140,-40 -Pout=/tmp/atlas-segments [-Pheap=576m]
+// Dev-only route check over a built segments dir (see graph-route-cli.kt):
+// proves the .rd5 the device's :graph service produces is routable through
+// the stock engine. M5 acceptance: Melbourne CBD -> Geelong, car profile.
+//
+//   ./gradlew :app:graphRouteCli \
+//     -Psegments=/tmp/atlas-segments -Pfrom=144.9631,-37.8142 \
+//     -Pto=144.3608,-38.1495 [-Pprofile=car-vario]
+val route_segments = providers.gradleProperty("segments")
+val route_from = providers.gradleProperty("from").orElse("144.9631,-37.8142")
+val route_to = providers.gradleProperty("to").orElse("144.3608,-38.1495")
+val route_profile = providers.gradleProperty("profile").orElse("car-vario")
+tasks.register<JavaExec>("graphRouteCli") {
+    group = "atlas-dev"
+    description = "Route between two points through a built .rd5 segments dir with the stock engine"
+    dependsOn("compileDebugUnitTestKotlin")
+    // The unit-test classpath serves the app's classes from
+    // bundleDebugClassesToRuntimeJar; reading the FileCollection alone does
+    // not schedule that jar, so a stale one silently shadowed fresh classes.
+    dependsOn("bundleDebugClassesToRuntimeJar")
+    mainClass = "com.danemadsen.atlas.graph.GraphRouteCli"
+    maxHeapSize = "512m"
+    doFirst {
+        classpath = tasks.named<Test>("testDebugUnitTest").get().classpath
+        args(
+            route_segments.orNull ?: error("-Psegments=<dir> is required"),
+            route_from.get(),
+            route_to.get(),
+            route_profile.get(),
+        )
+    }
+}
+
+val graph_build_archive = providers.gradleProperty("archive")
+val graph_build_bucket = providers.gradleProperty("bucket").orElse("140,-40")
+val graph_build_out = providers.gradleProperty("out").orElse("/tmp/atlas-segments")
+tasks.register<JavaExec>("graphBuildCli") {
+    group = "atlas-dev"
+    description = "Build one 5-degree bucket from a PMTiles archive under a bounded heap"
+    // AGP 9 registers the unit-test tasks only after this script evaluates,
+    // so the test classpath and args are resolved lazily in doFirst.
+    dependsOn("compileDebugUnitTestKotlin")
+    // See graphRouteCli: keep the runtime classes jar on the task graph.
+    dependsOn("bundleDebugClassesToRuntimeJar")
+    mainClass = "com.danemadsen.atlas.graph.GraphBuildCli"
+    maxHeapSize = providers.gradleProperty("heap").orElse("576m").get()
+    doFirst {
+        classpath = tasks.named<Test>("testDebugUnitTest").get().classpath
+        val (lon_min, lat_min) = graph_build_bucket.get().split(",").map { it.trim() }
+        args(
+            graph_build_archive.orNull ?: error("-Parchive=<pmtiles path> is required"),
+            lon_min,
+            lat_min,
+            graph_build_out.get(),
+        )
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val capitalized_name = variant.name.replaceFirstChar { it.uppercase() }
+        val check_task = tasks.register(
+            "check${capitalized_name}NoNetworkPermissions",
+            NoNetworkPermissionCheck::class,
+        ) {
+            mergedManifest.set(variant.artifacts.get(SingleArtifact.MERGED_MANIFEST))
+        }
+        tasks.matching { it.name == "assemble$capitalized_name" }.configureEach {
+            dependsOn(check_task)
+        }
+    }
+}

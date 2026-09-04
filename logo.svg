@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="88.104462mm"
+   height="88.104462mm"
+   viewBox="0 0 88.104461 88.104461"
+   version="1.1"
+   id="svg1"
+   xml:space="preserve"
+   inkscape:version="1.4.4 (dcaf3e7, 2026-05-05)"
+   sodipodi:docname="logo.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"><sodipodi:namedview
+     id="namedview1"
+     pagecolor="#505050"
+     bordercolor="#eeeeee"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#505050"
+     inkscape:document-units="mm"
+     inkscape:zoom="1.5946268"
+     inkscape:cx="-18.813179"
+     inkscape:cy="221.05485"
+     inkscape:window-width="3440"
+     inkscape:window-height="1382"
+     inkscape:window-x="0"
+     inkscape:window-y="1110"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="g4" /><defs
+     id="defs1" /><g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(-60.947769,-104.44777)"><g
+       id="g4"><circle
+         style="display:inline;fill:#245d75;fill-opacity:1;fill-rule:evenodd;stroke-width:12;stroke-linecap:round;stroke-linejoin:round"
+         id="path1"
+         cx="105"
+         cy="148.5"
+         r="24.058659"
+         inkscape:label="water" /><path
+         id="path4"
+         style="fill:#259cc2;fill-opacity:0.998733;fill-rule:evenodd;stroke-width:12;stroke-linecap:round;stroke-linejoin:round"
+         d="m 105.34551,124.44408 -4.38216,15.428 7.63261,4.47983 -3.40135,11.36572 15.67967,-6.47093 4.60643,-13.37024 a 24.058659,24.058659 0 0 0 0,-5.2e-4 24.058659,24.058659 0 0 0 -20.1352,-11.43186 z m -7.202663,21.89893 -6.056478,2.65461 -2.405538,7.21765 -7.520988,-0.15555 a 24.058659,24.058659 0 0 0 18.645377,16.13029 l 3.14502,-6.766 -7.217643,-10.86807 z m 30.141833,8.21086 -16.45326,6.55619 -1.21853,10.78487 a 24.058659,24.058659 0 0 0 17.67179,-17.34106 z"
+         inkscape:label="land" /></g></g></svg>
