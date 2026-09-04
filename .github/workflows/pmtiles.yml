@@ -208,8 +208,12 @@ jobs:
             free_disk: true
             oa_cc: ''
             address_at: ''
-          - country: singapore
-            url: https://download.geofabrik.de/asia/singapore-latest.osm.pbf
+          - country: malaysia-singapore-brunei
+            # Geofabrik has no standalone Singapore extract — the trio comes
+            # as one 238 MB file (a lone `asia/singapore-...` URL 302s to the
+            # homepage, whose HTML then dies in Planetiler). The sg
+            # countrywide addresses still cover the city-state's tiles.
+            url: https://download.geofabrik.de/asia/malaysia-singapore-brunei-latest.osm.pbf
             heap: 2g
             free_disk: false
             oa_cc: sg
