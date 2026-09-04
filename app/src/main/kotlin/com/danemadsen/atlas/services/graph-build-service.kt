@@ -97,6 +97,14 @@ class GraphBuildService : Service() {
     /** The snapshot behind the current status file, for the heartbeat's ts refresh. */
     @Volatile private var lastSnapshot: BuildSnapshot? = null
 
+    /**
+     * Serializes status writes (the run coroutine, the heartbeat thread, and
+     * terminal writes) AND makes the heartbeat's read of [lastSnapshot]
+     * atomic with its re-write — without it a tick racing a fresher
+     * snapshot's write could stamp the file with an older one.
+     */
+    private val statusLock = Any()
+
     /** Unique tmp suffix per status write: concurrent writers must not share a tmp file. */
     private val statusTmpSeq = AtomicInteger(0)
 
@@ -181,8 +189,14 @@ class GraphBuildService : Service() {
             // status the teardown wrote is the last word.
             return
         }
+        // run() is only reached with runJob inactive (onStartCommand's active
+        // branch queues into pendingIntent above), and ACTION_CANCEL only
+        // arms cancelRequested while a run IS active — so any value here is
+        // stale from a run whose finally already consumed it. Clearing it
+        // keeps a cancel that targeted run N from also killing run N+1.
         timedOut = false
         sawBuildWork = false
+        cancelRequested = false
         wakeLock.acquire(WAKE_LOCK_SLICE_MS)
         runJob = scope.launch {
             // Heartbeat: the old single 6h wake lock could expire mid-build
@@ -204,11 +218,21 @@ class GraphBuildService : Service() {
             }
             heartbeat.scheduleAtFixedRate({
                 wakeLock.acquire(WAKE_LOCK_SLICE_MS)
-                lastSnapshot?.takeIf { it.running }?.let { writeStatus(it) }
+                // Inside the lock so the re-stamp cannot interleave with a
+                // newer snapshot's write and regress the file (writeStatus
+                // is reentrant on this same lock).
+                synchronized(statusLock) {
+                    lastSnapshot?.takeIf { it.running }?.let { writeStatus(it) }
+                }
             }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS)
             var terminalError: String? = null
+            // Set only when dispatch() returned normally — an aborted run
+            // (onDestroy's scope.cancel, a user cancel) must not announce
+            // "ready", and neither must one still queued behind a handoff.
+            var completed_normally = false
             try {
                 dispatch(intent)
+                completed_normally = true
             } catch (e: CancellationException) {
                 // A cancelled/aborted run is not a failure — no error in the
                 // terminal status. Only coroutine cancellation takes this
@@ -238,6 +262,17 @@ class GraphBuildService : Service() {
                     heartbeat.awaitTermination(5, TimeUnit.SECONDS)
                 }
                 reportStatus(running = false, bucket = null, built = 0, total = 0, error = terminalError)
+                // Snapshot this run's own state BEFORE the handoff post:
+                // the post runs later on the main thread, and by then the
+                // service-wide flags can belong to a different run (a build
+                // started in the gap, or the follow-on's first ticks) —
+                // reading them inside the post would attribute that run's
+                // outcome to this one. At capture time this coroutine is
+                // still live, so a concurrent intent is guaranteed to land
+                // in pendingIntent (onStartCommand sees runJob active), not
+                // start a run the capture could miss.
+                val saw_work = sawBuildWork
+                val was_cancelled = cancelRequested
                 // The pending-intent snapshot-and-clear must run on the
                 // main thread, like every other pendingIntent access:
                 // doing it here on a Default worker races a concurrent
@@ -248,13 +283,18 @@ class GraphBuildService : Service() {
                 // directly in the gap between this coroutine's end and
                 // the post's execution.
                 main_handler.post {
-                    val cancelled = cancelRequested
-                    val pending = if (cancelled) null else pendingIntent
+                    val pending = if (was_cancelled) null else pendingIntent
                     pendingIntent = null
-                    cancelRequested = false
                     if (pending != null) {
-                        // A queued build takes over: the handoff belongs to
-                        // ITS terminal state, not this run's.
+                        // A queued build takes over: the success handoff
+                        // belongs to ITS terminal state, not this run's.
+                        // But a FAILED run still announces itself — the
+                        // follow-on may succeed without covering this
+                        // run's buckets, and its status writes would
+                        // overwrite this error before anyone sees it.
+                        if (terminalError != null) {
+                            notifyDone("Routing data preparation failed", terminalError)
+                        }
                         run(pending)
                     } else {
                         // The run's end is only now final (no follow-on):
@@ -268,7 +308,7 @@ class GraphBuildService : Service() {
                                 "Routing data preparation failed",
                                 terminalError,
                             )
-                        } else if (!cancelled && sawBuildWork) {
+                        } else if (!was_cancelled && completed_normally && saw_work) {
                             notifyDone(
                                 "Routing data ready",
                                 "Routing in your prepared area is available.",
@@ -461,34 +501,37 @@ class GraphBuildService : Service() {
      * Atomic-ish: small file, written whole via a unique tmp + rename.
      * The tmp name must be unique per write — the run coroutine and the
      * heartbeat write concurrently, and a shared tmp name could publish a
-     * torn file.
+     * torn file. [statusLock] orders the writers so a heartbeat re-stamp
+     * can never regress the file to an older snapshot.
      */
     private fun writeStatus(snapshot: BuildSnapshot) {
-        lastSnapshot = snapshot
-        runCatching {
-            val dir = File(filesDir, "graph").apply { mkdirs() }
-            val tmp = File(dir, "$STATUS_FILE.tmp.${statusTmpSeq.incrementAndGet()}")
-            tmp.writeText(
-                JSONObject()
-                    .put("running", snapshot.running)
-                    .put("bucket", snapshot.bucket ?: "")
-                    .put("built", snapshot.built)
-                    .put("total", snapshot.total)
-                    .put("error", snapshot.error ?: "")
-                    .put("label", snapshot.label ?: "")
-                    .put("fraction", snapshot.fraction?.toDouble() ?: -1.0)
-                    .put("ts", System.currentTimeMillis())
-                    .toString(),
-            )
-            if (!tmp.renameTo(File(dir, STATUS_FILE))) {
-                File(dir, STATUS_FILE).delete()
-                tmp.renameTo(File(dir, STATUS_FILE))
+        synchronized(statusLock) {
+            lastSnapshot = snapshot
+            runCatching {
+                val dir = File(filesDir, "graph").apply { mkdirs() }
+                val tmp = File(dir, "$STATUS_FILE.tmp.${statusTmpSeq.incrementAndGet()}")
+                tmp.writeText(
+                    JSONObject()
+                        .put("running", snapshot.running)
+                        .put("bucket", snapshot.bucket ?: "")
+                        .put("built", snapshot.built)
+                        .put("total", snapshot.total)
+                        .put("error", snapshot.error ?: "")
+                        .put("label", snapshot.label ?: "")
+                        .put("fraction", snapshot.fraction?.toDouble() ?: -1.0)
+                        .put("ts", System.currentTimeMillis())
+                        .toString(),
+                )
+                if (!tmp.renameTo(File(dir, STATUS_FILE))) {
+                    File(dir, STATUS_FILE).delete()
+                    tmp.renameTo(File(dir, STATUS_FILE))
+                }
+            }.onFailure {
+                // A silent write failure reads downstream as a dead build (the
+                // route's ensureBucket and the banner both poll this file) —
+                // it must at least be diagnosable in logcat.
+                Log.w(TAG, "status write failed", it)
             }
-        }.onFailure {
-            // A silent write failure reads downstream as a dead build (the
-            // route's ensureBucket and the banner both poll this file) —
-            // it must at least be diagnosable in logcat.
-            Log.w(TAG, "status write failed", it)
         }
     }
 
@@ -538,29 +581,42 @@ class GraphBuildService : Service() {
     }
 
     private fun updateNotification(progress: GraphBuildManager.Progress) {
-        val text = when {
-            progress.label != null -> buildString {
-                append(progress.bucket).append(" — ").append(progress.label)
-                progress.fraction?.let {
-                    append(" (").append((it * 100).toInt()).append("%)")
-                }
+        // Called from the build's hot loop (reportProgress fires per
+        // phase tick): a notification-manager throw here would kill the
+        // run over cosmetics. Best effort, logged.
+        runCatching {
+            // built + 1 = "the bucket now being built" — but only while one
+            // actually is; and never past total (the final tick lands after
+            // the last bucket's completion).
+            val shown = if (progress.building) {
+                minOf(progress.built + 1, progress.total)
+            } else {
+                progress.built
             }
-            else -> "${progress.bucket} (${progress.built + 1}/${progress.total})"
-        }
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Preparing routing data")
-            .setContentText(text)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-        // A determinate bar needs a real fraction; the label-only phases
-        // (and the pre-scan gap) stay honest with an indeterminate one.
-        if (progress.fraction != null) {
-            builder.setProgress(100, (progress.fraction * 100).toInt().coerceIn(0, 100), false)
-        } else {
-            builder.setProgress(0, 0, true)
-        }
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, builder.build())
+            val text = when {
+                progress.label != null -> buildString {
+                    append(progress.bucket).append(" — ").append(progress.label)
+                    progress.fraction?.let {
+                        append(" (").append((it * 100).toInt()).append("%)")
+                    }
+                }
+                else -> "${progress.bucket} ($shown/${progress.total})"
+            }
+            val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("Preparing routing data")
+                .setContentText(text)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+            // A determinate bar needs a real fraction; the label-only phases
+            // (and the pre-scan gap) stay honest with an indeterminate one.
+            if (progress.fraction != null) {
+                builder.setProgress(100, (progress.fraction * 100).toInt().coerceIn(0, 100), false)
+            } else {
+                builder.setProgress(0, 0, true)
+            }
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, builder.build())
+        }.onFailure { Log.w(TAG, "progress notification update failed", it) }
     }
 
     /**
@@ -615,9 +671,11 @@ class GraphBuildService : Service() {
         // The end-of-build notification: its own channel (the ongoing one is
         // IMPORTANCE_LOW; "it finished" is meant to be noticed) and its own
         // ID, so it outlives stopSelf() dropping the foreground notification.
+        // Notification IDs are per-APP, not per-process: NavigationService
+        // owns 3 in the main process, so this must not.
         private const val DONE_CHANNEL_ID = "graph_build_done"
         private const val DONE_CHANNEL_NAME = "Routing data ready"
-        private const val NOTIFICATION_DONE_ID = 3
+        private const val NOTIFICATION_DONE_ID = 4
         private const val STATUS_FILE = "build-status.json"
         private const val WAKE_LOCK_TAG = "atlas:graph-build"
         private const val WAKE_LOCK_SLICE_MS = 10L * 60 * 1000 // renewed by the heartbeat

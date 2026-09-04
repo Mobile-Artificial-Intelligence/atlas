@@ -73,7 +73,7 @@ class GraphPipeline(private val workDir: File) {
         bucketLatMin: Int,
         segmentsDir: File,
         onTileScanned: ((zoom: Int, x: Int, y: Int, bytes: ByteArray) -> Unit)? = null,
-        onSubProgress: ((label: String, fraction: Float?) -> Unit)? = null,
+        onSubProgress: ((label: String, phase: Int, fraction: Float?) -> Unit)? = null,
     ): BuildResult {
         require(bucketLonMin % BUCKET_DEGREES == 0 && bucketLatMin % BUCKET_DEGREES == 0) {
             "bucket corners must be multiples of $BUCKET_DEGREES degrees"
@@ -128,7 +128,7 @@ class GraphPipeline(private val workDir: File) {
         }
 
         // ---- phase 2: 45-degree tiles -> 5-degree buckets ----
-        onSubProgress?.invoke(REBUCKETING_LABEL, null)
+        onSubProgress?.invoke(REBUCKETING_LABEL, PHASE_REBUCKET, null)
         WayCutter5().apply {
             this.nodeFilter = requireNotNull(scan.nodeFilter) {
                 "scan phase always provides the node filter"
@@ -144,7 +144,7 @@ class GraphPipeline(private val workDir: File) {
         scan.nodeFilter = null
 
         // ---- phase 3: position dedup + (no) elevation ----
-        onSubProgress?.invoke(UNIFYING_LABEL, null)
+        onSubProgress?.invoke(UNIFYING_LABEL, PHASE_UNIFY, null)
         PosUnifier().process(
             nodeTilesIn = nodes55,
             nodeTilesOut = unodes55,
@@ -155,7 +155,7 @@ class GraphPipeline(private val workDir: File) {
         )
 
         // ---- phase 4: link into the staging dir ----
-        onSubProgress?.invoke(LINKING_LABEL, null)
+        onSubProgress?.invoke(LINKING_LABEL, PHASE_LINK, null)
         WayLinker().process(
             nodeTilesIn = unodes55,
             wayTilesIn = ways55,
@@ -172,7 +172,7 @@ class GraphPipeline(private val workDir: File) {
         )
 
         val staged_rd5 = File(staging, "$bucket_name$RD5_SUFFIX")
-        onSubProgress?.invoke(PUBLISHING_LABEL, null)
+        onSubProgress?.invoke(PUBLISHING_LABEL, PHASE_PUBLISH, null)
         require(staged_rd5.isFile) { "WayLinker produced no $bucket_name$RD5_SUFFIX" }
         validateRd5(staged_rd5)
 
@@ -215,7 +215,7 @@ class GraphPipeline(private val workDir: File) {
         bucketLatMin: Int,
         zoom: Int,
         onTileScanned: ((Int, Int, Int, ByteArray) -> Unit)?,
-        onSubProgress: ((String, Float?) -> Unit)?,
+        onSubProgress: ((String, Int, Float?) -> Unit)?,
     ): ScanPhaseResult {
         val nodeFilter = NodeFilter().also { it.init() }
         val wayCutter = WayCutter().also { it.init(ways45) }
@@ -271,6 +271,26 @@ class GraphPipeline(private val workDir: File) {
     public companion object {
         public const val BUCKET_DEGREES: Int = 5
         public const val MAX_SCAN_ZOOM: Int = 14
+
+        /**
+         * The ordered build phases of one bucket, as indexes into the
+         * overall bucket progress. The service's bar composes
+         * `(phase + step fraction) / PHASE_COUNT`, so the bar only ever
+         * moves forward within a bucket — equal phase weights keep it
+         * honest even though the phases differ wildly in wall time. The
+         * cutter owns phases 0-4 (it emits them from inside scanPhase);
+         * the pipeline owns 5-8 (the vendored stages).
+         */
+        public const val PHASE_COUNT: Int = 9
+        public const val PHASE_SCAN: Int = 0
+        public const val PHASE_MERGE: Int = 1
+        public const val PHASE_INDEX: Int = 2
+        public const val PHASE_STITCH: Int = 3
+        public const val PHASE_EMIT: Int = 4
+        public const val PHASE_REBUCKET: Int = 5
+        public const val PHASE_UNIFY: Int = 6
+        public const val PHASE_LINK: Int = 7
+        public const val PHASE_PUBLISH: Int = 8
 
         /**
          * The bucket name for a WGS84 position, matching the runtime's

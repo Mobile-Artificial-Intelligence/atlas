@@ -95,20 +95,23 @@ class PmtilesCutter : GeneratorBase() {
 
     /**
      * Set by the caller before [process]; coarse progress WITHIN the cutter
-     * phase: [label] names the current step and [fraction] is 0..1, or null
-     * while the step's size is not known (indeterminate). The cutter's
-     * phases are minutes each on-device and the bucket-level progress the
-     * service reports would otherwise sit frozen at one value the whole
-     * time — the exact "always 100%" complaint this exists to fix.
+     * phase: [label] names the current step, [phase] is its index into the
+     * bucket's overall progress (GraphPipeline.PHASE_* — the service's bar
+     * composes `(phase + fraction) / PHASE_COUNT`), and [fraction] is 0..1
+     * within the step, or null while the step's size is not known
+     * (indeterminate). The cutter's phases are minutes each on-device and
+     * the bucket-level progress the service reports would otherwise sit
+     * frozen at one value the whole time — the exact "always 100%"
+     * complaint this exists to fix.
      *
      * Like [onTileScanned] it runs inline on the build thread: no
      * suspending, no throwing, keep it cheap.
      */
-    public var onSubProgress: ((label: String, fraction: Float?) -> Unit)? = null
+    public var onSubProgress: ((label: String, phase: Int, fraction: Float?) -> Unit)? = null
 
     /** Emits one sub-progress tick; null-fraction means the phase is indeterminate. */
-    private fun subProgress(label: String, fraction: Float? = null) {
-        onSubProgress?.invoke(label, fraction)
+    private fun subProgress(label: String, phase: Int, fraction: Float? = null) {
+        onSubProgress?.invoke(label, phase, fraction)
     }
 
     private lateinit var expctxWay: BExpressionContextWay
@@ -210,7 +213,7 @@ class PmtilesCutter : GeneratorBase() {
         )
 
         val canonical = mergeFragmentEndpoints(zoom)
-        subProgress(EMITTING_LABEL)
+        subProgress(EMITTING_LABEL, GraphPipeline.PHASE_EMIT)
         val elided = MutableLongSet(canonical.size * 2)
         canonical.forEach { nid, _ -> elided.add(nid) }
 
@@ -268,14 +271,14 @@ class PmtilesCutter : GeneratorBase() {
      */
     private fun scan(reader: PmtilesReader, bounds: TileBounds, zoom: Int) {
         val tile_observer = onTileScanned
-        subProgress(SCANNING_LABEL)
+        subProgress(SCANNING_LABEL, GraphPipeline.PHASE_SCAN)
         reader.forEachTileInBounds(
             zoom,
             bounds,
             onCellsProbed = { probed, total ->
                 // Probed cells (hits and misses) over the grid: monotonic,
                 // and at detail zooms the walk is minutes of work.
-                subProgress(SCANNING_LABEL, probed.toFloat() / total)
+                subProgress(SCANNING_LABEL, GraphPipeline.PHASE_SCAN, probed.toFloat() / total)
             },
         ) { z, x, y, bytes ->
             tiles_scanned++
@@ -452,10 +455,10 @@ class PmtilesCutter : GeneratorBase() {
         }
 
         val parent = MutableLongLongMap()
-        subProgress(MERGING_LABEL)
+        subProgress(MERGING_LABEL, GraphPipeline.PHASE_MERGE)
         for (i in 0 until endpoint_count) {
             if ((i + 1) % STITCH_PROGRESS_EVERY == 0) {
-                subProgress(MERGING_LABEL, (i + 1).toFloat() / endpoint_count)
+                subProgress(MERGING_LABEL, GraphPipeline.PHASE_MERGE, (i + 1).toFloat() / endpoint_count)
             }
             val pos_i = ep_pos[i]
             val lon_i = (pos_i shr 32)
@@ -548,7 +551,7 @@ class PmtilesCutter : GeneratorBase() {
         // ---- segment index: counting sort of every fragment's segments
         // into the grid cells the segment traverses (DDA walk; cells are
         // ~2x the stitch threshold so a 3x3 lookup sees every candidate) ----
-        subProgress(INDEXING_LABEL)
+        subProgress(INDEXING_LABEL, GraphPipeline.PHASE_INDEX)
         var segment_count = 0
         for (fragment in fragments) segment_count += fragment.nodes.size - 1
         if (segment_count == 0) return
@@ -618,7 +621,7 @@ class PmtilesCutter : GeneratorBase() {
         var frag_inserted = IntArray(16)
         var frag_inserted_count = 0
         val insertions = ArrayList<Insertion>(1024)
-        subProgress(STITCHING_LABEL)
+        subProgress(STITCHING_LABEL, GraphPipeline.PHASE_STITCH)
         for (i in 0 until endpoint_count) {
             epoch++
             val nid = ep_nid[i]
@@ -727,7 +730,7 @@ class PmtilesCutter : GeneratorBase() {
                 }
             }
             if ((i + 1) % STITCH_PROGRESS_EVERY == 0) {
-                subProgress(STITCHING_LABEL, (i + 1).toFloat() / endpoint_count)
+                subProgress(STITCHING_LABEL, GraphPipeline.PHASE_STITCH, (i + 1).toFloat() / endpoint_count)
                 dbg(
                     "stitch: ${i + 1}/$endpoint_count endpoints, " +
                         "pairs=$pairs_checked, unions=$unions_done, " +

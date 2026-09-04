@@ -208,7 +208,10 @@ private fun BuildStatusBanner() {
                                         }
                                     }
                                 } else if (s != null && s.total > 0) {
-                                    "${s.bucket ?: ""} (${s.built + 1}/${s.total})"
+                                    // built + 1 = "the bucket now building",
+                                    // but never past total (the final tick
+                                    // lands after the last bucket's done).
+                                    "${s.bucket ?: ""} (${minOf(s.built + 1, s.total)}/${s.total})"
                                 } else {
                                     "reading the map archive…"
                                 },

@@ -72,7 +72,11 @@ class GraphBuildManager(
          * first step reports.
          */
         public val label: String? = null,
-        /** 0..1 through the labeled step, or null while its size is unknown. */
+        /**
+         * 0..1 through the WHOLE bucket (composed from the step's phase
+         * index and its own fraction by the forwarder in [ensure]) — never
+         * null while a step reports, so the bar is monotonic mid-bucket.
+         */
         public val fraction: Float? = null,
     )
 
@@ -188,11 +192,19 @@ class GraphBuildManager(
                     val result = buildOne(
                         bucket,
                         onTileScanned = onTileScanned,
-                        onSubProgress = { label, fraction ->
+                        onSubProgress = { label, phase, fraction ->
                             // Forwarded from the build thread: the sub-steps
                             // inside one bucket are minutes each, and the
                             // bucket-level ticks alone read as a stuck bar.
-                            onProgress(Progress(bucket, built, total, building = true, label, fraction))
+                            // Composed as (phase + step fraction) / PHASE_COUNT
+                            // the bar only moves forward within a bucket —
+                            // and is never null, so the UI can always draw a
+                            // determinate bar mid-bucket.
+                            val bucket_fraction =
+                                (phase + (fraction ?: 0f)) / GraphPipeline.PHASE_COUNT
+                            onProgress(
+                                Progress(bucket, built, total, building = true, label, bucket_fraction),
+                            )
                         },
                     )
                     built++
@@ -221,7 +233,7 @@ class GraphBuildManager(
     private suspend fun buildOne(
         bucketName: String,
         onTileScanned: ((zoom: Int, x: Int, y: Int, bytes: ByteArray) -> Unit)? = null,
-        onSubProgress: ((label: String, fraction: Float?) -> Unit)? = null,
+        onSubProgress: ((label: String, phase: Int, fraction: Float?) -> Unit)? = null,
     ): GraphPipeline.BuildResult? =
         withContext(Dispatchers.Default) {
             val (lonMin, latMin) = parseBucketName(bucketName)
