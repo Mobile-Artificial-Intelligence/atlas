@@ -143,6 +143,11 @@ jobs:
           # needs its own join without them.
           tippecanoe/tile-join -R data:address -pk \
             -o out/atlas-monaco.pmtiles out/atlas-monaco-base.pmtiles out/addr-z14.pmtiles
+          # tile-join widens the bbox to its inputs' union (the OA archive's
+          # own header is global); the app bounds its tile sweeps with the
+          # archive bbox, so it must stay the base's.
+          python3 .github/scripts/patch-pmtiles-bbox.py \
+            out/atlas-monaco-base.pmtiles out/atlas-monaco.pmtiles
 
       - name: Verify PMTiles
         run: |
@@ -322,6 +327,12 @@ jobs:
           # needs its own join without them.
           tippecanoe/tile-join -R data:address -pk \
             -o "out/atlas-$COUNTRY.pmtiles" "out/atlas-$COUNTRY-base.pmtiles" out/addr-z14.pmtiles
+          # tile-join widens the bbox to its inputs' union (the OA archive's
+          # own header is global); the app bounds its tile sweeps with the
+          # archive bbox (its z14 address sweep enumerates the bbox's tile
+          # grid), so it must stay the base's.
+          python3 .github/scripts/patch-pmtiles-bbox.py \
+            "out/atlas-$COUNTRY-base.pmtiles" "out/atlas-$COUNTRY.pmtiles"
           # The intermediates are the archive's size all over again — free
           # them before the upload.
           rm -f "out/atlas-$COUNTRY-base.pmtiles" out/addr-z14.pmtiles
