@@ -50,6 +50,7 @@ fun SettingsScreen(
     onDismiss: () -> Unit,
     onReplaceArchive: (uri: android.net.Uri) -> Unit,
     onInstallRoutingData: (uri: android.net.Uri) -> Unit,
+    onInstallSearchData: (uri: android.net.Uri) -> Unit,
     onPrepareAllRoutingData: () -> Unit,
     onRebuildRoutingData: () -> Unit,
     onRebuildSearchIndex: () -> Unit,
@@ -73,6 +74,11 @@ fun SettingsScreen(
     val routing_launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) onInstallRoutingData(uri) }
+
+    // And for the prebuilt search index's ZIP — same source, same picker.
+    val search_launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onInstallSearchData(uri) }
 
     Surface(
         // pointerInput with an empty body is deliberate: Compose hit-testing
@@ -169,8 +175,24 @@ fun SettingsScreen(
                     HorizontalDivider(Modifier.padding(vertical = 12.dp))
                     SettingsSectionLabel("Search")
                     Text(
+                        "The search index can be built on this device, or loaded " +
+                            "from a prebuilt search index — the file published " +
+                            "alongside your map archive. Loading it makes search " +
+                            "ready instantly: no minutes-long build. It must come " +
+                            "from the same download as the archive; Atlas refuses " +
+                            "a mismatched pair.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedButton(
+                        onClick = { search_launcher.launch(arrayOf("*/*")) },
+                        modifier = Modifier.padding(top = 8.dp),
+                    ) {
+                        Text("Load search index")
+                    }
+                    Text(
                         "Rebuilds the place index from the map archive.",
                         style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(top = 12.dp),
                     )
                     OutlinedButton(
                         onClick = onRebuildSearchIndex,

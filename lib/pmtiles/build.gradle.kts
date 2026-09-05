@@ -1,28 +1,44 @@
-import com.android.build.api.dsl.LibraryExtension
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-    alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.multiplatform)
+    // AGP is already on the plugin classpath (the app/lib modules apply
+    // com.android.library), so this resolves by id without a version —
+    // a second version would fail the already-on-classpath check.
+    id("com.android.kotlin.multiplatform.library")
 }
 
-extensions.configure<LibraryExtension>("android") {
-    namespace = "com.danemadsen.atlas.pmtiles"
-    compileSdk = 37
-
-    defaultConfig {
+kotlin {
+    // The android target of a KMP LIBRARY is configured through this block
+    // (KGP 2.4's replacement for the deprecated androidLibrary block):
+    // namespace/minSdk live here, not on a top-level android block.
+    android {
+        compilations.all {
+            compileTaskProvider.configure {
+                compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
+            }
+        }
+        namespace = "com.danemadsen.atlas.pmtiles"
+        compileSdk = 37
         minSdk = 26
     }
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+    // A plain JVM target so the search-index CLI (and anything else that
+    // runs on the host, like CI) consumes the SAME reader code the device
+    // runs — the CI-minted index and the on-device one can never diverge
+    // through a parallel implementation.
+    jvm {
+        compilations.all {
+            compileTaskProvider.configure {
+                compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
+            }
+        }
     }
 
-    // Directory/streaming internals are pure JVM; the module must still be an
-    // Android library so :app and :lib:graph can consume it on device.
-}
-
-dependencies {
-    testImplementation(kotlin("test"))
-    testImplementation(libs.junit)
+    sourceSets {
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+            implementation(libs.junit)
+        }
+    }
 }

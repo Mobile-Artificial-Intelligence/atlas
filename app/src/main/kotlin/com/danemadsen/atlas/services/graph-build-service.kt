@@ -371,10 +371,13 @@ class GraphBuildService : Service() {
      * issue.
      */
     private fun openDeepPass(): DeepPass? {
-        val archive = ArchiveStore.load(this) ?: return null
-        if (!SearchCoordinator.indexExists(this, archive)) return null
-        val indexer = SearchIndexer(this, SearchCoordinator.databaseFor(this, archive))
-        val db = indexer.open()
+        if (ArchiveStore.load(this) == null) return null
+        val archive_file = ArchiveStore.archiveFile(this)
+        if (!SearchCoordinator.indexExists(this, archive_file)) return null
+        val db = SearchCoordinator.openDatabase(
+            this,
+            SearchCoordinator.databaseFor(this, archive_file),
+        )
         val place_channel = Channel<PlaceEntity>(Channel.UNLIMITED)
         val address_channel = Channel<AddressEntity>(Channel.UNLIMITED)
         // The sink runs inline in the build thread's scan visitor (it must

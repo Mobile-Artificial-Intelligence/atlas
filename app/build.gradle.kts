@@ -208,8 +208,8 @@ tasks.register<JavaExec>("graphRouteCli") {
     // jars exist: without the explicit edges the JavaExec starts with
     // holes in its classpath and dies with NoClassDefFoundError on the
     // first class it touches (locally a warm build dir hides this).
-    dependsOn(":lib:pmtiles:bundleLibRuntimeToJarDebug")
-    dependsOn(":lib:search:bundleLibRuntimeToJarDebug")
+    dependsOn(":lib:pmtiles:bundleAndroidMainClassesToRuntimeJar")
+    dependsOn(":lib:search:bundleAndroidMainClassesToRuntimeJar")
     dependsOn(":lib:map-style:bundleLibRuntimeToJarDebug")
     mainClass = "com.danemadsen.atlas.graph.GraphRouteCli"
     maxHeapSize = "512m"
@@ -239,8 +239,8 @@ tasks.register<JavaExec>("graphBuildCli") {
     // See graphRouteCli: the libs' runtime jars too, or a fresh checkout
     // runs the JavaExec with a holed classpath (CI: NoClassDefFoundError
     // com/danemadsen/atlas/pmtiles/PmtilesReader).
-    dependsOn(":lib:pmtiles:bundleLibRuntimeToJarDebug")
-    dependsOn(":lib:search:bundleLibRuntimeToJarDebug")
+    dependsOn(":lib:pmtiles:bundleAndroidMainClassesToRuntimeJar")
+    dependsOn(":lib:search:bundleAndroidMainClassesToRuntimeJar")
     dependsOn(":lib:map-style:bundleLibRuntimeToJarDebug")
     mainClass = "com.danemadsen.atlas.graph.GraphBuildCli"
     maxHeapSize = providers.gradleProperty("heap").orElse("576m").get()

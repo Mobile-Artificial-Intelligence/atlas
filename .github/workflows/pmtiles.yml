@@ -35,6 +35,14 @@ name: PMTiles
 # wait out the slowest sibling's archive build, and the archive is
 # already on disk — no artifact re-download.
 #
+# The search index gets the same treatment: searchIndexCli replays the app's
+# own indexing pass over the archive and uploads the `atlas-search-<country>`
+# artifact (index DB + completion marker + manifest, root-level in the zip —
+# Settings → Load search index / the import dialog's third row, which runs
+# adoptPrebuiltIndex, turns the minutes-to-hours post-import address sweep
+# into a copy). Its manifest pins the same archive fingerprint — three
+# artifacts, one pair-check, all from the same run.
+#
 # The final `summarize` job indexes every artifact the run produced into
 # the run's Summary tab (name, size, download link).
 #
@@ -341,6 +349,61 @@ jobs:
           # artifact, root-level, which is the layout adoptPrebuiltSegments
           # parses.
           path: out/segments/*
+          if-no-files-found: error
+
+      # ── Prebuilt search index ────────────────────────────────────────
+      # The search counterpart of the routing leg: the SAME SearchIndexer
+      # pass the device's import runs, minted here while the archive is
+      # still on disk (Room's identity hash is target-independent, so the
+      # JVM-minted DB opens on device as if the device had built it). The
+      # out dir IS the artifact — DB + completion marker + the adopt gate's
+      # manifest, root-level in the artifact zip, exactly what
+      # adoptPrebuiltIndex parses. Installing it replaces the
+      # minutes-to-hours post-import address sweep with a copy.
+      - name: Build search index
+        env:
+          COUNTRY: ${{ matrix.country }}
+        run: |
+          ./gradlew :lib:search:searchIndexCli \
+            -Parchive="$GITHUB_WORKSPACE/out/atlas-$COUNTRY.pmtiles" \
+            -Pout="$GITHUB_WORKSPACE/out/search" \
+            -Pheap=4g
+
+      - name: Show search index
+        run: |
+          # End-to-end proof the artifact is adoptable: the manifest names
+          # this very archive, and the row counts are read back out of the
+          # minted DB itself — through plain sqlite3, the same claim the
+          # CLI's own reopen pass makes.
+          cat "out/search/manifest.json"
+          echo '---'
+          python3 - <<'EOF'
+          import glob, json, sqlite3, sys
+          manifest = json.load(open("out/search/manifest.json"))
+          db = glob.glob("out/search/search-*.db")
+          assert len(db) == 1, f"expected one index DB, found {db}"
+          con = sqlite3.connect(db[0])
+          try:
+              places = con.execute("SELECT COUNT(*) FROM place").fetchone()[0]
+              addresses = con.execute("SELECT COUNT(*) FROM address").fetchone()[0]
+          finally:
+              con.close()
+          assert places == manifest["places"], \
+              f"place rows {places} != manifest {manifest['places']}"
+          assert addresses == manifest["addresses"], \
+              f"address rows {addresses} != manifest {manifest['addresses']}"
+          print(f"search index verified: {places} places, {addresses} addresses")
+          EOF
+
+      - name: Upload search artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-search-${{ matrix.country }}
+          # The index DB is dense binary SQLite; storing beats re-deflating.
+          compression-level: 0
+          retention-days: 7
+          # Same dir-as-artifact trick as the routing segments.
+          path: out/search/*
           if-no-files-found: error
 
   # The artifact sidebar is buried on the run page; put every artifact the

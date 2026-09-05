@@ -1,5 +1,8 @@
 package com.danemadsen.atlas.pmtiles
 
+import java.io.File
+import java.io.FileInputStream
+
 /** The 127-byte PMTiles v3 header, parsed eagerly when an archive is opened. */
 class PmtilesHeader private constructor(
     buffer: ByteArray,
@@ -75,6 +78,31 @@ data class TileBounds(
     val east: Double,
     val north: Double,
 )
+
+/**
+ * The raw [PmtilesHeader.HEADER_SIZE] header bytes of the archive at
+ * [file] — the content identity a fingerprint hashes (an archive's
+ * metadata carries the SAF display name it was picked under, which a
+ * browser's " (1)" suffix would break, but these bytes only change when
+ * the archive itself does).
+ */
+fun archiveHeaderBytes(file: File): ByteArray {
+    require(file.length() >= PmtilesHeader.HEADER_SIZE) {
+        "not a PMTiles archive: $file (only ${file.length()} bytes)"
+    }
+    FileInputStream(file).use { input ->
+        val header = ByteArray(PmtilesHeader.HEADER_SIZE)
+        // readFully semantics: a single read may short-read, and a short
+        // header would silently hash a shifted window.
+        var read = 0
+        while (read < PmtilesHeader.HEADER_SIZE) {
+            val n = input.read(header, read, PmtilesHeader.HEADER_SIZE - read)
+            if (n < 0) error("archive shrank mid-read: $file")
+            read += n
+        }
+        return header
+    }
+}
 
 enum class Compression(val code: Int) {
     UNKNOWN(0),

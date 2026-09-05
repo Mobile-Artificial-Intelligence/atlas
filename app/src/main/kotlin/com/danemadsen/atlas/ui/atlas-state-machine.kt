@@ -44,10 +44,17 @@ import kotlinx.coroutines.launch
  */
 sealed interface AtlasUiState {
     data object NeedsArchive : AtlasUiState
-    data class Importing(val progress: Float?, val stage: String = STAGE_COPY_ARCHIVE) : AtlasUiState
+    data class Importing(val progress: Float?, val stage: ImportStage = ImportStage.COPY_ARCHIVE) : AtlasUiState
     data class ImportFailed(val message: String) : AtlasUiState
     data class MapReady(val archive: ArchiveInfo) : AtlasUiState
 }
+
+/**
+ * The import's ordered stages — the onboarding dialog renders them as a
+ * checklist (done / running with progress), so the stage is a value, not a
+ * message the UI has to match strings against.
+ */
+enum class ImportStage { COPY_ARCHIVE, INSTALL_ROUTING, INSTALL_SEARCH }
 
 /**
  * The routing side of the screen, orthogonal to the archive state:
@@ -122,6 +129,9 @@ class AtlasViewModel(
 
     /** The in-flight routing-ZIP install — single flight, see installRoutingData. */
     private var install_job: Job? = null
+
+    /** The in-flight search-index install — single flight, see installSearchData. */
+    private var search_install_job: Job? = null
 
     /**
      * The background engine warmup: parses the routing profiles and runs
@@ -241,7 +251,9 @@ class AtlasViewModel(
         // An archive without an index (a mid-import process death, or an
         // install from before search existed) gets its cheap pass here —
         // search then works on first launch of an existing install too.
-        (state.value as? AtlasUiState.MapReady)?.archive?.let { ensureSearchIndex(it) }
+        if ((state.value as? AtlasUiState.MapReady)?.archive != null) {
+            ensureSearchIndex(com.danemadsen.atlas.data.ArchiveStore.archiveFile(app))
+        }
         // Same for the engine warmup: with an archive on disk the map is
         // already usable, so the cold-engine cost belongs here in the
         // background, not on the user's first route.
@@ -264,7 +276,13 @@ class AtlasViewModel(
             delay(SEARCH_DEBOUNCE_MS)
             val archive = (state.value as? AtlasUiState.MapReady)?.archive ?: return@launch
             val center = mapCenter ?: GeoPoint(archive.centerLon, archive.centerLat)
-            val hits = SearchCoordinator.search(app, archive, query, center.lon, center.lat)
+            val hits = SearchCoordinator.search(
+                app,
+                com.danemadsen.atlas.data.ArchiveStore.archiveFile(app),
+                query,
+                center.lon,
+                center.lat,
+            )
             _searchState.value = SearchUiState.Results(hits)
         }
     }
@@ -292,17 +310,13 @@ class AtlasViewModel(
         }
     }
 
-    private fun ensureSearchIndex(archive: ArchiveInfo) {
-        if (SearchCoordinator.indexExists(app, archive)) return
+    private fun ensureSearchIndex(archiveFile: java.io.File) {
+        if (SearchCoordinator.indexExists(app, archiveFile)) return
         if (searchIndexJob?.isActive == true) return
         _searchState.value = SearchUiState.Indexing(false)
         searchIndexJob = viewModelScope.launch {
             try {
-                SearchCoordinator.buildCheapIndex(
-                    app,
-                    archive,
-                    com.danemadsen.atlas.data.ArchiveStore.archiveFile(app),
-                )
+                SearchCoordinator.buildCheapIndex(app, archiveFile)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -599,6 +613,54 @@ class AtlasViewModel(
     }
 
     /**
+     * Settings' "Load search index": adopts the prebuilt search index —
+     * the CI artifact paired with this map archive — instead of building
+     * it on-device. Same pairing contract as installRoutingData: the
+     * manifest pins the archive's content fingerprint, so an index from a
+     * different download is refused with the actionable message rather
+     * than installing a silently-wrong search.
+     */
+    fun installSearchData(uri: Uri) {
+        // Single flight: two adoptions share the coordinator's fixed
+        // adopt-scratch dir, and the second would delete the first's
+        // extracted DB mid-validation.
+        if (search_install_job?.isActive == true) {
+            toast("Search index install is already running")
+            return
+        }
+        search_install_job = viewModelScope.launch {
+            try {
+                // A running cheap pass writes the very DB file the adoption
+                // renames into — stop it first. Its cancellation is
+                // cooperative (checked every zoom bracket / 256 tiles), so
+                // join, don't race it.
+                searchIndexJob?.cancelAndJoin()
+                val input = app.contentResolver.openInputStream(uri)
+                    ?: error("the search index file could not be opened")
+                val adoption = try {
+                    SearchCoordinator.adoptPrebuiltIndex(
+                        app,
+                        com.danemadsen.atlas.data.ArchiveStore.archiveFile(app),
+                        input,
+                    )
+                } finally {
+                    input.close()
+                }
+                toast(
+                    "Search index installed — ${adoption.places} places and " +
+                        "${adoption.addresses} addresses are searchable.",
+                )
+            } catch (e: CancellationException) {
+                // ViewModel cleared mid-install: not a user-facing failure.
+                throw e
+            } catch (e: Exception) {
+                val reason = e.message?.takeIf { it.isNotBlank() } ?: "an unexpected error"
+                toast("Search index was not installed ($reason)")
+            }
+        }
+    }
+
+    /**
      * Settings' "Rebuild search index": the DBs are wiped and the cheap
      * pass re-runs (tens of seconds, surfaced through the search state).
      * Like the other two rebuild actions, it leaves the Settings tab —
@@ -606,7 +668,7 @@ class AtlasViewModel(
      * the search bar on the Map tab.
      */
     fun rebuildSearchIndex() {
-        val archive = (_state.value as? AtlasUiState.MapReady)?.archive ?: return
+        if ((_state.value as? AtlasUiState.MapReady)?.archive == null) return
         _settingsOpen.value = false
         viewModelScope.launch {
             // cancel() alone is asynchronous — ensureSearchIndex below would
@@ -617,7 +679,7 @@ class AtlasViewModel(
             searchIndexJob?.cancelAndJoin()
             SearchCoordinator.deleteIndexes(app)
             _searchState.value = SearchUiState.Idle
-            ensureSearchIndex(archive)
+            ensureSearchIndex(com.danemadsen.atlas.data.ArchiveStore.archiveFile(app))
         }
     }
 
@@ -638,7 +700,7 @@ class AtlasViewModel(
         _routeState.value = RouteUiState.Idle
     }
 
-    fun importArchive(uri: Uri, routingDataUri: Uri? = null) {
+    fun importArchive(uri: Uri, routingDataUri: Uri? = null, searchDataUri: Uri? = null) {
         // Two taps can land in one input batch before recomposition removes
         // the Import button: both would copy into the SAME staging file and
         // interleave (or the second job would follow the first's rename).
@@ -666,7 +728,7 @@ class AtlasViewModel(
                 // the on-device build is the designed fallback, so the
                 // message surfaces as a toast and the flow continues.
                 if (routingDataUri != null) {
-                    _state.value = AtlasUiState.Importing(null, STAGE_INSTALL_ROUTING)
+                    _state.value = AtlasUiState.Importing(null, ImportStage.INSTALL_ROUTING)
                     val buckets = try {
                         GraphBuildCoordinator.installRoutingData(app, routingDataUri)
                     } catch (e: Exception) {
@@ -685,6 +747,54 @@ class AtlasViewModel(
                         toast("Routing data installed for $buckets region(s) — routing is ready.")
                     }
                 }
+                // Nor its search index: unwind the old archive's running
+                // pass (if any) BEFORE wiping the DBs — cancel() alone is
+                // asynchronous, and the still-"active" job would make
+                // ensureSearchIndex return early and leave the new archive
+                // unindexed until the next launch. Then either adopt the
+                // user's prebuilt index (same stage of the import as the
+                // routing ZIP above) or build the cheap pass for the new
+                // archive (tens of seconds, surfaced through the search
+                // state). The order matters: deleteIndexes must not run
+                // AFTER a successful adopt, or it wipes what just landed.
+                searchIndexJob?.cancelAndJoin()
+                SearchCoordinator.deleteIndexes(app)
+                val archive_file = com.danemadsen.atlas.data.ArchiveStore.archiveFile(app)
+                var search_installed = false
+                if (searchDataUri != null) {
+                    _state.value = AtlasUiState.Importing(null, ImportStage.INSTALL_SEARCH)
+                    // A failure is NOT an import failure (same reasoning as
+                    // the routing ZIP): the map works, and the on-device
+                    // build is the designed fallback.
+                    try {
+                        val input = app.contentResolver.openInputStream(searchDataUri)
+                        if (input == null) {
+                            toast(
+                                "Search index was not installed (the file could not be " +
+                                    "opened) — Atlas will build the search index on this device instead.",
+                            )
+                        } else {
+                            try {
+                                val adoption = SearchCoordinator.adoptPrebuiltIndex(app, archive_file, input)
+                                search_installed = true
+                                toast(
+                                    "Search index installed — ${adoption.places} places and " +
+                                        "${adoption.addresses} addresses are searchable.",
+                                )
+                            } finally {
+                                input.close()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        val reason = e.message?.takeIf { it.isNotBlank() }
+                            ?: "an unexpected error"
+                        toast(
+                            "Search index was not installed ($reason) — Atlas will build " +
+                                "the search index on this device instead.",
+                        )
+                    }
+                }
+                if (!search_installed) ensureSearchIndex(archive_file)
                 _state.value = AtlasUiState.MapReady(info)
                 // A new archive must not inherit the previous archive's
                 // dismissed-build tombstone.
@@ -702,16 +812,6 @@ class AtlasViewModel(
                     .remove(KEY_PROFILE)
                     .apply()
                 initial_camera = null
-                // Nor its search index: unwind the old archive's running
-                // pass (if any) BEFORE wiping the DBs — cancel() alone is
-                // asynchronous, and the still-"active" job would make
-                // ensureSearchIndex return early and leave the new archive
-                // unindexed until the next launch. Then wipe the old DBs and
-                // build the cheap pass for the new archive (tens of
-                // seconds, surfaced through the search state).
-                searchIndexJob?.cancelAndJoin()
-                SearchCoordinator.deleteIndexes(app)
-                ensureSearchIndex(info)
                 // The warmup is keyed to nothing archive-specific — but a
                 // fresh import is the natural moment to ensure it has run
                 // for THIS archive's routing data.
@@ -769,8 +869,6 @@ private const val KEY_CAMERA_LAT = "camera.lat"
 private const val KEY_CAMERA_ZOOM = "camera.zoom"
 private const val KEY_CAMERA_BEARING = "camera.bearing"
 private const val SEARCH_DEBOUNCE_MS = 250L
-private const val STAGE_COPY_ARCHIVE = "Copying map archive into app storage…"
-private const val STAGE_INSTALL_ROUTING = "Installing prebuilt routing data…"
 // Mirrors GraphPrepFlow's staleness budget: a running status older than
 // this means the :graph process died mid-build.
 private const val BUILD_STOP_STALE_MS = 90_000L

@@ -1,9 +1,7 @@
 package com.danemadsen.atlas.search
 
-import android.content.Context
-import androidx.room.Room
 import com.danemadsen.atlas.pmtiles.PmtilesReader
-import com.danemadsen.atlas.pmtiles.TileBounds
+import com.danemadsen.atlas.pmtiles.archiveHeaderBytes
 import com.danemadsen.atlas.pmtiles.mvt.MvtGeomType
 import com.danemadsen.atlas.pmtiles.mvt.MvtTile
 import kotlinx.coroutines.CoroutineStart
@@ -28,6 +26,12 @@ import java.security.MessageDigest
  * partial DB with no marker, which the resume check treats as "not indexed
  * yet" (the pass re-runs; inserts are idempotent on the unique keys).
  *
+ * The DB handle comes from [openDatabase], injected by the caller: the app
+ * passes its Android Room builder, CI's JVM CLI passes a
+ * BundledSQLiteDriver-backed builder — both mint/open the SAME schema (Room's
+ * identity hash is target-independent), so a CI-minted index adopts on device
+ * as if the device had built it itself.
+ *
  * The import-time pass runs in two stages: first the `place` layer at zooms
  * [MIN_INDEX_ZOOM]..[MAX_CHEAP_ZOOM] — countries down to neighbourhoods —
  * which is tens of seconds over a continental archive and makes search
@@ -43,8 +47,8 @@ import java.security.MessageDigest
  * archive.
  */
 class SearchIndexer(
-    private val context: Context,
     private val databaseFile: File,
+    private val openDatabase: (File) -> PlaceDatabase,
 ) {
 
     /** Rows a pass offered vs. rows it genuinely added, per table. */
@@ -58,11 +62,7 @@ class SearchIndexer(
     /** A fresh DB handle; the caller owns closing it. */
     fun open(): PlaceDatabase {
         databaseFile.parentFile?.mkdirs()
-        return Room.databaseBuilder(
-            context.applicationContext,
-            PlaceDatabase::class.java,
-            databaseFile.absolutePath,
-        ).build()
+        return openDatabase(databaseFile)
     }
 
     /**
@@ -70,12 +70,12 @@ class SearchIndexer(
      * zooms [MIN_INDEX_ZOOM]..min([MAX_CHEAP_ZOOM], archive maxZoom); stage
      * 2 sweeps the `address` layer at [ADDRESS_INDEX_ZOOM] when the archive
      * carries one (GB/US builds merge no addresses; their sweep would spend
-     * minutes walking z14 tiles to find no `address` layer).
+     * minutes walking z14 tiles to find no `address` layer). The sweep
+     * bounds come from the reader's own header bbox — the same box the
+     * graph build walks — so the pass needs nothing but the archive.
      */
-    suspend fun indexCheapPass(
-        reader: PmtilesReader,
-        bounds: TileBounds,
-    ): PassResult = withContext(Dispatchers.IO) {
+    suspend fun indexCheapPass(reader: PmtilesReader): PassResult = withContext(Dispatchers.IO) {
+        val bounds = reader.header.bounds()
         val db = open()
         try {
             val existing = existingZooms(db)
@@ -270,10 +270,12 @@ class SearchIndexer(
 
         /**
          * Bumped whenever the extraction or schema rules change in a way an
-         * existing index cannot absorb — folded into [archiveFingerprint]
+         * existing index cannot absorb — folded into [contentFingerprint]
          * so every archive re-indexes exactly once per format change. 3:
          * addresses moved to their own table + FTS (split from the place
-         * schema).
+         * schema). The fingerprint SCHEME itself (content hash vs. the old
+         * metadata hash) also re-keys every existing index exactly once,
+         * without a bump.
          */
         const val INDEX_FORMAT = 3
 
@@ -384,29 +386,19 @@ class SearchIndexer(
         }
 
         /**
-         * The archive fingerprint keying the index DB's file name: stable
-         * across launches of the same archive, different for any different
-         * archive (name, size or bbox change) or index format ([INDEX_FORMAT]).
+         * The archive fingerprint keying the index DB's file name: SHA-256
+         * over the archive's raw 127-byte PMTiles header, its file length
+         * and [INDEX_FORMAT]. Content, not metadata — a fingerprint keyed on
+         * the archive's display name would break the CI pairing (a browser
+         * appending " (1)" to a download would mint an unadoptable index),
+         * while these bytes only change when the archive itself does.
          */
-        fun archiveFingerprint(
-            fileName: String,
-            sizeBytes: Long,
-            west: Double,
-            south: Double,
-            east: Double,
-            north: Double,
-            minZoom: Int,
-            maxZoom: Int,
-        ): String {
+        fun contentFingerprint(archiveFile: File): String {
             val digest = MessageDigest.getInstance("SHA-256")
-            val canonical = listOf(
-                fileName, sizeBytes.toString(),
-                west.toString(), south.toString(), east.toString(), north.toString(),
-                minZoom.toString(), maxZoom.toString(),
-                INDEX_FORMAT.toString(),
-            ).joinToString(" ")
-            return digest.digest(canonical.toByteArray(Charsets.UTF_8))
-                .joinToString("") { "%02x".format(it) }
+            digest.update("atlas-search-index/$INDEX_FORMAT/".toByteArray(Charsets.UTF_8))
+            digest.update(archiveHeaderBytes(archiveFile))
+            digest.update(archiveFile.length().toString().toByteArray(Charsets.UTF_8))
+            return digest.digest().joinToString("") { "%02x".format(it) }
         }
 
         fun databaseFile(searchDir: File, fingerprint: String): File =

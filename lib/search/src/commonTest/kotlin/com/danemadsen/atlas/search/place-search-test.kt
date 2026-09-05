@@ -1,5 +1,6 @@
 package com.danemadsen.atlas.search
 
+import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -71,31 +72,59 @@ class PlaceSearchTest {
     }
 
     @Test
-    fun `fingerprint differs when any identifying field differs`() {
-        val base = SearchIndexer.archiveFingerprint(
-            "australia.pmtiles", 1317773274L,
-            68.1, -57.1, 169.0, -8.8, 0, 14,
-        )
-        assertEquals(base, SearchIndexer.archiveFingerprint(
-            "australia.pmtiles", 1317773274L,
-            68.1, -57.1, 169.0, -8.8, 0, 14,
-        ))
+    fun `fingerprint differs when any identifying byte differs`() {
+        val root = createTempDirectory("atlas-fp-").toFile()
+        // Two archives with the SAME header layout but different bodies
+        // (different directory offsets, different sizes) must never share a
+        // fingerprint: the hash covers the raw 127 header bytes plus the
+        // file length, so any difference in either shows up.
+        fun archive(vararg tail: Int): java.io.File {
+            val header = ByteArray(127)
+            header[7] = 3
+            // 65536 root directory offset/length pair — any well-formed
+            // pair works, the point is only that both files are parseable
+            // archives of equal or unequal size.
+            header[16] = 1
+            val file = java.io.File(root, "a-${tail.size}.pmtiles")
+            file.writeBytes(header + tail.map { it.toByte() }.toByteArray())
+            return file
+        }
+        val base = SearchIndexer.contentFingerprint(archive())
+        assertEquals(base, SearchIndexer.contentFingerprint(archive()))
         assertTrue(
-            base != SearchIndexer.archiveFingerprint(
-                "australia.pmtiles", 1317773275L,
-                68.1, -57.1, 169.0, -8.8, 0, 14,
-            ),
+            base != SearchIndexer.contentFingerprint(archive(1)),
             "a one-byte archive difference must change the fingerprint",
         )
         assertEquals(64, base.length, "sha-256 hex fingerprint length")
+        root.deleteRecursively()
+    }
+
+    @Test
+    fun `fingerprint ignores the file name`() {
+        // The CI pairing pins the ARCHIVE, not the SAF display name it was
+        // picked under — a browser appending " (1)" to a re-download must
+        // not orphan the index. Same bytes under two names: one fingerprint.
+        val root = createTempDirectory("atlas-fp-").toFile()
+        val header = ByteArray(127)
+        header[7] = 3
+        val first = java.io.File(root, "atlas-australia.pmtiles")
+        first.writeBytes(header)
+        val second = java.io.File(root, "atlas-australia (1).pmtiles")
+        first.copyTo(second, overwrite = true)
+        assertEquals(
+            SearchIndexer.contentFingerprint(first),
+            SearchIndexer.contentFingerprint(second),
+            "the display name must not leak into the content fingerprint",
+        )
+        root.deleteRecursively()
     }
 
     @Test
     fun `fingerprint embeds the index format`() {
-        // INDEX_FORMAT is folded into the fingerprint's canonical string:
-        // bumping it rebuilds every index exactly once (new DB file name,
-        // new completion marker). The exact value is asserted on purpose —
-        // a bump must be a conscious change that fails this line, not a
+        // INDEX_FORMAT is folded into the fingerprint's prefix: bumping it
+        // rebuilds every index exactly once (new DB file name, new
+        // completion marker). The exact value is asserted on purpose — a
+        // bump must be a conscious change that fails this line, not a
         // silent edit that strands old DBs as unexplained stale disk.
         assertEquals(3, SearchIndexer.INDEX_FORMAT, "index format — 3: address table split")
     }

@@ -42,4 +42,8 @@ interface AddressDao {
      */
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertAll(addresses: List<AddressEntity>)
+
+    /** The minted artifact's row-count proof (see [SearchIndexCli]). */
+    @Query("SELECT COUNT(*) FROM address")
+    suspend fun count(): Int
 }

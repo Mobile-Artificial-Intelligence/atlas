@@ -134,7 +134,9 @@ fun MapScreen() {
         }
         ImportArchiveFlow(
             state = state,
-            onImport = { archive, routing_data -> view_model.importArchive(archive, routing_data) },
+            onImport = { archive, routing_data, search_data ->
+                view_model.importArchive(archive, routing_data, search_data)
+            },
             onRetry = view_model::dismissError,
         )
         val settings_open by view_model.settingsOpen.collectAsStateWithLifecycle()
@@ -191,6 +193,7 @@ fun MapScreen() {
                             onDismiss = view_model::closeSettings,
                             onReplaceArchive = { uri -> view_model.importArchive(uri) },
                             onInstallRoutingData = view_model::installRoutingData,
+                            onInstallSearchData = view_model::installSearchData,
                             onPrepareAllRoutingData = view_model::prepareAllRoutingData,
                             onRebuildRoutingData = view_model::rebuildRoutingData,
                             onRebuildSearchIndex = view_model::rebuildSearchIndex,
