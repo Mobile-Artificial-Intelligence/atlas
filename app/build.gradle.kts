@@ -171,10 +171,12 @@ tasks.withType<Test>().configureEach {
 // Dev/CI bucket build harness (see graph-build-cli.kt): runs the SAME
 // pipeline the device's :graph service runs, under a heap the caller
 // controls — the default matches a typical Android largeHeap cap, so a green
-// run proves the on-device build fits. `-Pbucket=all` + `-Pzip=<file>`
-// builds every bucket in the archive's bbox and mints the prebuilt routing
-// ZIP the CI's `routing` job uploads (the app installs it via
-// adoptPrebuiltSegments and routing needs no on-device build).
+// run proves the on-device build fits. `-Pbucket=all` walks the archive's
+// bbox and writes manifest.json into the out dir, so the dir itself is
+// what CI uploads as the prebuilt routing artifact (upload-artifact zips
+// it; the app installs the artifact via adoptPrebuiltSegments and routing
+// needs no on-device build). `-Pzip=<file>` additionally mints the same
+// layout as a local ZIP.
 //
 //   ./gradlew :app:graphBuildCli \
 //     -Parchive=$HOME/atlas-prototype/tmp/australia.pmtiles \

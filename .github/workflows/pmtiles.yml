@@ -23,16 +23,17 @@ name: PMTiles
 #
 # After the archive, each leg replays the app's own graph build over the
 # file it just produced — every 5° bucket the bbox touches, via the same
-# graphBuildCli Gradle task that proves the device heap — and uploads
-# `atlas-routing-<country>.zip` alongside the map archive. Installing that
-# ZIP in the app (Settings → Install routing data, which runs
-# adoptPrebuiltSegments) gives instant routing: no ~50-minute on-device
-# build. The ZIP's manifest pins the archive fingerprint, so a ZIP only
-# adopts against the archive from the same run — the two artifacts are a
-# pair. This runs INSIDE the country's leg, right after the archive
-# upload: routing for a country must not wait out the slowest sibling's
-# archive build, and the archive is already on disk — no artifact
-# re-download.
+# graphBuildCli Gradle task that proves the device heap — and uploads the
+# segments dir as the `atlas-routing-<country>` artifact alongside the map
+# archive (upload-artifact zips the dir, so the artifact zip carries the
+# .rd5s at its root — Installing that zip in the app, Settings → Install
+# routing data, which runs adoptPrebuiltSegments, gives instant routing:
+# no ~50-minute on-device build). The manifest pins the archive
+# fingerprint, so routing data only adopts against the archive from the
+# same run — the two artifacts are a pair. This runs INSIDE the country's
+# leg, right after the archive upload: routing for a country must not
+# wait out the slowest sibling's archive build, and the archive is
+# already on disk — no artifact re-download.
 #
 # The final `summarize` job indexes every artifact the run produced into
 # the run's Summary tab (name, size, download link).
@@ -48,8 +49,8 @@ name: PMTiles
 #     wall-clock does not)
 on:
   schedule:
-    # Daily at 19:23 UTC = 05:23 Brisbane (off the :00/:30 marks).
-    - cron: '23 19 * * *'
+    # Daily at midnight UTC, when Geofabrik's daily updates are ready. The cron is
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 # Every run is a full-matrix run (hours long, all countries), so runs
@@ -297,6 +298,13 @@ jobs:
       # local CLI run or a self-hosted runner — only pays for the buckets it
       # never reached. A hosted retry starts with an empty workspace and
       # rebuilds from scratch.
+      #
+      # No -Pzip: the out dir IS the artifact. The all-mode leaves
+      # manifest.json in it, and upload-artifact zips the dir — the
+      # artifact zip then carries the .rd5s at its root, exactly what the
+      # app's Install routing data picker expects. A minted ZIP would just
+      # nest a zip inside the artifact zip, one level out of the app's
+      # reach.
       - name: Build routing buckets
         env:
           COUNTRY: ${{ matrix.country }}
@@ -305,17 +313,22 @@ jobs:
             -Parchive="$GITHUB_WORKSPACE/out/atlas-$COUNTRY.pmtiles" \
             -Pbucket=all \
             -Pout="$GITHUB_WORKSPACE/out/segments" \
-            -Pzip="$GITHUB_WORKSPACE/out/atlas-$COUNTRY-routing.zip" \
             -Pheap=4g
+          # Resume markers, not artifact content: the manifest already
+          # carries the empty list, and the provenance marker is meaningless
+          # outside this workspace (a retry starts from an empty one).
+          rm -f "$GITHUB_WORKSPACE/out/segments"/*.empty \
+                "$GITHUB_WORKSPACE/out/segments/build-fingerprint.txt"
 
-      - name: Show routing ZIP
+      - name: Show routing segments
         env:
           COUNTRY: ${{ matrix.country }}
         run: |
-          # End-to-end proof the ZIP is adoptable: the manifest names this
+          # End-to-end proof the dir is adoptable: the manifest names this
           # very archive and its bucket list parses.
-          unzip -p "out/atlas-$COUNTRY-routing.zip" manifest.json
-          unzip -l "out/atlas-$COUNTRY-routing.zip" | tail -3
+          cat "out/segments/manifest.json"
+          echo '---'
+          ls "out/segments" | tail -3
 
       - name: Upload routing artifact
         uses: actions/upload-artifact@v4
@@ -324,7 +337,10 @@ jobs:
           # The .rd5 segments are dense binary; storing beats re-deflating.
           compression-level: 0
           retention-days: 7
-          path: out/atlas-${{ matrix.country }}-routing.zip
+          # The dir, not a zip: upload-artifact zips these into the
+          # artifact, root-level, which is the layout adoptPrebuiltSegments
+          # parses.
+          path: out/segments/*
           if-no-files-found: error
 
   # The artifact sidebar is buried on the run page; put every artifact the

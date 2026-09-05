@@ -14,10 +14,12 @@ import java.util.zip.ZipOutputStream
  *    heap-proof harness this file has always been;
  *  - ALL buckets (`<lon,lat>` = "all"): enumerates every 5° bucket the
  *    archive's bbox touches and builds each one — this is the CI path that
- *    mints a country's prebuilt routing ZIP (the app's
+ *    mints a country's prebuilt routing data (the app's
  *    `adoptPrebuiltSegments` installs it and routing works immediately,
- *    no on-device build). With a 4th arg, everything lands in a ZIP next
- *    to the segment files.
+ *    no on-device build). The all-mode ends by writing `manifest.json`
+ *    INTO the out dir, so the dir itself is what CI uploads: upload-artifact
+ *    zips it, and the artifact zip is directly adoptable. A 4th arg
+ *    additionally mints the same layout as a local ZIP.
  *
  * Run via `./gradlew :app:graphBuildCli -Parchive=<pmtiles>
  * -Pbucket=<lon,lat>|all -Pout=<dir> [-Pzip=<file>] [-Pheap=576m]`; the
@@ -73,6 +75,13 @@ object GraphBuildCli {
 
         if (bucket_spec == "all") {
             buildAllBuckets(archive, out_dir, work_dir, profile_dir)
+            // The all-mode walked the WHOLE bbox, so its empty list is
+            // complete: leave the dir itself adoptable (CI uploads the dir
+            // as the routing artifact — upload-artifact zips it, and a
+            // minted ZIP would only nest a zip inside that zip, which the
+            // app's picker can't read). -Pzip still mints one for local use.
+            writeRoutingManifest(out_dir, fingerprint)
+            println("SEGMENTS RESULT: ${out_dir.path} (${out_dir.listFiles()!!.size} files)")
         } else {
             val (lon_min, lat_min) = bucket_spec.split(",").map { it.trim().toInt() }
             buildOneBucket(archive, lon_min, lat_min, out_dir, work_dir, profile_dir)
@@ -217,6 +226,26 @@ object GraphBuildCli {
     }
 
     /**
+     * The manifest `adoptPrebuiltSegments` gates on, written next to the
+     * segments: an all-mode out dir IS the adoptable artifact (the empty
+     * list is complete — the all-mode walked the whole bbox). The empty
+     * list comes from the `.empty` markers, exactly as [writeRoutingZip]
+     * renders it. internal: exercised directly by the dir-manifest test.
+     */
+    internal fun writeRoutingManifest(outDir: File, fingerprint: String) {
+        File(outDir, MANIFEST_FILE).writeText(
+            renderRoutingManifest(fingerprint, emptyBucketsIn(outDir)),
+        )
+    }
+
+    private fun emptyBucketsIn(outDir: File): List<String> =
+        outDir.listFiles()
+            ?.filter { it.isFile && it.name.endsWith(EMPTY_SUFFIX) }
+            ?.map { it.name.removeSuffix(EMPTY_SUFFIX) }
+            ?.sorted()
+            ?: emptyList()
+
+    /**
      * The routing ZIP `adoptPrebuiltSegments` installs: every `.rd5` in
      * [outDir] at the root, the `lookups.dat` the segments were built
      * against, and the manifest (archive fingerprint + the buckets that
@@ -231,12 +260,7 @@ object GraphBuildCli {
             ?: error("no segments in $outDir")
         val lookups = File(outDir, LOOKUPS_FILE)
         check(lookups.isFile) { "no $LOOKUPS_FILE in $outDir — the ZIP must carry it" }
-        val empties = outDir.listFiles()
-            ?.filter { it.isFile && it.name.endsWith(EMPTY_SUFFIX) }
-            ?.map { it.name.removeSuffix(EMPTY_SUFFIX) }
-            ?.sorted()
-            ?: emptyList()
-        val manifest_text = renderRoutingManifest(fingerprint, empties)
+        val manifest_text = renderRoutingManifest(fingerprint, emptyBucketsIn(outDir))
         ZipOutputStream(zipFile.outputStream().buffered()).use { zip ->
             for (rd5 in rd5s) {
                 zip.putNextEntry(java.util.zip.ZipEntry(rd5.name))

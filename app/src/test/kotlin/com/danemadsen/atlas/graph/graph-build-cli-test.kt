@@ -65,6 +65,32 @@ class GraphBuildCliTest {
     }
 
     /**
+     * The all-mode contract: [GraphBuildCli.writeRoutingManifest] drops the
+     * manifest NEXT TO the segments, because CI uploads the out dir as the
+     * routing artifact (upload-artifact zips it). The manifest must read
+     * back exactly as the adoption gate expects — same fingerprint, empty
+     * list from the .empty markers and nothing else.
+     */
+    @Test
+    fun dirManifestMakesTheOutDirAdoptable() {
+        val root = createTempDirectory("atlas-cli-dir-").toFile()
+        val segments = File(root, "segments").apply { mkdirs() }
+        File(segments, "E010_S20.rd5").writeBytes(ByteArray(16))
+        File(segments, "E005_S45.empty").writeText("")
+        File(segments, "E150_S30.empty").writeText("")
+        File(segments, "lookups.dat").writeBytes(ByteArray(8))
+
+        GraphBuildCli.writeRoutingManifest(segments, "ab".repeat(32))
+
+        val manifest = File(segments, "manifest.json").readText()
+        val (fingerprint, empty) = parseRoutingManifest(manifest)
+        assertEquals("ab".repeat(32), fingerprint)
+        assertEquals(listOf("E005_S45", "E150_S30"), empty)
+
+        root.deleteRecursively()
+    }
+
+    /**
      * Render -> parse must round-trip both fields, and the malformed
      * manifests the adoption gate must refuse (no fingerprint, short hex,
      * no empty array) fail with the gate's own messages.
