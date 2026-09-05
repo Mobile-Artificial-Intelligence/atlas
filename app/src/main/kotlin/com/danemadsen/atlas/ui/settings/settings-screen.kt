@@ -1,6 +1,9 @@
 package com.danemadsen.atlas.ui.settings
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings as AndroidSettings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.danemadsen.atlas.data.ArchiveInfo
 
 /**
@@ -47,6 +51,8 @@ fun SettingsScreen(
     archive: ArchiveInfo,
     ttsMuted: Boolean,
     onToggleTtsMute: () -> Unit,
+    overlayEnabled: Boolean,
+    onToggleOverlay: (Boolean) -> Unit,
     onDismiss: () -> Unit,
     onReplaceArchive: (uri: android.net.Uri) -> Unit,
     onInstallRoutingData: (uri: android.net.Uri) -> Unit,
@@ -79,6 +85,50 @@ fun SettingsScreen(
     val search_launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) onInstallSearchData(uri) }
+
+    // The overlay appop has no runtime dialog: enabling without the grant
+    // opens the system screen scoped to Atlas, and returning auto-applies
+    // a pending enable (see the LifecycleResumeEffect below). When the
+    // appop is revoked mid-flight the pref deliberately stays ON — the
+    // service-side canDrawOverlays guard keeps the window honest, and
+    // re-granting restores behavior with no extra taps.
+    val context = LocalContext.current
+    var overlay_granted by remember { mutableStateOf(AndroidSettings.canDrawOverlays(context)) }
+    var pending_overlay_enable by remember { mutableStateOf(false) }
+    val overlay_permission_launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { overlay_granted = AndroidSettings.canDrawOverlays(context) }
+
+    LifecycleResumeEffect(Unit) {
+        val granted = AndroidSettings.canDrawOverlays(context)
+        overlay_granted = granted
+        // The user granted the appop while we were in the system screen:
+        // complete the pending enable on their return.
+        if (granted && pending_overlay_enable) {
+            pending_overlay_enable = false
+            onToggleOverlay(true)
+        }
+        onPauseOrDispose { }
+    }
+
+    /** Settings' overlay switch: three cases — direct, grant-first, off. */
+    fun onOverlaySwitch(want: Boolean) {
+        when {
+            want && AndroidSettings.canDrawOverlays(context) -> onToggleOverlay(true)
+            want -> {
+                // Enabling without the appop: go get it. The switch stays
+                // visually OFF (the pref is untouched) until the grant lands.
+                pending_overlay_enable = true
+                overlay_permission_launcher.launch(
+                    Intent(
+                        AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}"),
+                    ),
+                )
+            }
+            else -> onToggleOverlay(false)
+        }
+    }
 
     Surface(
         // pointerInput with an empty body is deliberate: Compose hit-testing
@@ -221,7 +271,29 @@ fun SettingsScreen(
                     }
 
                     HorizontalDivider(Modifier.padding(vertical = 12.dp))
-                    SettingsSectionLabel("About")
+                    SettingsSectionLabel("Floating banner")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Show next turn over other apps", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                if (overlay_granted) {
+                                    "A small turn banner floats above other apps while navigating."
+                                } else {
+                                    "Needs the “Display over other apps” permission."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(checked = overlayEnabled, onCheckedChange = ::onOverlaySwitch)
+                    }
+
+                    HorizontalDivider(Modifier.padding(vertical = 12.dp))
                     var attribution_open by remember { mutableStateOf(false) }
                     val version = appVersion(LocalContext.current)
                     Text(

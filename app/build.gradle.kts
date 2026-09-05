@@ -106,6 +106,10 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.savedstate)
 
     implementation(libs.maplibre.android)
+    // Car-app library: Android Auto projection of the live session. AAR
+    // verified to declare zero permissions; NoNetworkPermissionCheck keeps
+    // the offline guarantee structural if a future bump changes that.
+    implementation(libs.androidx.car.app)
 
     implementation(project(":lib:pmtiles"))
     implementation(project(":lib:map-style"))
@@ -125,6 +129,9 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(kotlin("test"))
+    // Session-level car tests later if wanted; plain-JVM model tests below
+    // need only the main artifact.
+    testImplementation(libs.androidx.car.app.testing)
     testImplementation(libs.coroutines.core)
     testImplementation(libs.coroutines.test)
     androidTestImplementation(libs.androidx.test.junit)

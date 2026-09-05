@@ -3,12 +3,14 @@ package com.danemadsen.atlas.services
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.danemadsen.atlas.location.LocationTracker
@@ -17,13 +19,11 @@ import com.danemadsen.atlas.nav.NavigationProgress
 import com.danemadsen.atlas.nav.SoundPlayer
 import com.danemadsen.atlas.nav.TtsSpeaker
 import com.danemadsen.atlas.nav.metersBetween
-import com.danemadsen.atlas.nav.turnInstruction
+import com.danemadsen.atlas.nav.navigationStatusText
+import com.danemadsen.atlas.nav.routeProgressFraction
 import com.danemadsen.atlas.routing.GeoPoint
 import com.danemadsen.atlas.routing.RouteResult
 import com.danemadsen.atlas.routing.RouterGateway
-import com.danemadsen.atlas.routing.TurnCommand
-import com.danemadsen.atlas.routing.formatDistance
-import com.danemadsen.atlas.routing.formatDuration
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
@@ -52,7 +52,8 @@ import kotlinx.coroutines.launch
  * every publish it makes is session-token-checked, so the states can
  * never interleave wrongly even across threads.
  *
- * It ends itself on arrival or when the coordinator's Stop lands; a
+ * It ends itself on arrival or when the coordinator's Stop lands;
+ * START_NOT_STICKY plus the in-process pendingRoute handoff means a
  * restart after process death finds no pending route and stops honestly
  * (a dead process cannot have kept driving).
  */
@@ -63,6 +64,16 @@ class NavigationService : Service() {
     private var rerouteJob: Job? = null
     private var tts: TtsSpeaker? = null
     private var sounds: SoundPlayer? = null
+
+    /** The floating turn banner's controller; null until first needed. */
+    private var overlay: NavOverlayController? = null
+
+    /**
+     * The session's partial wake lock — acquired per-session in [run]
+     * (never on the stale/no-GPS paths), re-armed by [gpsWatchdog] each
+     * tick, released in [endSession]/[onDestroy].
+     */
+    private lateinit var wakeLock: PowerManager.WakeLock
 
     /**
      * The session this service instance is driving — matched against the
@@ -106,6 +117,20 @@ class NavigationService : Service() {
 
     @Volatile private var progressEngine: NavigationProgress? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        // Non-refcounted: acquire/release sites are unpaired by design
+        // (watchdog re-arms), so counting would only hide a leak.
+        wakeLock = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+            .apply { setReferenceCounted(false) }
+        // Channel creation hoisted out of the builder: it used to recreate
+        // the channel on every 5 s notify — a wasteful no-op at fix rate
+        // for a whole session.
+        createChannel()
+        createDoneChannel()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
@@ -127,12 +152,54 @@ class NavigationService : Service() {
                 }
                 sessionOver = false
                 runSession = session
-                startForegroundWith(buildNotification(route))
+                // A previous session's transient ended-notification must
+                // not survive the new session taking the shade over.
+                getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_DONE_ID)
+                // The coordinator seeded the session's mute from the saved
+                // preference; the first notification must honor it.
+                val nav_state = NavigationCoordinator.navState.value as? NavigationCoordinator.NavState.Navigating
+                startForegroundWith(
+                    renderNotification(
+                        route = route,
+                        snapshot = null,
+                        arrived = false,
+                        muted = nav_state?.muted ?: false,
+                        recalculating = false,
+                    ),
+                )
+                // The banner rides the session start: show it only when
+                // the pref (handed through start()) asked for it, and only
+                // if the appop is still granted.
+                if (NavigationCoordinator.overlayRequested.value) {
+                    overlay = overlay ?: NavOverlayController(this)
+                    overlay?.show()
+                }
                 if (runJob?.isActive != true) run(route, session)
+            }
+            ACTION_TOGGLE_MUTE -> {
+                // Only meaningful mid-session: the shade action only exists
+                // while the ongoing notification does, toggleMute no-ops on
+                // non-Navigating, and re-posting the ongoing notification
+                // with no foreground state behind it would be a lie.
+                if (runJob?.isActive == true) {
+                    // One mute path for every surface (panel, shade action,
+                    // car): the coordinator flips the live session and
+                    // persists the preference.
+                    NavigationCoordinator.toggleMute(this)
+                    // Flip the action's own label immediately — the next 5 s
+                    // tick would otherwise leave the old verb in the shade.
+                    currentRoute?.let { updateNotification(it, snapshot = null, arrived = false) }
+                }
             }
             ACTION_STOP -> {
                 val session = intent.getLongExtra(NavigationCoordinator.EXTRA_SESSION, 0L)
-                if (session == 0L || session == runSession) {
+                if (session == 0L && runJob?.isActive != true && NavigationCoordinator.hasArmedStart()) {
+                    // A leftover session-0 stop (the shade action after the
+                    // session already ended itself) racing a newer start:
+                    // the START intent is next in the queue and must find
+                    // the process alive with its armed state intact —
+                    // endSession() would publish Ended over it.
+                } else if (session == 0L || session == runSession) {
                     // 0 = the session already ended itself (arrival or
                     // re-route failure retired the token) or stopping
                     // from Idle: stop whatever is left.
@@ -146,17 +213,29 @@ class NavigationService : Service() {
                 }
             }
         }
+        // START_NOT_STICKY is a decision, not a default. After a process
+        // death the system does NOT redeliver the START intent, and even
+        // if it restarted the service, NavigationCoordinator.pendingRoute
+        // lived in the dead heap — takePendingRoute() returns null and the
+        // stopSelfResult above runs. The honest state is "nothing driving":
+        // AtlasViewModel.init re-routes from the persisted destination and
+        // re-offers the trip as a PREVIEW (never a resumed navigation), so
+        // no intent redelivery can resurrect a session the process already
+        // lost. Sticky restart would only manufacture a zombie service with
+        // no route to announce.
         return START_NOT_STICKY
     }
 
     private fun endSession() {
         sessionOver = true
+        if (wakeLock.isHeld) wakeLock.release()
         runJob?.cancel()
         runJob = null
         rerouteJob?.cancel()
         rerouteJob = null
         NavigationCoordinator.publishEnded(runSession)
         runSession = 0L
+        overlay?.hide()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -186,10 +265,32 @@ class NavigationService : Service() {
                     )
                     return@launch
                 }
+                // The screen is usually off in a pocket or mount — the
+                // exact posture this app exists for. Doze and OEM managers
+                // can duty-cycle GPS_PROVIDER callbacks even behind a
+                // location FGS; the progress engine, off-route detection
+                // and the watchdog all assume ~1 Hz fixes, and their
+                // failure mode is silent. Cost is bounded to the session
+                // (see endSession/onDestroy).
+                wakeLock.acquire(NAV_WAKE_LOCK_SLICE_MS)
                 // A GPS-fix watchdog: the fix loop is the only thing that
                 // knows the stream went quiet, and the user needs to hear
                 // it more than see it.
                 launch { gpsWatchdog(cues) }
+                // Mid-navigation toggle: the Settings switch (or a later
+                // coordinator write) drives the banner live, exactly like
+                // the mute. Construct lazily too — a session started with
+                // the pref off must still be able to enable mid-trip. The
+                // controller's attach() re-guards the appop every time, so
+                // a revoked permission just degrades to "no overlay".
+                // show/hide are idempotent.
+                launch {
+                    NavigationCoordinator.overlayRequested.collect { enabled ->
+                        val controller = overlay ?: NavOverlayController(this@NavigationService)
+                            .also { overlay = it }
+                        if (enabled) controller.show() else controller.hide()
+                    }
+                }
                 var last_notification_at = 0L
                 // conflate: while a fix is being processed the stream can
                 // produce more; only the newest matters (it is the
@@ -216,7 +317,10 @@ class NavigationService : Service() {
                     if (step.events.arrived) {
                         sessionOver = true
                         NavigationCoordinator.publishArrived(session, current)
-                        updateNotification(current, arrived = true)
+                        // The ongoing notification dies with the service;
+                        // this transient one is what the shade still shows
+                        // afterwards.
+                        notifyNavEnded("Arrived at your destination")
                         stopSelf()
                         return@collect
                     }
@@ -234,6 +338,11 @@ class NavigationService : Service() {
                         ttsAvailable = speaker.available,
                         recalculating = recalculating,
                     )
+                    // The banner renders exactly what was published —
+                    // reading the coordinator back keeps the overlay, the
+                    // notification, and the banner one-render-stale
+                    // consistently.
+                    overlay?.update(NavigationCoordinator.navState.value)
 
                     if (step.events.recalculate && !recalculating && mayReroute(fix.point)) {
                         startReroute(session, fix.point, speaker, cues)
@@ -242,7 +351,10 @@ class NavigationService : Service() {
                     val now = System.currentTimeMillis()
                     if (now - last_notification_at > NOTIFICATION_UPDATE_MS) {
                         last_notification_at = now
-                        updateNotification(current, arrived = false)
+                        // The explicit step.snapshot, not the coordinator's
+                        // published copy — the publish may be one fix stale
+                        // and the shade should match the banner exactly.
+                        updateNotification(current, step.snapshot, arrived = false)
                     }
                 }
             } finally {
@@ -319,6 +431,9 @@ class NavigationService : Service() {
             currentRoute = rerouted
             progressEngine = NavigationProgress(rerouted)
             recalculating = false
+            // Refresh the shade right away: it was showing "Recalculating
+            // route…" and the next fix could be seconds away.
+            updateNotification(rerouted, snapshot = null, arrived = false)
         }
     }
 
@@ -326,6 +441,9 @@ class NavigationService : Service() {
     private fun failSession(session: Long, message: String, route: RouteResult?) {
         sessionOver = true
         NavigationCoordinator.publishRerouteFailed(session, message, route)
+        // The ongoing notification dies with the service; leave the reason
+        // behind in the shade on the transient channel instead.
+        notifyNavEnded("Navigation ended", message)
         stopSelf()
     }
 
@@ -337,6 +455,13 @@ class NavigationService : Service() {
     private suspend fun gpsWatchdog(cues: SoundPlayer) {
         while (true) {
             delay(GPS_SIGNAL_POLL_MS)
+            // Re-arm the wake lock each tick: re-acquiring while held
+            // re-arms the system timeout (the GraphBuildService heartbeat
+            // trick), and this loop runs whether or not fixes are arriving
+            // — so a signal outage (tunnel) can never let the slice expire
+            // and hand the fix recovery to doze, where it might never wake
+            // up to re-arm itself. Non-refcounted, so this is safe.
+            wakeLock.acquire(NAV_WAKE_LOCK_SLICE_MS)
             val last = latest_fix_ms.get()
             if (last == 0L) continue // no first fix yet — the banner says so
             if (!signalLost && System.currentTimeMillis() - last > GPS_SIGNAL_LOST_MS) {
@@ -356,54 +481,117 @@ class NavigationService : Service() {
         }
     }
 
-    private fun notificationText(route: RouteResult, arrived: Boolean): String {
-        val nav_state = NavigationCoordinator.navState.value
-        val snapshot = (nav_state as? NavigationCoordinator.NavState.Navigating)?.snapshot
-        return if (arrived || snapshot == null) {
-            "Navigating to your destination"
-        } else {
-            val remaining = formatDistance(snapshot.remainingMeters.roundToInt())
-            val eta = formatDuration(snapshot.remainingSeconds)
-            val turn = snapshot.nextTurn
-            val turn_text = when {
-                turn == null -> ""
-                turn.command == TurnCommand.ARRIVE -> " — arrive"
-                else -> " — " + turnInstruction(turn.command, turn.streetName)
-            }
-            "$remaining • $eta$turn_text"
-        }
-    }
-
-    private fun updateNotification(route: RouteResult, arrived: Boolean) {
+    private fun updateNotification(route: RouteResult, snapshot: NavigationProgress.Snapshot?, arrived: Boolean) {
+        val nav_state = NavigationCoordinator.navState.value as? NavigationCoordinator.NavState.Navigating
         getSystemService(NotificationManager::class.java).notify(
             NOTIFICATION_ID,
-            notificationBuilder().setContentText(notificationText(route, arrived)).build(),
+            renderNotification(
+                route = route,
+                snapshot = snapshot ?: nav_state?.snapshot,
+                arrived = arrived,
+                muted = nav_state?.muted ?: false,
+                recalculating = recalculating,
+            ),
         )
     }
 
-    private fun buildNotification(route: RouteResult): Notification =
-        notificationBuilder()
-            .setContentText("Navigating to your destination")
-            .build()
-
-    private fun notificationBuilder(): NotificationCompat.Builder {
-        val manager = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26) {
-            manager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW),
-            )
-        }
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    /**
+     * The one renderer for the ongoing notification — build and every 5 s
+     * update go through it, so the shade can never drift from the banner:
+     * status line from [navigationStatusText], progress bar from
+     * [routeProgressFraction] (indeterminate until the first fix), and the
+     * Mute/Stop actions whose labels mirror the live state.
+     */
+    private fun renderNotification(
+        route: RouteResult,
+        snapshot: NavigationProgress.Snapshot?,
+        arrived: Boolean,
+        muted: Boolean,
+        recalculating: Boolean,
+    ): Notification {
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentTitle("Atlas navigation")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setContentText(navigationStatusText(snapshot, arrived, recalculating))
+        contentIntent()?.let { builder.setContentIntent(it) }
+        val fraction = routeProgressFraction(route, snapshot)
+        if (fraction != null) {
+            builder.setProgress(100, (fraction * 100).roundToInt().coerceIn(0, 100), false)
+        } else {
+            builder.setProgress(0, 0, true)
+        }
+        builder.addAction(0, if (muted) "Unmute" else "Mute", serviceAction(ACTION_TOGGLE_MUTE, REQ_MUTE))
+        builder.addAction(0, "Stop", serviceAction(ACTION_STOP, REQ_STOP))
+        return builder.build()
+    }
+
+    /**
+     * PendingIntent.getService caches per filterEquals — which IGNORES
+     * extras — so a minted action PendingIntent is reused for every later
+     * intent that matches its action. Every action therefore carries
+     * session 0L, ALWAYS: minting with the live session's token would
+     * freeze that token into the cache, and every tap for the rest of the
+     * app's life would carry a stale session the service must drop.
+     */
+    private fun serviceAction(action: String, request_code: Int): PendingIntent =
+        PendingIntent.getService(
+            this,
+            request_code,
+            Intent(this, NavigationService::class.java)
+                .setAction(action)
+                .putExtra(NavigationCoordinator.EXTRA_SESSION, 0L),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+
+    private fun contentIntent(): PendingIntent? {
+        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return null
+        return PendingIntent.getActivity(this, REQ_CONTENT, launch, PendingIntent.FLAG_IMMUTABLE)
+    }
+
+    /**
+     * The transient "navigation ended" notification — arrival or a
+     * re-route failure posts the reason here before stopping, because the
+     * ongoing notification is removed with the foreground state.
+     */
+    private fun notifyNavEnded(title: String, message: String? = null) {
+        val builder = NotificationCompat.Builder(this, DONE_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentTitle(title)
+            .setAutoCancel(true)
+        message?.let { builder.setContentText(it) }
+        contentIntent()?.let { builder.setContentIntent(it) }
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_DONE_ID, builder.build())
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW),
+            )
+        }
+    }
+
+    private fun createDoneChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(DONE_CHANNEL_ID, DONE_CHANNEL_NAME, NotificationManager.IMPORTANCE_DEFAULT),
+            )
+        }
     }
 
     override fun onDestroy() {
         tts?.shutdown()
         sounds?.release()
         scope.cancel()
+        if (wakeLock.isHeld) wakeLock.release()
+        overlay?.destroy()
+        // Belt and braces: the foreground notification normally goes with
+        // the service, but any out-of-order destroy path must never leave
+        // the ongoing one behind. The transient ended notification
+        // (NOTIFICATION_DONE_ID) is deliberately NOT cancelled here.
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         super.onDestroy()
     }
 
@@ -412,10 +600,21 @@ class NavigationService : Service() {
     companion object {
         const val ACTION_START = "com.danemadsen.atlas.nav.START"
         const val ACTION_STOP = "com.danemadsen.atlas.nav.STOP"
+        const val ACTION_TOGGLE_MUTE = "com.danemadsen.atlas.nav.TOGGLE_MUTE"
 
         private const val CHANNEL_ID = "navigation"
         private const val CHANNEL_NAME = "Navigation"
+        private const val DONE_CHANNEL_ID = "navigation_events"
+        private const val DONE_CHANNEL_NAME = "Navigation events"
         private const val NOTIFICATION_ID = 3
+
+        /** The transient arrival/failure notification's ID — see [notifyNavEnded]. */
+        private const val NOTIFICATION_DONE_ID = 5
+
+        private const val REQ_CONTENT = 1
+        private const val REQ_MUTE = 2
+        private const val REQ_STOP = 3
+
         private const val NOTIFICATION_UPDATE_MS = 5_000L
 
         /** No fix for this long → GPS_DISCONNECTED. */
@@ -432,5 +631,15 @@ class NavigationService : Service() {
 
         /** And at least this much time since the last re-route started. */
         private const val REROUTE_COOLDOWN_MS = 10_000L
+
+        /** The session wake lock's tag — matched in `adb shell dumpsys power`. */
+        private const val WAKE_LOCK_TAG = "atlas:navigation"
+
+        /**
+         * The slice is re-armed by gpsWatchdog every GPS_SIGNAL_POLL_MS, so
+         * a session longer than the slice never sees it expire — the slice
+         * only bounds the lock if the service dies mid-session.
+         */
+        private const val NAV_WAKE_LOCK_SLICE_MS = 10L * 60 * 1000
     }
 }

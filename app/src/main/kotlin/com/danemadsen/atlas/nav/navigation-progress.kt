@@ -8,6 +8,19 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
+ * Completed fraction of [route] (0..1), or null before the first fix —
+ * the notification progress bar's driver. [Snapshot.remainingMeters] is
+ * measured along the route and [RouteResult.distanceMeters] is the same
+ * polyline total the engine uses, so the fraction is exact, snaps to 1.0
+ * at arrival, and a re-route's fresh engine resets it honestly to the
+ * new route's 0.
+ */
+internal fun routeProgressFraction(route: RouteResult, snapshot: NavigationProgress.Snapshot?): Double? =
+    snapshot?.let {
+        (1.0 - it.remainingMeters / max(route.distanceMeters.toDouble(), 1.0)).coerceIn(0.0, 1.0)
+    }
+
+/**
  * The pure, fix-driven half of navigation mode: given a route and a
  * stream of GPS fixes, every [update] returns the full progress snapshot
  * plus the events the caller must act on (TTS announcements, re-route,

@@ -83,12 +83,26 @@ object NavigationCoordinator {
     /** True when a [start] is armed that the service has not consumed yet. */
     fun hasArmedStart(): Boolean = startArmed
 
-    fun start(context: Context, route: RouteResult, muted: Boolean = false) {
+    /**
+     * Whether the floating turn banner should be shown for the live
+     * session. A parallel StateFlow next to the mute plumbing, and for the
+     * same reason: the service stays persistence-free — the UI owns the
+     * pref, the coordinator is the bus the live change rides.
+     */
+    private val _overlayRequested = MutableStateFlow(false)
+    val overlayRequested: StateFlow<Boolean> = _overlayRequested.asStateFlow()
+
+    fun setOverlayRequested(enabled: Boolean) {
+        _overlayRequested.value = enabled
+    }
+
+    fun start(context: Context, route: RouteResult, muted: Boolean = false, overlayEnabled: Boolean = false) {
         if (_navState.value is NavState.Navigating || _navState.value is NavState.Arrived) return
         pendingRoute = route
         startArmed = true
         val session = session_counter.incrementAndGet()
         active_session = session
+        _overlayRequested.value = overlayEnabled
         _navState.value = NavState.Navigating(
             result = route,
             snapshot = null,
@@ -125,16 +139,44 @@ object NavigationCoordinator {
         )
     }
 
-    fun toggleMute() {
+    /**
+     * One mute path for three callers (phone panel, shade action, Android
+     * Auto action): flips the live session's mute and persists it, so the
+     * state the UI mirrors, what the speaker reads, and the NEXT session's
+     * seed all agree — a shade mute survives process death like a panel
+     * mute always did.
+     */
+    fun toggleMute(context: Context) {
         val current = _navState.value as? NavState.Navigating ?: return
-        _navState.value = current.copy(muted = !current.muted)
+        val muted = !current.muted
+        _navState.value = current.copy(muted = muted)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_TTS_MUTED, muted).apply()
     }
+
+    /** The SharedPreferences file all Atlas settings live in. */
+    const val PREFS_NAME = "atlas-settings"
+
+    /** The voice-guidance mute's key, shared by every writer. */
+    const val KEY_TTS_MUTED = "tts.muted"
 
     /** The service's consume-once start payload; null for a stale restart. */
     fun takePendingRoute(): RouteResult? {
         if (!startArmed) return null
         startArmed = false
         return pendingRoute
+    }
+
+    /**
+     * Non-service consumers (the Android Auto screen) closing a terminal
+     * state the service already retired: arrival and re-route failure
+     * reset the token themselves, so no token check and no service intent
+     * here — purely a state flip. No-op for non-terminal states.
+     */
+    fun clearTerminalState() {
+        if (_navState.value is NavState.Arrived || _navState.value is NavState.Failed) {
+            _navState.value = NavState.Idle
+        }
     }
 
     // ---- service-side publishers (single writer: the fix loop) ----

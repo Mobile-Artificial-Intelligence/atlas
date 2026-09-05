@@ -17,6 +17,11 @@ import com.danemadsen.atlas.routing.GraphBuildCoordinator
 import com.danemadsen.atlas.nav.NavigationCoordinator
 import com.danemadsen.atlas.search.PlaceHit
 import com.danemadsen.atlas.search.SearchCoordinator
+import com.danemadsen.atlas.ui.savedlocations.DEFAULT_PIN_NAME
+import com.danemadsen.atlas.ui.savedlocations.SavedLocation
+import com.danemadsen.atlas.ui.savedlocations.defaultLabel
+import com.danemadsen.atlas.ui.savedlocations.SavedLocationStore
+import com.danemadsen.atlas.ui.savedlocations.SavedSlot
 import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 // createSavedStateHandle is a top-level extension on CreationExtras in
@@ -55,6 +60,13 @@ sealed interface AtlasUiState {
  * message the UI has to match strings against.
  */
 enum class ImportStage { COPY_ARCHIVE, INSTALL_ROUTING, INSTALL_SEARCH }
+
+/**
+ * The bottom tab bar's destination. Navigation mode hides the bar entirely
+ * (the turn banner and nav panel own the screen), so the tab only matters
+ * while [NavigationCoordinator.NavState] is Idle.
+ */
+enum class Tab { MAP, SAVED, SETTINGS }
 
 /**
  * The routing side of the screen, orthogonal to the archive state:
@@ -117,8 +129,9 @@ class AtlasViewModel(
     private var selectedProfile = RouteProfile.CAR
     private var lastDestination: GeoPoint? = null
 
-    /** Small persisted app settings (the TTS mute). */
-    private val prefs = app.getSharedPreferences("atlas-settings", android.content.Context.MODE_PRIVATE)
+    /** Small persisted app settings (the TTS mute, overlay, saved places). */
+    private val prefs =
+        app.getSharedPreferences(NavigationCoordinator.PREFS_NAME, android.content.Context.MODE_PRIVATE)
 
     private val _searchState = MutableStateFlow<SearchUiState>(SearchUiState.Idle)
     val searchState: StateFlow<SearchUiState> = _searchState.asStateFlow()
@@ -194,9 +207,32 @@ class AtlasViewModel(
             .apply()
     }
 
-    /** The Settings overlay's visibility, orthogonal to every other state. */
-    private val _settingsOpen = MutableStateFlow(false)
-    val settingsOpen: StateFlow<Boolean> = _settingsOpen.asStateFlow()
+    /** The bottom tab bar's selection, orthogonal to every other state. */
+    private val _activeTab = MutableStateFlow(Tab.MAP)
+    val activeTab: StateFlow<Tab> = _activeTab.asStateFlow()
+
+    /**
+     * Saved destinations (Home/Work pins plus the arbitrary list), persisted
+     * as one JSON string under [KEY_SAVED_LOCATIONS]. They are user-curated
+     * data — a Home must survive an archive replace the way the TTS mute
+     * does — and a stale coordinate after a city switch degrades honestly:
+     * requestRoute's insideArchive bounds check fails it into the normal
+     * Failed drawer instead of lying or crashing.
+     */
+    private val _savedLocations = MutableStateFlow(
+        SavedLocationStore.decode(prefs.getString(KEY_SAVED_LOCATIONS, null)),
+    )
+    val savedLocations: StateFlow<List<SavedLocation>> = _savedLocations.asStateFlow()
+
+    /**
+     * The armed pick-on-map mode: the next long-press saves a location
+     * instead of routing. Single-shot — the first long-press consumes it —
+     * and always visible on the Map tab via the SavedPickBanner.
+     */
+    data class SavedPickRequest(val slot: SavedSlot?)
+
+    private val _pickPending = MutableStateFlow<SavedPickRequest?>(null)
+    val pickPending: StateFlow<SavedPickRequest?> = _pickPending.asStateFlow()
 
     /**
      * Voice-guidance mute, persisted so it survives process death and
@@ -204,8 +240,17 @@ class AtlasViewModel(
      * settings switch and the navigation panel's Mute button both write
      * here — one source of truth, so the two can never disagree.
      */
-    private val _ttsMuted = MutableStateFlow(prefs.getBoolean(KEY_TTS_MUTED, false))
+    private val _ttsMuted = MutableStateFlow(prefs.getBoolean(NavigationCoordinator.KEY_TTS_MUTED, false))
     val ttsMuted: StateFlow<Boolean> = _ttsMuted.asStateFlow()
+
+    /**
+     * The floating turn banner's persisted switch — same prefs file, same
+     * shape as the mute. Handed to [NavigationCoordinator.start] the way
+     * the mute is; a mid-navigation toggle rides the coordinator's
+     * [NavigationCoordinator.overlayRequested] to the live session.
+     */
+    private val _overlayEnabled = MutableStateFlow(prefs.getBoolean(KEY_OVERLAY_ENABLED, false))
+    val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
 
     init {
         // Process death must not silently drop a route the user had:
@@ -246,6 +291,18 @@ class AtlasViewModel(
                 if (current is NavigationCoordinator.NavState.Arrived) {
                     clearPersistedRoute()
                 }
+            }
+        }
+        // The shade's Mute action (and later the car's) goes through the
+        // coordinator, not through this ViewModel — mirror it so the
+        // panel/Settings switch never disagrees with what actually speaks.
+        // Never writes prefs: the coordinator's own toggle persists, and
+        // this VM toggle already did for the phone-side path.
+        viewModelScope.launch {
+            navState.collect { current ->
+                val muted =
+                    (current as? NavigationCoordinator.NavState.Navigating)?.muted ?: return@collect
+                if (muted != _ttsMuted.value) _ttsMuted.value = muted
             }
         }
         // An archive without an index (a mid-import process death, or an
@@ -464,10 +521,10 @@ class AtlasViewModel(
     fun startNavigation() {
         val result = (_routeState.value as? RouteUiState.Previewing)?.result ?: return
         // Navigation owns the whole screen (banner + panel, no tab bar);
-        // leaving the Settings tab open behind it would resurface the
+        // leaving whichever tab was open behind it would resurface the
         // moment the session ends.
-        _settingsOpen.value = false
-        NavigationCoordinator.start(app, result, _ttsMuted.value)
+        _activeTab.value = Tab.MAP
+        NavigationCoordinator.start(app, result, _ttsMuted.value, _overlayEnabled.value)
     }
 
     /**
@@ -484,24 +541,159 @@ class AtlasViewModel(
         }
     }
 
-    /** The navigation panel's Mute/Unmute. */
+    /** The navigation panel's Mute/Unmute (and the Settings switch). */
     fun toggleMute() {
         val muted = !_ttsMuted.value
         _ttsMuted.value = muted
-        prefs.edit().putBoolean(KEY_TTS_MUTED, muted).apply()
+        prefs.edit().putBoolean(NavigationCoordinator.KEY_TTS_MUTED, muted).apply()
         // The live session (if any) flips too, so what speaks matches
-        // what the settings switch shows.
+        // what the settings switch shows — and the coordinator's own
+        // write keeps the shade's Mute action, the car's Mute, and this
+        // switch on one persisted source of truth.
         if (navState.value is NavigationCoordinator.NavState.Navigating) {
-            NavigationCoordinator.toggleMute()
+            NavigationCoordinator.toggleMute(app)
         }
     }
 
-    fun openSettings() {
-        _settingsOpen.value = true
+    /**
+     * The Settings tab's floating-banner switch: persist, and re-drive a
+     * live session's overlay through the coordinator — the same path a
+     * mute toggle rides, so a mid-navigation change is immediate.
+     */
+    fun setOverlayEnabled(enabled: Boolean) {
+        _overlayEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_OVERLAY_ENABLED, enabled).apply()
+        NavigationCoordinator.setOverlayRequested(enabled)
     }
 
+    fun openSettings() {
+        _activeTab.value = Tab.SETTINGS
+    }
+
+    /** Back and the Saved/Settings screens' way back to the Map tab. */
     fun closeSettings() {
-        _settingsOpen.value = false
+        _activeTab.value = Tab.MAP
+    }
+
+    /** The middle tab's seam, symmetric with openSettings/closeSettings. */
+    fun openSavedLocations() {
+        _activeTab.value = Tab.SAVED
+    }
+
+    /** The general tab setter, for callers that hold a [Tab]. */
+    fun selectTab(tab: Tab) {
+        _activeTab.value = tab
+    }
+
+    private fun persistSavedLocations() {
+        prefs.edit().putString(KEY_SAVED_LOCATIONS, SavedLocationStore.encode(_savedLocations.value)).apply()
+    }
+
+    /**
+     * Upserts into the saved list: a slotted location replaces the old
+     * occupant of its slot, others append. The single source of truth for
+     * the saved list, called by every creation entry point.
+     */
+    fun saveLocation(location: SavedLocation) {
+        _savedLocations.value = SavedLocationStore.upsert(_savedLocations.value, location)
+        persistSavedLocations()
+    }
+
+    fun renameSavedLocation(id: String, name: String) {
+        _savedLocations.value = SavedLocationStore.rename(_savedLocations.value, id, name)
+        persistSavedLocations()
+    }
+
+    fun deleteSavedLocation(id: String) {
+        _savedLocations.value = SavedLocationStore.delete(_savedLocations.value, id)
+        persistSavedLocations()
+    }
+
+    /** Demotes a pinned place to the general list without deleting it. */
+    fun clearSavedSlot(id: String) {
+        _savedLocations.value = SavedLocationStore.clearSlot(_savedLocations.value, id)
+        persistSavedLocations()
+    }
+
+    /**
+     * Arms pick-on-map and jumps to the Map tab (the pick happens there).
+     * The pick is consumed by the next long-press — [onMapLongPress] — and
+     * the banner on the Map tab keeps the armed state visible.
+     */
+    fun beginPickSavedLocation(slot: SavedSlot?) {
+        _pickPending.value = SavedPickRequest(slot)
+        _activeTab.value = Tab.MAP
+    }
+
+    fun cancelPickSavedLocation() {
+        _pickPending.value = null
+    }
+
+    /**
+     * The map's long-press: a pick-pending interception in front of
+     * [requestRoute], so arming a save redirects exactly one long-press.
+     * Byte-identical routing behavior when no pick is pending.
+     */
+    fun onMapLongPress(point: GeoPoint) {
+        val pick = _pickPending.value
+        if (pick != null) {
+            _pickPending.value = null
+            saveLocation(
+                SavedLocation(
+                    id = SavedLocationStore.newId(),
+                    name = pick.slot?.defaultLabel() ?: DEFAULT_PIN_NAME,
+                    lon = point.lon,
+                    lat = point.lat,
+                    slot = pick.slot,
+                ),
+            )
+            toast("Location saved")
+            return
+        }
+        requestRoute(point)
+    }
+
+    /** Search results' Save button: a named save, staying on the Map tab. */
+    fun savePlace(place: PlaceHit) {
+        saveLocation(
+            SavedLocation(
+                id = SavedLocationStore.newId(),
+                name = place.name,
+                lon = place.lon,
+                lat = place.lat,
+            ),
+        )
+        toast("Saved \"${place.name}\"")
+    }
+
+    /** "Save map center": the always-current idle camera center. */
+    fun saveMapCenter() {
+        val center = mapCenter
+        if (center == null) {
+            toast("Move the map a little first")
+            return
+        }
+        saveLocation(
+            SavedLocation(
+                id = SavedLocationStore.newId(),
+                name = DEFAULT_PIN_NAME,
+                lon = center.lon,
+                lat = center.lat,
+            ),
+        )
+        toast("Location saved")
+    }
+
+    /**
+     * Tap on a saved row: the identical single choke point every other
+     * destination uses (long-press, search Route, restore, reRoute), so
+     * it inherits stop-nav-first, route-job cancel, the archive bounds
+     * check and bucket building for free. The Previewing fit-bounds
+     * effect on the map owns the camera after that.
+     */
+    fun goToSavedLocation(location: SavedLocation) {
+        _activeTab.value = Tab.MAP
+        requestRoute(GeoPoint(location.lon, location.lat))
     }
 
     /**
@@ -510,7 +702,7 @@ class AtlasViewModel(
      * in the same status banner an on-demand build uses.
      */
     fun prepareAllRoutingData() {
-        _settingsOpen.value = false
+        _activeTab.value = Tab.MAP
         viewModelScope.launch {
             GraphBuildCoordinator.startAll(app)
         }
@@ -530,7 +722,7 @@ class AtlasViewModel(
             toast("Stop navigation before rebuilding routing data")
             return
         }
-        _settingsOpen.value = false
+        _activeTab.value = Tab.MAP
         // The route the UI drops here is dropped everywhere: a rebuild
         // tears the map's state down, and a later process death must
         // not resurrect the route against the freshly-wiped data.
@@ -669,7 +861,7 @@ class AtlasViewModel(
      */
     fun rebuildSearchIndex() {
         if ((_state.value as? AtlasUiState.MapReady)?.archive == null) return
-        _settingsOpen.value = false
+        _activeTab.value = Tab.MAP
         viewModelScope.launch {
             // cancel() alone is asynchronous — ensureSearchIndex below would
             // see the old job still "active" and return without scheduling
@@ -712,7 +904,7 @@ class AtlasViewModel(
         if (_state.value is AtlasUiState.Importing) return
         // A replace chosen from Settings: the import dialog must be the
         // topmost surface, so the user sees its progress.
-        _settingsOpen.value = false
+        _activeTab.value = Tab.MAP
         // The old archive's route must not survive the replace: its
         // in-memory preview would paint over the new tiles and the fit
         // would fly the camera to the old city, with a Start button
@@ -820,6 +1012,11 @@ class AtlasViewModel(
                 // Nor its camera or any route aimed at the old tiles:
                 // both restores are bounds-checked against the new
                 // archive, but the clean slate is simpler and correct.
+                // The wiped keys are all archive-derived state — user-curated
+                // data (saved.locations, tts.muted) is deliberately NOT in
+                // this list: a routine archive update must not destroy the
+                // user's Home pin, and a stale coordinate degrades honestly
+                // via requestRoute's insideArchive check → Failed drawer.
                 prefs.edit()
                     .remove(KEY_CAMERA_LON)
                     .remove(KEY_CAMERA_LAT)
@@ -877,7 +1074,10 @@ fun rememberAtlasViewModel(): AtlasViewModel {
 private const val KEY_DEST_LON = "route.destination.lon"
 private const val KEY_DEST_LAT = "route.destination.lat"
 private const val KEY_PROFILE = "route.profile"
-private const val KEY_TTS_MUTED = "tts.muted"
+private const val KEY_SAVED_LOCATIONS = "saved.locations"
+
+/** The floating-banner switch, same dot-namespaced Boolean shape as the mute. */
+private const val KEY_OVERLAY_ENABLED = "overlay.enabled"
 
 // The camera keys live in the SAME prefs as the route-destination keys
 // (same names as the SavedStateHandle ones above are fine — prefs and

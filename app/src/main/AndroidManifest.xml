@@ -29,6 +29,13 @@
          permission, no runtime grant needed. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- The floating turn banner (NavigationService's overlay window) is a
+         TYPE_APPLICATION_OVERLAY, gated by this appop rather than a runtime
+         dialog — the Settings tab launches the system grant screen. Not in
+         NoNetworkPermissionCheck's forbidden list, so the offline guarantee
+         is untouched. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <!-- Package visibility (Android 11+): without these the system's
          AppsFilter hides other apps' speech components from Atlas, and the
          TTS engine fails to bind even though it is installed and selected
@@ -83,5 +90,26 @@
             android:name=".services.NavigationService"
             android:exported="false"
             android:foregroundServiceType="location" />
+
+        <!-- Android Auto (phone projection): advertises the CarAppService to
+             the Android Auto host. The DHU/head unit binds the service below. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:value="true" />
+        <!-- Every shipping host speaks level >= 2; level 2 covers the
+             MessageInfo-as-NavigationInfo variant used for the GPS-wait and
+             Recalculating states (level 1 only has Step). -->
+        <meta-data
+            android:name="androidx.car.app.minCarAppApiLevel"
+            android:value="2" />
+
+        <service
+            android:name=".auto.AtlasCarAppService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="androidx.car.app.CarAppService" />
+                <category android:name="androidx.car.app.category.NAVIGATION" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -17,10 +18,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
 /**
- * The app's two-tab bottom navigation: the map is the product, and
- * settings is the only other destination. A gear crammed into the search
- * bar was easy to fat-finger next to the mic and invisible as "a place
- * you can go"; tabs make both reachable with a thumb at the bottom edge.
+ * The app's three-tab bottom navigation: the map is the product, the saved
+ * destinations (Home/Work pins + arbitrary places) are the middle tab, and
+ * settings is the last. A gear crammed into the search bar was easy to
+ * fat-finger next to the mic and invisible as "a place you can go"; tabs
+ * make all three reachable with a thumb at the bottom edge.
  *
  * Navigation mode hides the bar entirely (the turn banner and nav panel
  * own the screen), and so does onboarding (the import flow is modal).
@@ -31,8 +33,9 @@ internal val TAB_BAR_HEIGHT = 64.dp
 
 @Composable
 fun MainTabBar(
-    settingsOpen: Boolean,
+    activeTab: Tab,
     onOpenMap: () -> Unit,
+    onOpenSaved: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -47,13 +50,19 @@ fun MainTabBar(
         windowInsets = androidx.compose.material3.NavigationBarDefaults.windowInsets,
     ) {
         NavigationBarItem(
-            selected = !settingsOpen,
+            selected = activeTab == Tab.MAP,
             onClick = onOpenMap,
             icon = { Icon(Icons.Filled.Map, contentDescription = null) },
             label = { Text("Map") },
         )
         NavigationBarItem(
-            selected = settingsOpen,
+            selected = activeTab == Tab.SAVED,
+            onClick = onOpenSaved,
+            icon = { Icon(Icons.Filled.Star, contentDescription = null) },
+            label = { Text("Saved") },
+        )
+        NavigationBarItem(
+            selected = activeTab == Tab.SETTINGS,
             onClick = onOpenSettings,
             icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
             label = { Text("Settings") },

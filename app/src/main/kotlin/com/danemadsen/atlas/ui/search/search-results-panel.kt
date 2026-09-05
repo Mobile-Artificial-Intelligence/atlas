@@ -29,6 +29,7 @@ fun SearchResultsPanel(
     searchState: SearchUiState,
     onSelectPlace: (PlaceHit) -> Unit,
     onRouteToPlace: (PlaceHit) -> Unit,
+    onSavePlace: (PlaceHit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val hits = (searchState as? SearchUiState.Results)?.hits ?: return
@@ -53,6 +54,7 @@ fun SearchResultsPanel(
                                 hit = hit,
                                 onSelect = { onSelectPlace(hit) },
                                 onRoute = { onRouteToPlace(hit) },
+                                onSave = { onSavePlace(hit) },
                             )
                         }
                     }
@@ -67,6 +69,7 @@ private fun ResultRow(
     hit: PlaceHit,
     onSelect: () -> Unit,
     onRoute: () -> Unit,
+    onSave: () -> Unit,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -84,6 +87,7 @@ private fun ResultRow(
             )
         }
         TextButton(onClick = onRoute) { Text("Route") }
+        TextButton(onClick = onSave) { Text("Save") }
     }
 }
 

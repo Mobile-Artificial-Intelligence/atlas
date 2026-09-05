@@ -54,9 +54,13 @@ import com.danemadsen.atlas.ui.TAB_BAR_HEIGHT
 import com.danemadsen.atlas.ui.graph.GraphPrepFlow
 import com.danemadsen.atlas.ui.nav.NavigationPanel
 import com.danemadsen.atlas.ui.nav.TurnBanner
+import com.danemadsen.atlas.ui.nav.rememberNavNotificationAsker
 import com.danemadsen.atlas.ui.onboarding.ImportArchiveFlow
 import com.danemadsen.atlas.ui.rememberAtlasViewModel
+import com.danemadsen.atlas.ui.Tab
 import com.danemadsen.atlas.ui.route.RoutePreviewPanel
+import com.danemadsen.atlas.ui.savedlocations.SavedLocationsScreen
+import com.danemadsen.atlas.ui.savedlocations.SavedPickBanner
 import com.danemadsen.atlas.ui.search.SearchBar
 import com.danemadsen.atlas.ui.search.SearchResultsPanel
 import com.danemadsen.atlas.ui.settings.SettingsScreen
@@ -100,7 +104,7 @@ fun MapScreen() {
                 selectedPlace = selected_place,
                 savedCamera = view_model.savedCamera,
                 onPlaceShown = view_model::onPlaceShown,
-                onLongPress = view_model::requestRoute,
+                onLongPress = view_model::onMapLongPress,
                 onCameraSettled = view_model::onCameraSettled,
             )
         }
@@ -139,8 +143,12 @@ fun MapScreen() {
             },
             onRetry = view_model::dismissError,
         )
-        val settings_open by view_model.settingsOpen.collectAsStateWithLifecycle()
+        val active_tab by view_model.activeTab.collectAsStateWithLifecycle()
+        val pick_pending by view_model.pickPending.collectAsStateWithLifecycle()
+        val saved_locations by view_model.savedLocations.collectAsStateWithLifecycle()
         val tts_muted by view_model.ttsMuted.collectAsStateWithLifecycle()
+        val overlay_enabled by view_model.overlayEnabled.collectAsStateWithLifecycle()
+        val ask_nav_notifications = rememberNavNotificationAsker()
         if (archive != null) {
             Column(
                 modifier = Modifier
@@ -156,10 +164,10 @@ fun MapScreen() {
                     // what the user needs at a glance is the next maneuver,
                     // not a search field.
                     TurnBanner(snapshot = (nav_state as NavigationCoordinator.NavState.Navigating).snapshot)
-                } else if (!settings_open) {
-                    // The Settings tab owns the whole screen — a search
-                    // field floating over the map behind it would be an
-                    // interactive hole in an opaque panel.
+                } else if (active_tab == Tab.MAP) {
+                    // The Settings and Saved tabs own the whole screen — a
+                    // search field floating over the opaque panel behind
+                    // them would be an interactive hole in that panel.
                     SearchBar(
                         query = search_query,
                         searchState = search_state,
@@ -185,11 +193,14 @@ fun MapScreen() {
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth(),
                 ) {
-                    if (settings_open) {
-                        SettingsScreen(
+                    when (active_tab) {
+                        Tab.SETTINGS -> {
+                            SettingsScreen(
                             archive = archive,
                             ttsMuted = tts_muted,
                             onToggleTtsMute = view_model::toggleMute,
+                            overlayEnabled = overlay_enabled,
+                            onToggleOverlay = view_model::setOverlayEnabled,
                             onDismiss = view_model::closeSettings,
                             onReplaceArchive = { uri -> view_model.importArchive(uri) },
                             onInstallRoutingData = view_model::installRoutingData,
@@ -204,7 +215,29 @@ fun MapScreen() {
                         // its Cancel button must not unmount with the Map
                         // tab, or a 30-minute job has no visible surface.
                         GraphPrepFlow(state, route_state)
-                    } else {
+                    }
+                    Tab.SAVED -> {
+                        SavedLocationsScreen(
+                            savedLocations = saved_locations,
+                            onRouteToSaved = view_model::goToSavedLocation,
+                            onRename = view_model::renameSavedLocation,
+                            onDelete = view_model::deleteSavedLocation,
+                            onClearSlot = view_model::clearSavedSlot,
+                            onBeginPick = view_model::beginPickSavedLocation,
+                            onSaveMapCenter = view_model::saveMapCenter,
+                            onDismiss = view_model::closeSettings,
+                            modifier = Modifier.weight(1f),
+                        )
+                        // A routing build can also be running (or fail)
+                        // while the user sits on this tab — the banner and
+                        // its Cancel button must not unmount with the Map
+                        // tab, or a 30-minute job has no visible surface.
+                        GraphPrepFlow(state, route_state)
+                    }
+                    Tab.MAP -> {
+                        // The armed pick mode is always visible so the
+                        // next long-press's meaning is never a surprise.
+                        pick_pending?.let { SavedPickBanner(onCancel = view_model::cancelPickSavedLocation) }
                         // Navigation owns the drawer from Start until it
                         // ends (arrived, failed, or Stop) — exactly one
                         // way out, never a route preview stacked under a
@@ -213,7 +246,16 @@ fun MapScreen() {
                             RoutePreviewPanel(
                                 routeState = route_state,
                                 onProfileSelected = view_model::selectProfile,
-                                onStart = view_model::startNavigation,
+                                onStart = {
+                                    // Order is deliberate: the session goes
+                                    // live first, then the once-per-install
+                                    // POST_NOTIFICATIONS ask rides the press
+                                    // (nav-permission-gate.kt). Navigation
+                                    // runs either way; the grant only
+                                    // silences the progress notification.
+                                    view_model.startNavigation()
+                                    ask_nav_notifications()
+                                },
                                 onRetry = view_model::reRoute,
                                 onDismiss = view_model::dismissRoute,
                             )
@@ -221,13 +263,16 @@ fun MapScreen() {
                                 searchState = search_state,
                                 onSelectPlace = view_model::selectPlace,
                                 onRouteToPlace = view_model::routeToPlace,
+                                onSavePlace = view_model::savePlace,
                             )
                             GraphPrepFlow(state, route_state)
                         }
                     }
+                    }
                     MainTabBar(
-                        settingsOpen = settings_open,
+                        activeTab = active_tab,
                         onOpenMap = view_model::closeSettings,
+                        onOpenSaved = view_model::openSavedLocations,
                         onOpenSettings = view_model::openSettings,
                     )
                 }
