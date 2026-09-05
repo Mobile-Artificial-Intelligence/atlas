@@ -49,7 +49,7 @@ name: PMTiles
 #     wall-clock does not)
 on:
   schedule:
-    # Daily at midnight UTC, when Geofabrik's daily updates are ready. The cron is
+    # Daily at midnight UTC, when Geofabrik's daily updates are ready.
     - cron: '0 0 * * *'
   workflow_dispatch:
 
