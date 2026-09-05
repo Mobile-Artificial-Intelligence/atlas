@@ -37,6 +37,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.danemadsen.atlas.ui.AtlasUiState
 import com.danemadsen.atlas.ui.ImportStage
@@ -176,9 +178,11 @@ fun ImportArchiveFlow(
                             )
                         }
                     }
-                    if (steps.size == 1) {
+                    if (steps.size == 1 && state.progress == null) {
                         // A bare copy with no percentage yet (the file size
-                        // query can stall) must not look frozen.
+                        // query can stall) must not look frozen. Guarded on
+                        // progress==null, or it stacks under the determinate
+                        // bar the moment the percentage starts arriving.
                         LinearProgressIndicator(Modifier.fillMaxWidth().padding(start = 32.dp, top = 2.dp))
                     }
                 }
@@ -204,7 +208,18 @@ fun ImportArchiveFlow(
         )
         }
 
-        is AtlasUiState.MapReady -> Unit
+        is AtlasUiState.MapReady -> {
+            // A successful import clears the picks. They otherwise survive
+            // into the NEXT import (Settings' "Replace map archive" opens
+            // this dialog's Importing checklist) and would render phantom
+            // "Installing routing data"/"Installing search index" stages for
+            // files that import is not going to install.
+            LaunchedEffect(state) {
+                picked_archive = null
+                picked_routing = null
+                picked_search = null
+            }
+        }
     }
 }
 
@@ -292,18 +307,19 @@ private fun ImportStageRow(label: String, done: Boolean, running: Boolean, last:
         when {
             done -> Icon(
                 Icons.Outlined.Check,
-                contentDescription = null,
+                contentDescription = "done",
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(20.dp),
             )
             running -> CircularProgressIndicator(
                 strokeWidth = 2.dp,
-                modifier = Modifier.size(20.dp),
+                modifier = Modifier.size(20.dp).semantics { contentDescription = "in progress" },
             )
             else -> Box(
                 modifier = Modifier
                     .size(20.dp)
-                    .background(MaterialTheme.colorScheme.outlineVariant, CircleShape),
+                    .background(MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                    .semantics { contentDescription = "waiting" },
             )
         }
         Text(

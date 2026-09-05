@@ -36,6 +36,13 @@ fun renderSearchManifest(archiveFingerprint: String, places: Int, addresses: Int
  * the fix).
  */
 fun parseSearchManifest(text: String): SearchManifest {
+    val format = Regex("\"format\":(-?\\d+)").find(text)?.groupValues?.get(1)?.toInt()
+        ?: error("search index has no manifest format — re-download the search index " +
+            "and the map archive from the same build, then install both")
+    require(format == SEARCH_MANIFEST_FORMAT) {
+        "the search index is an unsupported format (version $format) — update the " +
+            "app, or re-download the search index from the same build as your map archive"
+    }
     val fingerprint = Regex("\"archiveFingerprint\":\"([0-9a-f]+)\"").find(text)
         ?: error("search index has no archive fingerprint — re-download the search index " +
             "and the map archive from the same build, then install both")

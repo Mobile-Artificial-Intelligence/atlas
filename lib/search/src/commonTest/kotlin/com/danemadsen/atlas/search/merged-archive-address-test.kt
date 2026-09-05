@@ -14,7 +14,7 @@ import kotlin.test.assertTrue
  * fixture, so there the test is a no-op; locally:
  *
  *   ATLAS_MERGED_ARCHIVE=/tmp/atlas-australia.pmtiles \
- *     gradlew :lib:search:testDebugUnitTest --tests MergedArchiveAddressTest
+ *     gradlew :lib:search:jvmTest --tests MergedArchiveAddressTest
  */
 class MergedArchiveAddressTest {
 

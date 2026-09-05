@@ -236,9 +236,21 @@ object SearchCoordinator {
                                 // The free-space floor as a gate before the
                                 // stream starts: an extraction that would
                                 // fill the partition fails with a message,
-                                // not an opaque ENOSPC.
+                                // not an opaque ENOSPC. The declared entry
+                                // size turns the floor into a real fit
+                                // check — the DB is the multi-GB entry, a
+                                // single floor probe against it would still
+                                // let the copy run the partition dry and
+                                // die with the system message mid-stream.
                                 require(scratch.usableSpace > MIN_FREE_DISK_BYTES) {
-                                    "not enough free storage to install the search index"
+                                    "not enough free storage to install the " +
+                                        "search index — free up space and try again"
+                                }
+                                if (entry.size > 0) {
+                                    require(scratch.usableSpace - MIN_FREE_DISK_BYTES >= entry.size) {
+                                        "not enough free storage to install the " +
+                                            "search index — free up space and try again"
+                                    }
                                 }
                                 val out = File(scratch, name)
                                 out.outputStream().use { output ->
@@ -266,6 +278,15 @@ object SearchCoordinator {
                 require(index_manifest.archiveFingerprint == fingerprintFor(archiveFile)) {
                     "this search index was built from a different map archive — use the " +
                         "search index from the same download as your map archive"
+                }
+                // A 0/0 manifest would pass the integrity check against a
+                // 0-byte DB (Room CREATES the schema into it and both counts
+                // read 0), adopting a permanently-empty "complete" index.
+                // Every real archive yields places; a manifest claiming
+                // none is not a real index.
+                require(index_manifest.places > 0) {
+                    "the search index contains no places — re-download the search " +
+                        "index and the map archive from the same build, then install both"
                 }
                 val name = db_name
                     ?: error("the search index file contains no search index — wrong file?")
@@ -317,6 +338,14 @@ object SearchCoordinator {
                     live_marker.delete()
                     check(tmp_marker.renameTo(live_marker)) { "could not install the search index marker" }
                 }
+                // Drop the cached query handle AGAIN: a search that ran
+                // during the multi-GB scratch->tmp copy re-cached the OLD
+                // file's handle (the swap had not happened yet), and that
+                // handle still points at the unlinked old inode — it would
+                // serve stale results forever. The commit above replaced
+                // the file; this replaces the app's view of it.
+                cached_db?.second?.close()
+                cached_db = null
                 deleteStaleIndexes(context, archiveFile)
                 IndexAdoption(places, addresses)
             } finally {

@@ -676,7 +676,12 @@ class AtlasViewModel(
             // anything, leaving search dead until the next launch. Wait for
             // the pass to unwind (it checks cancellation every 256 tiles /
             // zoom bracket) before wiping the DBs it may still hold open.
+            // The Settings install joins the coordinator's same write lock,
+            // so it must unwind too — wiping under it would delete the live
+            // DB mid-adopt, and the rebuild's recovery pass would then hit
+            // the still-held lock and silently never run.
             searchIndexJob?.cancelAndJoin()
+            search_install_job?.cancelAndJoin()
             SearchCoordinator.deleteIndexes(app)
             _searchState.value = SearchUiState.Idle
             ensureSearchIndex(com.danemadsen.atlas.data.ArchiveStore.archiveFile(app))
@@ -757,7 +762,14 @@ class AtlasViewModel(
                 // archive (tens of seconds, surfaced through the search
                 // state). The order matters: deleteIndexes must not run
                 // AFTER a successful adopt, or it wipes what just landed.
+                // The Settings install job joins the coordinator's same
+                // write lock as the cheap pass — unwind BOTH before wiping,
+                // or a replace-archive that lands mid-adopt deletes the
+                // adopt's live DB out from under it (and this import's own
+                // adopt below would hit the still-held lock and silently
+                // never run).
                 searchIndexJob?.cancelAndJoin()
+                search_install_job?.cancelAndJoin()
                 SearchCoordinator.deleteIndexes(app)
                 val archive_file = com.danemadsen.atlas.data.ArchiveStore.archiveFile(app)
                 var search_installed = false
@@ -785,6 +797,12 @@ class AtlasViewModel(
                                 input.close()
                             }
                         }
+                    } catch (e: CancellationException) {
+                        // The import coroutine was cancelled (ViewModel
+                        // cleared): not a user-facing failure, and the
+                        // generic catch below would toast a false "was not
+                        // installed" from it.
+                        throw e
                     } catch (e: Exception) {
                         val reason = e.message?.takeIf { it.isNotBlank() }
                             ?: "an unexpected error"
