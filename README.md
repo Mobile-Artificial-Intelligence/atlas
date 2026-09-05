@@ -1,3 +1,7 @@
+<div align="center" id = "top">
+  <img alt="logo" height="200px" src="https://raw.githubusercontent.com/Mobile-Artificial-Intelligence/atlas/main/logo.svg">
+</div>
+
 # Atlas — fully-offline maps for Android
 
 Atlas is an open-source Android maps app that renders, searches, routes, and
