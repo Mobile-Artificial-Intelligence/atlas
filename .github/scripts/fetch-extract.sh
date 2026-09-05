@@ -15,8 +15,27 @@ out=$2
 MIN_BYTES=100000
 
 mkdir -p "$(dirname "$out")"
-curl --fail --location --retry 8 --retry-delay 10 --retry-all-errors \
-     --continue-at - --output "$out" "$url"
+
+# --continue-at - only when there IS something to resume: an empty/absent
+# file must not send "Range: bytes=0-", which some Geofabrik backends
+# answer with a plain 200 — curl calls that "server doesn't seem to
+# support byte ranges" (exit 33) and --retry does not cover it.
+fetch() {
+  local resume=()
+  if [ -s "$out" ]; then
+    resume=(--continue-at -)
+  fi
+  curl --fail --location --retry 8 --retry-delay 10 --retry-all-errors \
+       "${resume[@]}" --output "$out" "$url"
+}
+fetch || {
+  # A mid-body resume that the server refuses (exit 33, file replaced
+  # mid-download by the daily regeneration, …) is better restarted than
+  # failed: the archive build is hours, the extract download is minutes.
+  echo "resume refused — restarting the download from zero" >&2
+  rm -f "$out"
+  fetch
+}
 
 # Skip the 4-byte length prefix; the next 11 bytes must be the OSMHeader
 # field tag (0a), its length (09), and the literal "OSMHeader".
