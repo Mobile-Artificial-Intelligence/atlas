@@ -3,9 +3,11 @@
 #   - dropped connections mid-body on the multi-GB extracts — retried and
 #     RESUMED (--continue-at -) instead of restarting 11 GB from zero;
 #   - incident-window HTML error pages (a 200 with a body full of HTML) —
-#     --fail cannot catch those, so the OSM pbf magic byte does: every
-#     extract starts with 0x0a (a BlobHeader record), an error page with
-#     '<'.
+#     --fail cannot catch those, so the pbf structure does. An OSM pbf
+#     starts with a 4-byte big-endian BlobHeader length (00 00 00 xx),
+#     then the BlobHeader's first field: 0a 09 "OSMHeader". An error page
+#     starts with '<' (3c). (The first byte alone is 00 for every valid
+#     pbf — a first-byte 0a check rejects the very thing it validates.)
 set -euo pipefail
 
 url=$1
@@ -16,9 +18,11 @@ mkdir -p "$(dirname "$out")"
 curl --fail --location --retry 8 --retry-delay 10 --retry-all-errors \
      --continue-at - --output "$out" "$url"
 
-first=$(od -An -tx1 -N1 "$out" | tr -d ' \n')
-if [ "$first" != "0a" ]; then
-  echo "::error::$out is not an OSM pbf (first byte 0x$first) — Geofabrik error page? $(head -c 200 "$out" | tr '\n' ' ')"
+# Skip the 4-byte length prefix; the next 11 bytes must be the OSMHeader
+# field tag (0a), its length (09), and the literal "OSMHeader".
+head_hex=$(od -An -tx1 -N15 "$out" | tr -d ' \n')
+if [ "${head_hex:8}" != "0a094f534d486561646572" ]; then
+  echo "::error::$out is not an OSM pbf (starts $(head -c 15 "$out" | od -An -tx1 | tr -d ' \n')) — Geofabrik error page? $(head -c 200 "$out" | tr '\n' ' ')"
   exit 1
 fi
 size=$(wc -c < "$out")
