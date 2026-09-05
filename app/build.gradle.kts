@@ -201,6 +201,14 @@ tasks.register<JavaExec>("graphRouteCli") {
     // bundleDebugClassesToRuntimeJar; reading the FileCollection alone does
     // not schedule that jar, so a stale one silently shadowed fresh classes.
     dependsOn("bundleDebugClassesToRuntimeJar")
+    // …and each LIBRARY module's classes from its own
+    // bundleLibRuntimeToJarDebug jar. On a fresh checkout none of these
+    // jars exist: without the explicit edges the JavaExec starts with
+    // holes in its classpath and dies with NoClassDefFoundError on the
+    // first class it touches (locally a warm build dir hides this).
+    dependsOn(":lib:pmtiles:bundleLibRuntimeToJarDebug")
+    dependsOn(":lib:search:bundleLibRuntimeToJarDebug")
+    dependsOn(":lib:map-style:bundleLibRuntimeToJarDebug")
     mainClass = "com.danemadsen.atlas.graph.GraphRouteCli"
     maxHeapSize = "512m"
     doFirst {
@@ -226,6 +234,12 @@ tasks.register<JavaExec>("graphBuildCli") {
     dependsOn("compileDebugUnitTestKotlin")
     // See graphRouteCli: keep the runtime classes jar on the task graph.
     dependsOn("bundleDebugClassesToRuntimeJar")
+    // See graphRouteCli: the libs' runtime jars too, or a fresh checkout
+    // runs the JavaExec with a holed classpath (CI: NoClassDefFoundError
+    // com/danemadsen/atlas/pmtiles/PmtilesReader).
+    dependsOn(":lib:pmtiles:bundleLibRuntimeToJarDebug")
+    dependsOn(":lib:search:bundleLibRuntimeToJarDebug")
+    dependsOn(":lib:map-style:bundleLibRuntimeToJarDebug")
     mainClass = "com.danemadsen.atlas.graph.GraphBuildCli"
     maxHeapSize = providers.gradleProperty("heap").orElse("576m").get()
     doFirst {
