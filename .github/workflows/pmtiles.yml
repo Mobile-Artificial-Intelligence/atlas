@@ -243,7 +243,10 @@ jobs:
           ADDRESS_AT: ${{ matrix.address_at }}
         run: |
           if [ -n "$ADDRESS_AT" ]; then
-            python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles" --address-at "$ADDRESS_AT"
+            # --address-at= (not --address-at with a space): canada's
+            # ADDRESS_AT starts with a minus (-79.38…), which argparse
+            # would otherwise read as an unknown option.
+            python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles" --address-at="$ADDRESS_AT"
           else
             python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles"
           fi
