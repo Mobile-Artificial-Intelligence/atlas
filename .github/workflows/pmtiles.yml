@@ -61,13 +61,9 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
-# Every run is a full-matrix run (hours long, all countries), so runs
-# serialize: a queued dispatch waits for one already in flight rather than
-# cancelling it — and vice versa.
-concurrency:
-  group: pmtiles
-  cancel-in-progress: false
-
+# No concurrency block: runs are independent by design — every trigger
+# starts immediately, overlapping in-flight runs included. All outputs are
+# per-run namespaced (artifacts, summary, caches), so nothing collides.
 jobs:
   countries:
     name: pmtiles-${{ matrix.country }}
