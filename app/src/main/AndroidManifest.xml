@@ -85,13 +85,10 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Geographic URIs from other apps (RFC 5870 + the q= z=
-                 extensions): another map app, a browser link, or an NFC tag
-                 can hand Atlas a coordinate or place to look up offline.
-                 The request is parsed by MapIntentParser and lands in the
-                 map state via ExternalMapIntentHandler (onCreate for a
-                 cold start, onNewIntent for the running activity — the
-                 singleTop launch mode means both must be handled). -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.APP_MAPS" />
+            </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
