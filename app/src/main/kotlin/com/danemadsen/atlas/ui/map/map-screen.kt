@@ -183,8 +183,8 @@ fun MapScreen() {
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .fillMaxWidth()
-                    // Edge-to-edge: the bar must clear the status bar,
-                    // and the results panel below the map must clear it too.
+                    // Edge-to-edge: the bar and the results popover under
+                    // it must clear the status bar.
                     .statusBarsPadding()
                     .padding(horizontal = 12.dp),
             ) {
@@ -203,6 +203,17 @@ fun MapScreen() {
                             search_query = query
                             view_model.onSearchQueryChange(query)
                         },
+                    )
+                    // The results popover hangs directly under the search
+                    // bar: the eyes are already there after typing, and a
+                    // bottom drawer made candidates compete with the route
+                    // drawer for the same strip of chrome.
+                    SearchResultsPanel(
+                        searchState = search_state,
+                        savedLocations = saved_locations,
+                        onOpenRouteMenu = view_model::openPlaceMenu,
+                        onToggleSave = view_model::togglePlaceSaved,
+                        modifier = Modifier.padding(top = 4.dp),
                     )
                 }
             }
@@ -295,12 +306,6 @@ fun MapScreen() {
                                 },
                                 onRetry = view_model::reRoute,
                                 onDismiss = view_model::dismissRoute,
-                            )
-                            SearchResultsPanel(
-                                searchState = search_state,
-                                onSelectPlace = view_model::selectPlace,
-                                onRouteToPlace = view_model::routeToPlace,
-                                onSavePlace = view_model::savePlace,
                             )
                             GraphPrepFlow(state, route_state)
                         }

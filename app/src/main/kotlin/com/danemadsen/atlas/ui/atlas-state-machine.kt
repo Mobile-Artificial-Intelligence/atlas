@@ -443,9 +443,16 @@ class AtlasViewModel(
         _selectedPlace.value = place
     }
 
-    /** Drawer row Route button: same flow as a long-press destination. */
-    fun routeToPlace(place: PlaceHit) {
-        requestRoute(GeoPoint(place.lon, place.lat))
+    /**
+     * Search popover row tap: open the location menu — the same route
+     * menu a long-press gets — at the place's point, named after it. The
+     * camera flies there too, so the menu's actions act on a point the
+     * user can actually see.
+     */
+    fun openPlaceMenu(place: PlaceHit) {
+        selectPlace(place)
+        _locationMenuLabel.value = place.name
+        _locationMenuPoint.value = GeoPoint(place.lon, place.lat)
     }
 
     /**
@@ -765,17 +772,29 @@ class AtlasViewModel(
         toast("Location saved")
     }
 
-    /** Search results' Save button: a named save, staying on the Map tab. */
-    fun savePlace(place: PlaceHit) {
-        saveLocation(
-            SavedLocation(
-                id = SavedLocationStore.newId(),
-                name = place.name,
-                lon = place.lon,
-                lat = place.lat,
-            ),
-        )
-        toast("Saved \"${place.name}\"")
+    /**
+     * Search popover's star: save the place, or — when that point is
+     * already in the saved list — unsave it. Matched by coordinates, so
+     * the same place toggles identically across searches.
+     */
+    fun togglePlaceSaved(place: PlaceHit) {
+        val existing = _savedLocations.value.firstOrNull {
+            it.lon == place.lon && it.lat == place.lat
+        }
+        if (existing != null) {
+            _savedLocations.value = SavedLocationStore.delete(_savedLocations.value, existing.id)
+            toast("Removed \"${place.name}\"")
+        } else {
+            saveLocation(
+                SavedLocation(
+                    id = SavedLocationStore.newId(),
+                    name = place.name,
+                    lon = place.lon,
+                    lat = place.lat,
+                ),
+            )
+            toast("Saved \"${place.name}\"")
+        }
     }
 
     /** "Save map center": the always-current idle camera center. */

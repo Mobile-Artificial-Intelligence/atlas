@@ -8,35 +8,43 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.StarBorder
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.danemadsen.atlas.search.PlaceHit
 import com.danemadsen.atlas.ui.SearchUiState
+import com.danemadsen.atlas.ui.savedlocations.SavedLocation
 
 /**
- * The search results drawer: top ranked hits below the route drawer, one
- * row per place. Tapping a row flies the map there; Route runs the same
- * flow as a long-press on that point.
+ * The search results popover: anchored directly under the search bar, one
+ * row per place. Tapping a row opens the location menu — the same route
+ * menu a long-press gets — for that place; the star on the far right
+ * toggles the place's saved state.
  */
 @Composable
 fun SearchResultsPanel(
     searchState: SearchUiState,
-    onSelectPlace: (PlaceHit) -> Unit,
-    onRouteToPlace: (PlaceHit) -> Unit,
-    onSavePlace: (PlaceHit) -> Unit,
+    savedLocations: List<SavedLocation>,
+    onOpenRouteMenu: (PlaceHit) -> Unit,
+    onToggleSave: (PlaceHit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val hits = (searchState as? SearchUiState.Results)?.hits ?: return
     Surface(
         modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceContainer,
-        shadowElevation = 4.dp,
+        shadowElevation = 8.dp,
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             when {
@@ -44,7 +52,7 @@ fun SearchResultsPanel(
                     Text(
                         "No places match that search",
                         style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(12.dp),
+                        modifier = Modifier.padding(16.dp),
                     )
                 }
                 else -> {
@@ -52,9 +60,9 @@ fun SearchResultsPanel(
                         items(hits, key = { "${it.name}|${it.kind}|${it.lon}|${it.lat}" }) { hit ->
                             ResultRow(
                                 hit = hit,
-                                onSelect = { onSelectPlace(hit) },
-                                onRoute = { onRouteToPlace(hit) },
-                                onSave = { onSavePlace(hit) },
+                                saved = savedLocations.any { it.lon == hit.lon && it.lat == hit.lat },
+                                onOpen = { onOpenRouteMenu(hit) },
+                                onToggleSave = { onToggleSave(hit) },
                             )
                         }
                     }
@@ -67,16 +75,16 @@ fun SearchResultsPanel(
 @Composable
 private fun ResultRow(
     hit: PlaceHit,
-    onSelect: () -> Unit,
-    onRoute: () -> Unit,
-    onSave: () -> Unit,
+    saved: Boolean,
+    onOpen: () -> Unit,
+    onToggleSave: () -> Unit,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onSelect)
-            .padding(start = 12.dp),
+            .clickable(onClick = onOpen)
+            .padding(start = 16.dp),
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(hit.name, style = MaterialTheme.typography.titleSmall)
@@ -86,8 +94,13 @@ private fun ResultRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        TextButton(onClick = onRoute) { Text("Route") }
-        TextButton(onClick = onSave) { Text("Save") }
+        IconButton(onClick = onToggleSave) {
+            Icon(
+                imageVector = if (saved) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                contentDescription = if (saved) "Unsave this place" else "Save this place",
+                tint = if (saved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
