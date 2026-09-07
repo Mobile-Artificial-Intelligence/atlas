@@ -11,6 +11,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
+import com.danemadsen.atlas.intent.ExternalMapIntentHandler
 import com.danemadsen.atlas.ui.DebugCameraBus
 import com.danemadsen.atlas.ui.map.MapScreen
 import com.danemadsen.atlas.ui.theme.AtlasTheme
@@ -20,6 +21,10 @@ class AtlasActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         handleCameraUri(intent?.data)
+        // A cold-start geo: link: the request replays through the handler
+        // until the ViewModel (built inside the composition below) has
+        // consumed it.
+        ExternalMapIntentHandler.handle(intent)
         setContent {
             AtlasTheme {
                 // The manifest declares uiMode in configChanges so the map
@@ -45,6 +50,9 @@ class AtlasActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleCameraUri(intent.data)
+        // The singleTop relaunch: the activity is already alive, so the
+        // geo: request reaches the map without any recreation.
+        ExternalMapIntentHandler.handle(intent)
     }
 
     /** `atlas://camera?lon=..&lat=..&zoom=..&bearing=..` — adb-driven

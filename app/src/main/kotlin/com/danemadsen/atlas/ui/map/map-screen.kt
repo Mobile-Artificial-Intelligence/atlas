@@ -35,6 +35,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.danemadsen.atlas.data.ArchiveInfo
 import com.danemadsen.atlas.data.ArchiveStore
+import com.danemadsen.atlas.intent.ExternalMapIntentHandler
 import com.danemadsen.atlas.location.LocationPresence
 import com.danemadsen.atlas.location.LocationPresenceTracker
 import com.danemadsen.atlas.mapstyle.StyleBuilder
@@ -48,6 +49,7 @@ import com.danemadsen.atlas.search.PlaceHit
 import com.danemadsen.atlas.ui.AtlasUiState
 import com.danemadsen.atlas.ui.CameraSnapshot
 import com.danemadsen.atlas.ui.DebugCameraBus
+import com.danemadsen.atlas.ui.IntentCameraTarget
 import com.danemadsen.atlas.ui.MainTabBar
 import com.danemadsen.atlas.ui.RouteUiState
 import com.danemadsen.atlas.ui.TAB_BAR_HEIGHT
@@ -92,6 +94,31 @@ fun MapScreen() {
     val selected_place by view_model.selectedPlace.collectAsStateWithLifecycle()
     var search_query by remember { mutableStateOf("") }
     val navigating = nav_state is NavigationCoordinator.NavState.Navigating
+    // External geo: intents (see ExternalMapIntentHandler): the camera fly
+    // and the offline-search query each land here once, applied by the
+    // effects below.
+    val intent_camera by view_model.intentCamera.collectAsStateWithLifecycle()
+    val pending_query by view_model.pendingSearchQuery.collectAsStateWithLifecycle()
+    // The handler's replay keeps a cold-start geo: intent alive until THIS
+    // collector exists (composition is a second or more behind onCreate);
+    // the seq dedup inside onMapIntent makes a replayed redelivery after
+    // an activity recreation a no-op.
+    LaunchedEffect(view_model) {
+        ExternalMapIntentHandler.requests.collect { event ->
+            view_model.onMapIntent(event)
+        }
+    }
+    // An intent's search rides the same debounced path as typing — but the
+    // query text itself lives in THIS local state, so copy it in first. A
+    // query that arrives before an archive exists waits for the archive:
+    // the effect re-runs when state flips to MapReady.
+    LaunchedEffect(pending_query, state) {
+        val query = pending_query ?: return@LaunchedEffect
+        if (state !is AtlasUiState.MapReady) return@LaunchedEffect
+        search_query = query
+        view_model.onSearchQueryChange(query)
+        view_model.onPendingSearchQueryShown()
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         val archive = (state as? AtlasUiState.MapReady)?.archive
@@ -101,8 +128,10 @@ fun MapScreen() {
                 routeState = route_state,
                 navState = nav_state,
                 selectedPlace = selected_place,
+                intentCamera = intent_camera,
                 savedCamera = view_model.savedCamera,
                 onPlaceShown = view_model::onPlaceShown,
+                onIntentCameraShown = view_model::onIntentCameraShown,
                 onLongPress = view_model::onMapLongPress,
                 onCameraSettled = view_model::onCameraSettled,
             )
@@ -144,6 +173,7 @@ fun MapScreen() {
         )
         val active_tab by view_model.activeTab.collectAsStateWithLifecycle()
         val location_menu_point by view_model.locationMenuPoint.collectAsStateWithLifecycle()
+        val location_menu_label by view_model.locationMenuLabel.collectAsStateWithLifecycle()
         val saved_locations by view_model.savedLocations.collectAsStateWithLifecycle()
         val tts_muted by view_model.ttsMuted.collectAsStateWithLifecycle()
         val overlay_enabled by view_model.overlayEnabled.collectAsStateWithLifecycle()
@@ -233,13 +263,17 @@ fun MapScreen() {
                     }
                     Tab.MAP -> {
                         // The long-press location menu: route, save as
-                        // Home/Work, or save as a plain location.
+                        // Home/Work, save as a plain location, or hand the
+                        // point to another map app / the Sharesheet.
                         LocationMenuPanel(
                             point = location_menu_point,
+                            label = location_menu_label,
                             onDismiss = view_model::dismissLocationMenu,
                             onRoute = view_model::routeHere,
                             onSetSlot = view_model::setSlotFromMenu,
                             onSave = view_model::saveMenuPoint,
+                            onOpenWith = { view_model.openLocationWith(it) },
+                            onShare = { view_model.shareLocation(it) },
                         )
                         // Navigation owns the drawer from Start until it
                         // ends (arrived, failed, or Stop) — exactly one
@@ -308,8 +342,10 @@ fun AtlasMap(
     routeState: RouteUiState,
     navState: NavigationCoordinator.NavState,
     selectedPlace: PlaceHit?,
+    intentCamera: IntentCameraTarget?,
     savedCamera: CameraSnapshot?,
     onPlaceShown: () -> Unit,
+    onIntentCameraShown: () -> Unit,
     onLongPress: (GeoPoint) -> Unit,
     onCameraSettled: (CameraSnapshot, from_user_move: Boolean) -> Unit,
     modifier: Modifier = Modifier,
@@ -454,6 +490,25 @@ fun AtlasMap(
             ),
         )
         onPlaceShown()
+    }
+
+    // An external geo: intent's camera: fly to the requested coordinate
+    // (respecting z=), then clear the target — the same once-only shape as
+    // the place fly-to above. Atlas framing an intent target, not the
+    // user's chosen view: programmatic, so the settle is not persisted.
+    LaunchedEffect(map_libre, intentCamera) {
+        val map = map_libre ?: return@LaunchedEffect
+        val target = intentCamera ?: return@LaunchedEffect
+        programmatic_camera = true
+        map.animateCamera(
+            CameraUpdateFactory.newCameraPosition(
+                CameraPosition.Builder()
+                    .target(LatLng(target.lat, target.lon))
+                    .zoom(target.zoom ?: SELECTED_PLACE_ZOOM)
+                    .build(),
+            ),
+        )
+        onIntentCameraShown()
     }
 
     // The map's brand family (motorways, major roads, casings, transit text)

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Android Auto host reads this descriptor (referenced by the
+     com.google.android.gms.car.application meta-data) instead of the
+     legacy value="true" flag. Atlas renders templates only — it never
+     draws into the host surface — so "template" is the single declared
+     feature. -->
+<automotiveApp>
+    <uses name="template" />
+</automotiveApp>

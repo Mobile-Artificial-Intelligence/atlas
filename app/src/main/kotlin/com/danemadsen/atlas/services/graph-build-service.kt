@@ -662,8 +662,24 @@ class GraphBuildService : Service() {
      * on API 35+. End honestly — cancelled run, terminal status, released
      * wake lock — instead of being killed mid-build with a running banner
      * left behind.
+     *
+     * The system dispatches the one-argument overload on API 35 and the
+     * two-argument one on API 36+; both funnel into the same teardown.
+     * (Graph-build state needs no extra persistence here: the manager's
+     * segmentsDir/build-state.json records every completed bucket as it
+     * completes, so a timed-out build resumes cleanly from what it had
+     * finished and a partial bucket is rebuilt from scratch — never
+     * half-installed.)
      */
+    override fun onTimeout(startId: Int) {
+        handleTimeout()
+    }
+
     override fun onTimeout(startId: Int, fgsType: Int) {
+        handleTimeout()
+    }
+
+    private fun handleTimeout() {
         timedOut = true
         // Only the routing run owns a build the manager can cancel; a
         // search run's cancel flag is read directly in the sweep.

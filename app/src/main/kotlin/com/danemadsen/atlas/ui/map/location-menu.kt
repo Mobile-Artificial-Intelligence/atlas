@@ -10,7 +10,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Work
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -33,15 +35,20 @@ import java.util.Locale
  * The map's long-press menu: what the user can do with a chosen point.
  * Route is the primary action; Home/Work saves land in their slots (the
  * one place slots are set from, per the saved tab's redesign); Save
- * location appends a plain pin.
+ * location appends a plain pin; Open with… and Share hand the point to
+ * the rest of the device — and the menu is also the landing surface of an
+ * external geo: intent's coordinate target.
  */
 @Composable
 fun LocationMenuPanel(
     point: GeoPoint?,
+    label: String? = null,
     onDismiss: () -> Unit,
     onRoute: (GeoPoint) -> Unit,
     onSetSlot: (SavedSlot) -> Unit,
     onSave: () -> Unit,
+    onOpenWith: (GeoPoint) -> Unit = {},
+    onShare: (GeoPoint) -> Unit = {},
 ) {
     point ?: return
     Surface(
@@ -53,13 +60,14 @@ fun LocationMenuPanel(
         shadowElevation = 6.dp,
     ) {
         Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-            // The chosen point, as coordinates — the only identity the
+            // The chosen point: its geo-intent label when one came with the
+            // link, the raw coordinates otherwise — the only identity the
             // menu has until it is saved and named. Cancel is the way
             // out: the menu sits in the bottom stack, so a tap on the
             // map behind it does not reach a dismissal handler.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "%.5f, %.5f".format(Locale.US, point.lon, point.lat),
+                    label ?: "%.5f, %.5f".format(Locale.US, point.lon, point.lat),
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f),
                 )
@@ -77,6 +85,12 @@ fun LocationMenuPanel(
             }
             MenuRow("Save location", Icons.Filled.Place) {
                 onSave()
+            }
+            MenuRow("Open with…", Icons.Filled.OpenInNew) {
+                onOpenWith(point)
+            }
+            MenuRow("Share", Icons.Filled.Share) {
+                onShare(point)
             }
         }
     }

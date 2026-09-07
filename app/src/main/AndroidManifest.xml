@@ -36,6 +36,13 @@
          is untouched. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!-- Android Auto (phone projection): turn-by-turn runs on the library's
+         navigation templates (NavigationTemplate + NavigationManager), which
+         hosts require this permission for since car-app 1.3+. ACCESS_SURFACE
+         is deliberately absent — the car screen never draws into the host
+         surface, it only sends templates. -->
+    <uses-permission android:name="androidx.car.app.NAVIGATION_TEMPLATES" />
+
     <!-- Package visibility (Android 11+): without these the system's
          AppsFilter hides other apps' speech components from Atlas, and the
          TTS engine fails to bind even though it is installed and selected
@@ -48,7 +55,11 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
-        <!-- Voice search resolves recognizer activities by this action. -->
+        <!-- Voice search launches a recognizer ACTIVITY by this action
+             (RecognizeIntent), not the SpeechRecognizer service API — so
+             android.speech.RecognitionService is not queried: the service
+             binding path is never used and the activity query is what
+             makes the mic button's resolver work. -->
         <intent>
             <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
         </intent>
@@ -74,6 +85,19 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Geographic URIs from other apps (RFC 5870 + the q= z=
+                 extensions): another map app, a browser link, or an NFC tag
+                 can hand Atlas a coordinate or place to look up offline.
+                 The request is parsed by MapIntentParser and lands in the
+                 map state via ExternalMapIntentHandler (onCreate for a
+                 cold start, onNewIntent for the running activity — the
+                 singleTop launch mode means both must be handled). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="geo" />
+            </intent-filter>
         </activity>
 
         <!-- Bucket builds run in their own process: a builder OOM must never
@@ -92,10 +116,13 @@
             android:foregroundServiceType="location" />
 
         <!-- Android Auto (phone projection): advertises the CarAppService to
-             the Android Auto host. The DHU/head unit binds the service below. -->
+             the Android Auto host. The modern descriptor pattern — the host
+             reads res/xml/automotive_app_desc.xml (template support), not
+             the legacy value="true" flag. The DHU/head unit binds the
+             service below. -->
         <meta-data
             android:name="com.google.android.gms.car.application"
-            android:value="true" />
+            android:resource="@xml/automotive_app_desc" />
         <!-- Every shipping host speaks level >= 2; level 2 covers the
              MessageInfo-as-NavigationInfo variant used for the GPS-wait and
              Recalculating states (level 1 only has Step). -->

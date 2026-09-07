@@ -9,6 +9,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.danemadsen.atlas.AtlasApplication
 import com.danemadsen.atlas.data.ArchiveInfo
 import com.danemadsen.atlas.data.PmtilesRepository
+import com.danemadsen.atlas.intent.ExternalMapIntentHandler
+import com.danemadsen.atlas.intent.MapIntentRequest
+import com.danemadsen.atlas.intent.LocationIntentLauncher
 import com.danemadsen.atlas.routing.GeoPoint
 import com.danemadsen.atlas.routing.RouteProfile
 import com.danemadsen.atlas.routing.RouteResult
@@ -101,6 +104,17 @@ data class CameraSnapshot(
     val lat: Double,
     val zoom: Double,
     val bearing: Double,
+)
+
+/**
+ * The camera fly an external geo: intent asked for — coordinates plus the
+ * optional `z=` zoom. Null zoom falls back to the map's place-selection
+ * zoom (the fly is Atlas framing an intent target, like a drawer fly-to).
+ */
+data class IntentCameraTarget(
+    val lon: Double,
+    val lat: Double,
+    val zoom: Double?,
 )
 
 class AtlasViewModel(
@@ -230,9 +244,18 @@ class AtlasViewModel(
     private val _locationMenuPoint = MutableStateFlow<GeoPoint?>(null)
     val locationMenuPoint: StateFlow<GeoPoint?> = _locationMenuPoint.asStateFlow()
 
+    /**
+     * The long-press menu's optional title label — set when the point was
+     * chosen by an external geo: intent (`q=lat,lon(Label)`), null for a
+     * plain long-press (the coordinate text is the title then).
+     */
+    private val _locationMenuLabel = MutableStateFlow<String?>(null)
+    val locationMenuLabel: StateFlow<String?> = _locationMenuLabel.asStateFlow()
+
     /** The menu's tap-away/Cancel: clears the menu without side effects. */
     fun dismissLocationMenu() {
         _locationMenuPoint.value = null
+        _locationMenuLabel.value = null
     }
 
     /**
@@ -351,6 +374,70 @@ class AtlasViewModel(
         _selectedPlace.value = null
     }
 
+    /**
+     * The camera target an external geo: intent asked for — set by
+     * [onMapIntent], consumed by the map's fly and cleared by
+     * [onIntentCameraShown]. Null-safe across activity recreations: the
+     * request is never re-applied (the handler's seq dedup), and a target
+     * that outlives its activity waits for the next map composition.
+     */
+    private val _intentCamera = MutableStateFlow<IntentCameraTarget?>(null)
+    val intentCamera: StateFlow<IntentCameraTarget?> = _intentCamera.asStateFlow()
+
+    /** The map screen consumed the intent's camera fly. */
+    fun onIntentCameraShown() {
+        _intentCamera.value = null
+    }
+
+    /**
+     * The query an external geo: intent wants run through the offline
+     * index. One-shot like [intentCamera]: the search bar copies it into
+     * its own text field, the normal debounced search runs, done.
+     */
+    private val _pendingSearchQuery = MutableStateFlow<String?>(null)
+    val pendingSearchQuery: StateFlow<String?> = _pendingSearchQuery.asStateFlow()
+
+    /** The search bar consumed the intent's query. */
+    fun onPendingSearchQueryShown() {
+        _pendingSearchQuery.value = null
+    }
+
+    /**
+     * The single inlet for external map intents: one [ExternalMapIntentHandler.Event],
+     * one application to existing state —
+     *
+     * - a coordinate flies the camera and opens the long-press location
+     *   menu at the point (the label, when the URI carried one, becomes
+     *   the menu's title and the saved/share name);
+     * - a search query rides the normal offline search path.
+     *
+     * The seq dedups a replayed event (activity recreation re-delivers the
+     * handler's replay cache) without suppressing a genuine second open
+     * of the same geo: link.
+     */
+    fun onMapIntent(event: ExternalMapIntentHandler.Event) {
+        if (event.seq <= last_intent_seq) return
+        last_intent_seq = event.seq
+        ExternalMapIntentHandler.consumeReplay()
+        when (val request = event.request) {
+            is MapIntentRequest.Coordinate -> {
+                _intentCamera.value = IntentCameraTarget(
+                    lon = request.longitude,
+                    lat = request.latitude,
+                    zoom = request.zoom,
+                )
+                _locationMenuLabel.value = request.label
+                _locationMenuPoint.value = GeoPoint(request.latitude, request.longitude)
+            }
+            is MapIntentRequest.Search -> {
+                _pendingSearchQuery.value = request.query
+            }
+        }
+    }
+
+    /** Highest intent seq this VM has applied — the replay dedup bound. */
+    private var last_intent_seq = 0L
+
     /** Drawer row tap: fly the camera there. */
     fun selectPlace(place: PlaceHit) {
         _selectedPlace.value = place
@@ -359,6 +446,30 @@ class AtlasViewModel(
     /** Drawer row Route button: same flow as a long-press destination. */
     fun routeToPlace(place: PlaceHit) {
         requestRoute(GeoPoint(place.lon, place.lat))
+    }
+
+    /**
+     * The location menu's "Open with…": the long-press point (or the
+     * geo-intent target) offered to every installed geo: handler through
+     * the system chooser. A toast keeps the no-handler case honest.
+     */
+    fun openLocationWith(point: GeoPoint) {
+        val ok = LocationIntentLauncher.openWith(app, point.lat, point.lon)
+        if (!ok) toast("No other map app can open that location")
+    }
+
+    /**
+     * The location menu's "Share": the point (named when it came from a
+     * labeled geo: link) out through the Android Sharesheet as plain text.
+     */
+    fun shareLocation(point: GeoPoint) {
+        val ok = LocationIntentLauncher.share(
+            app,
+            _locationMenuLabel.value,
+            point.lat,
+            point.lon,
+        )
+        if (!ok) toast("Nothing can share that location")
     }
 
     /** Launches the background engine warmup (idempotent per archive). */
@@ -628,13 +739,14 @@ class AtlasViewModel(
         saveLocation(
             SavedLocation(
                 id = SavedLocationStore.newId(),
-                name = slot.defaultLabel(),
+                name = _locationMenuLabel.value ?: slot.defaultLabel(),
                 lon = point.lon,
                 lat = point.lat,
                 slot = slot,
             ),
         )
         _locationMenuPoint.value = null
+        _locationMenuLabel.value = null
         toast("Set as ${slot.defaultLabel()}")
     }
 
@@ -643,12 +755,13 @@ class AtlasViewModel(
         saveLocation(
             SavedLocation(
                 id = SavedLocationStore.newId(),
-                name = DEFAULT_PIN_NAME,
+                name = _locationMenuLabel.value ?: DEFAULT_PIN_NAME,
                 lon = point.lon,
                 lat = point.lat,
             ),
         )
         _locationMenuPoint.value = null
+        _locationMenuLabel.value = null
         toast("Location saved")
     }
 
