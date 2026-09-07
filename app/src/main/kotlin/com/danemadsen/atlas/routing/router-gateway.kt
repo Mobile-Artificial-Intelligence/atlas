@@ -2,10 +2,11 @@ package com.danemadsen.atlas.routing
 
 import android.content.Context
 import android.content.Intent
-import com.danemadsen.atlas.data.ArchiveStore
-import com.danemadsen.atlas.graph.FileMapSource
+import com.danemadsen.atlas.data.RegionInfo
+import com.danemadsen.atlas.data.RegionStore
 import com.danemadsen.atlas.graph.GraphBuildManager
 import com.danemadsen.atlas.graph.GraphPipeline
+import com.danemadsen.atlas.graph.MultiDirMapSource
 import com.danemadsen.atlas.services.GraphBuildService
 import com.danemadsen.atlas.beerouter.geo.Position
 import com.danemadsen.atlas.beerouter.router.OsmNodeNamed
@@ -37,6 +38,13 @@ import kotlin.math.hypot
  * routing graph when a route needs buckets that were never built — the
  * on-demand flow: a route request is what makes "prepare this region"
  * happen, a handful of 5° buckets at a time.
+ *
+ * Atlas installs any number of map regions side by side (see
+ * [RegionStore]); every region owns its own segment dir
+ * (`graph/segments/<regionId>/`) and its own archive. The engine still
+ * sees ONE map — [MultiDirMapSource] stitches the per-region dirs back
+ * into a single name-keyed view — and this gateway decides, per 5°
+ * bucket, WHICH region has to build it.
  */
 object RouterGateway {
 
@@ -69,33 +77,40 @@ object RouterGateway {
     private class IslandFailureException : Exception()
 
     /**
-     * The parsed profile contexts, one per [RouteProfile], reused for the
-     * process lifetime: profile compilation (and the classloading behind
-     * it) is a large part of a cold first route, and one process must
-     * never pay it twice — upstream BRouter's server reuses one context
-     * per profile across requests the same way. Reuse is safe because the
-     * engine resets its per-route state on every run that COMPLETES
-     * (waypoint matching pairs `setWaypoint` with `unsetWaypoint`), and a
-     * run that is CANCELLED mid-flight evicts the context below rather
-     * than leaving half-set state for the next route. The segments dir
-     * never moves and [FileMapSource] checks `exists()` at open time, so
-     * buckets built later are still found through the cached source.
+     * The parsed profile contexts, keyed by profile AND the installed
+     * region set: adding or removing a region must never reuse a context
+     * built over the old region set (its [MultiDirMapSource] would neither
+     * see the new region's buckets nor — worse — keep answering for a
+     * deleted one). Reuse is otherwise safe for the process lifetime:
+     * profile compilation (and the classloading behind it) is a large
+     * part of a cold first route, and one process must never pay it
+     * twice — upstream BRouter's server reuses one context per profile
+     * across requests the same way. The engine resets its per-route state
+     * on every run that COMPLETES (waypoint matching pairs `setWaypoint`
+     * with `unsetWaypoint`), and a run that is CANCELLED mid-flight
+     * evicts the context below rather than leaving half-set state for the
+     * next route. The region set only changes between routes (single
+     * engine thread), so the key is stable for a context's whole life.
      * Every engine pass runs on the single routing thread, so the map
      * needs no locking beyond its own.
      */
-    private val context_cache = ConcurrentHashMap<RouteProfile, RoutingContext>()
+    private val context_cache = ConcurrentHashMap<ContextKey, RoutingContext>()
 
-    /** The cached context for [profile], parsed on first use. */
+    /** The context-cache key: profile plus the sorted installed region ids. */
+    private data class ContextKey(val profile: RouteProfile, val regionIds: String)
+
+    /** The cached context for [key], parsed on first use. */
     private fun contextFor(
         profile: RouteProfile,
         profileContent: String,
         lookupContent: String,
-        segmentsDir: File,
-    ): RoutingContext = context_cache.computeIfAbsent(profile) {
+        mapSource: MultiDirMapSource,
+        key: ContextKey,
+    ): RoutingContext = context_cache.computeIfAbsent(key) {
         RoutingContext(
             profileContent = profileContent,
             lookupContent = lookupContent,
-            mapSource = FileMapSource(segmentsDir),
+            mapSource = mapSource,
             generateTurns = true,
         )
     }
@@ -127,7 +142,7 @@ object RouterGateway {
         val app_context = context.applicationContext
         val profile_content: String
         val lookup_content: String
-        val segments_dir: File
+        val regions: List<RegionInfo>
         withContext(Dispatchers.IO) {
             // The lookups content MUST be the one the buckets were built
             // with — read the extracted copy, not the asset, so both sides
@@ -136,17 +151,37 @@ object RouterGateway {
             profile_content = app_context.assets.open("profiles/${profile.assetName}")
                 .bufferedReader().use { it.readText() }
             lookup_content = File(profiles_dir, "lookups.dat").readText()
-            segments_dir = File(File(app_context.filesDir, "graph"), "segments")
+            regions = RegionStore.loadAll(app_context)
         }
+        // No installed region means no map to route on at all. The UI
+        // gates the drawer on MapReady, so this is a backstop, not the
+        // normal path.
+        if (regions.isEmpty()) throw RouteException(ROUTE_LEAVES)
 
-        val manager = managerFor(app_context)
+        // One engine-side map stitched from every region's segment dir.
+        // The dirs are created (not filtered to those that exist): a
+        // corridor bucket built MID-ROUTE lands in a dir that did not
+        // exist at route start, and the cached source must still find it
+        // — exists() is checked per open, so an empty dir is free and a
+        // later-built bucket is visible.
+        val region_dirs = regions.map { segmentsDir(app_context, it.id) }
+        withContext(Dispatchers.IO) { region_dirs.forEach { it.mkdirs() } }
+        val map_source = MultiDirMapSource(region_dirs)
+        val context_key = ContextKey(
+            profile,
+            regions.map { it.id }.sorted().joinToString(","),
+        )
+
+        val managers = withContext(Dispatchers.IO) {
+            regions.associate { it.id to managerFor(app_context, it) }
+        }
         // A replaced archive must not route over the previous archive's
         // graph: the wipe normally happens inside the :graph service, but
         // the service only runs when something needs building — a route
         // whose corridor the stale state already "covers" would read it
         // as built and silently steer over the old archive's roads (or
         // fail fast on its built-empty records).
-        withContext(Dispatchers.IO) { manager.wipeIfArchiveChanged() }
+        withContext(Dispatchers.IO) { managers.values.forEach { it.wipeIfArchiveChanged() } }
         val origin_bucket = GraphPipeline.bucketNameFor(origin.lon, origin.lat)
         val destination_bucket = GraphPipeline.bucketNameFor(destination.lon, destination.lat)
 
@@ -163,15 +198,15 @@ object RouterGateway {
         // built-empty (ocean, no routable ways) fails fast and friendly —
         // the engine can never match a waypoint inside such a bucket —
         // before minutes of corridor building.
-        var states = withContext(Dispatchers.IO) { manager.bucketStates() }
         for ((bucket, label) in listOf(origin_bucket to "origin", destination_bucket to "destination")) {
-            val recorded = states[bucket]
+            val recorded = recordedBucketState(app_context, regions, managers, bucket)
+            if (ownerRegion(bucket, regions) == null) throw RouteException(ROUTE_LEAVES)
             if (recorded != null && recorded.rd5 == null) {
                 throw RouteException("no road near the $label")
             }
         }
         val missing = (listOf(origin_bucket, destination_bucket) + corridor)
-            .filter { states[it] == null }
+            .filter { recordedBucketState(app_context, regions, managers, it) == null }
             .distinct()
         if (missing.size > MAX_BUCKET_BUILDS) {
             throw RouteException(
@@ -182,15 +217,20 @@ object RouterGateway {
         var builds = 0
         for (bucket in missing) {
             currentCoroutineContext().ensureActive()
+            // A bucket inside NO installed region can never be built: the
+            // route would leave the installed map regions.
+            val owner = ownerRegion(bucket, regions) ?: throw RouteException(ROUTE_LEAVES)
             builds++
             onPreparing(bucket)
-            ensureBucket(app_context, bucket)
+            ensureBucket(app_context, owner, bucket)
             onPreparing(null)
             // An empty waypoint bucket is an honest terminal failure —
             // without this check the engine would re-report the bucket as
             // missing forever (an empty bucket never produces an .rd5).
             if (bucket == origin_bucket || bucket == destination_bucket) {
-                val built = withContext(Dispatchers.IO) { manager.bucketState(bucket) }
+                val built = withContext(Dispatchers.IO) {
+                    managers.getValue(owner.id).bucketState(bucket)
+                }
                 if (built?.rd5 == null) {
                     throw RouteException(
                         "no road near the " +
@@ -212,7 +252,8 @@ object RouterGateway {
             try {
                 val result = enrichTurnNames(
                     app_context,
-                    calculate(profile, profile_content, lookup_content, segments_dir, origin, destination),
+                    regions,
+                    calculate(profile, profile_content, lookup_content, map_source, context_key, origin, destination),
                 )
                 // A route that succeeded is the best warmup recipe there
                 // is: its exact waypoint pair is known to match and to
@@ -237,16 +278,16 @@ object RouterGateway {
                     )
                 }
                 waypoint_neighbors_expanded = true
-                states = withContext(Dispatchers.IO) { manager.bucketStates() }
                 val neighbors = haloBuckets(setOf(origin_bucket, destination_bucket))
-                    .filter { states[it] == null }
+                    .filter { recordedBucketState(app_context, regions, managers, it) == null }
                 if (neighbors.isEmpty() || builds + neighbors.size > MAX_BUCKET_BUILDS) {
                     throw RouteException("no road near the origin or the destination")
                 }
                 builds += neighbors.size
                 for (bucket in neighbors) {
+                    val owner = ownerRegion(bucket, regions) ?: throw RouteException(ROUTE_LEAVES)
                     onPreparing(bucket)
-                    ensureBucket(app_context, bucket)
+                    ensureBucket(app_context, owner, bucket)
                     onPreparing(null)
                 }
             } catch (e: MissingBucketException) {
@@ -257,7 +298,10 @@ object RouterGateway {
                 // message, not a spin.
                 currentCoroutineContext().ensureActive()
                 if (!named_missing.add(e.bucket)) {
-                    val state = withContext(Dispatchers.IO) { manager.bucketState(e.bucket) }
+                    val owner = ownerRegion(e.bucket, regions)
+                    val state = owner?.let {
+                        withContext(Dispatchers.IO) { managers.getValue(it.id).bucketState(e.bucket) }
+                    }
                     throw RouteException(
                         if (state?.rd5 != null) {
                             "the routing data for ${e.bucket} is damaged — rebuild the routing data"
@@ -273,25 +317,34 @@ object RouterGateway {
                     )
                 }
                 builds++
+                val owner = ownerRegion(e.bucket, regions) ?: throw RouteException(ROUTE_LEAVES)
                 onPreparing(e.bucket)
-                ensureBucket(app_context, e.bucket)
+                ensureBucket(app_context, owner, e.bucket)
                 onPreparing(null)
             } catch (e: IslandFailureException) {
                 if (halo_expanded) {
                     throw RouteException("the destination is not reachable on this road network")
                 }
                 halo_expanded = true
-                states = withContext(Dispatchers.IO) { manager.bucketStates() }
+                // Halo buckets are optional growth, not required corridor:
+                // one outside every installed region is simply not
+                // buildable and cannot help the search, so it is skipped
+                // rather than failing the whole route on it.
                 val halo = haloBuckets((corridor + listOf(origin_bucket, destination_bucket)).toSet())
-                    .filter { states[it] == null }
+                    .filter {
+                        ownerRegion(it, regions) != null &&
+                            recordedBucketState(app_context, regions, managers, it) == null
+                    }
                 if (halo.isEmpty() || builds + halo.size > MAX_BUCKET_BUILDS) {
                     throw RouteException("the destination is not reachable on this road network")
                 }
                 builds += halo.size
                 for (bucket in halo) {
                     currentCoroutineContext().ensureActive()
+                    val owner = ownerRegion(bucket, regions)
+                        ?: throw RouteException(ROUTE_LEAVES)
                     onPreparing(bucket)
-                    ensureBucket(app_context, bucket)
+                    ensureBucket(app_context, owner, bucket)
                     onPreparing(null)
                 }
             }
@@ -402,11 +455,18 @@ object RouterGateway {
         try {
             val profiles_dir = GraphBuildCoordinator.ensureBuildAssets(app_context)
             val lookup_content: String
-            val segments_dir: File
+            val regions: List<RegionInfo>
             withContext(Dispatchers.IO) {
                 lookup_content = File(profiles_dir, "lookups.dat").readText()
-                segments_dir = File(File(app_context.filesDir, "graph"), "segments")
+                regions = RegionStore.loadAll(app_context)
             }
+            if (regions.isEmpty()) return
+            // Same rule as route(): every region's dir is in the source
+            // (created, not filtered), so a context warmed now keeps
+            // finding buckets built into it later.
+            val region_dirs = regions.map { segmentsDir(app_context, it.id) }
+            withContext(Dispatchers.IO) { region_dirs.forEach { it.mkdirs() } }
+            val map_source = MultiDirMapSource(region_dirs)
             val profile_contents = HashMap<RouteProfile, String>()
             for (profile in RouteProfile.entries) {
                 profile_contents[profile] = withContext(Dispatchers.IO) {
@@ -416,7 +476,16 @@ object RouterGateway {
                 // On the routing thread: the parse is engine work, and it
                 // must not race a live route on the same context cache.
                 withContext(engine_dispatcher) {
-                    contextFor(profile, profile_contents.getValue(profile), lookup_content, segments_dir)
+                    contextFor(
+                        profile,
+                        profile_contents.getValue(profile),
+                        lookup_content,
+                        map_source,
+                        ContextKey(
+                            profile,
+                            regions.map { it.id }.sorted().joinToString(","),
+                        ),
+                    )
                 }
             }
             // The warm route replays the last pair that actually routed
@@ -453,7 +522,11 @@ object RouterGateway {
                     saved_profile,
                     profile_contents.getValue(saved_profile),
                     lookup_content,
-                    segments_dir,
+                    map_source,
+                    ContextKey(
+                        saved_profile,
+                        regions.map { it.id }.sorted().joinToString(","),
+                    ),
                 )
                 try {
                     RoutingEngine(ctx).doRouting(listOf(
@@ -497,13 +570,53 @@ object RouterGateway {
             .apply()
     }
 
-    /** A fresh manager over the app's graph directories (read-only use here). */
-    private fun managerFor(context: Context): GraphBuildManager =
+    /**
+     * A fresh manager over ONE region's graph directories (read-only use
+     * here: state reads and the archive-changed wipe). [assetsDir] points
+     * at the extracted build assets so a manager that ever builds (none
+     * do on this path) uses the same lookups table the engine does.
+     */
+    private fun managerFor(context: Context, region: RegionInfo): GraphBuildManager =
         GraphBuildManager(
-            archiveFile = ArchiveStore.archiveFile(context),
-            segmentsDir = File(File(context.filesDir, "graph"), "segments"),
+            archiveFile = RegionStore.archiveFile(RegionStore.mapDir(context), region.id),
+            segmentsDir = segmentsDir(context, region.id),
             workRoot = File(context.cacheDir, "graph-work"),
+            assetsDir = File(context.filesDir, "profiles"),
         )
+
+    /** One region's segment dir: `graph/segments/<regionId>/`. */
+    private fun segmentsDir(context: Context, regionId: String): File =
+        File(File(File(context.filesDir, "graph"), "segments"), regionId)
+
+    /**
+     * The region that owns [bucket]'s build — resolved from the bucket's
+     * CENTER, which is always interior (the bucket grid is coarse enough
+     * that center-vs-edge ambiguity only matters for a region smaller
+     * than 5°, and the CI archives are whole Geofabrik extracts). Null
+     * when the bucket lies in no installed region: such a bucket is not
+     * buildable at all.
+     */
+    private fun ownerRegion(bucket: String, regions: List<RegionInfo>): RegionInfo? {
+        val center = bucketCenter(bucket)
+        return RegionStore.regionForPoint(regions, center.lon, center.lat)
+    }
+
+    /**
+     * The durable build-state record for [bucket] in its owning region's
+     * manager, or null when the bucket has no owner (not buildable) or
+     * was never built. The engine's "missing" notion is per-bucket, not
+     * per-region, so every caller funnels through here.
+     */
+    private suspend fun recordedBucketState(
+        context: Context,
+        regions: List<RegionInfo>,
+        managers: Map<String, GraphBuildManager>,
+        bucket: String,
+    ): GraphBuildManager.BucketState? {
+        val owner = ownerRegion(bucket, regions) ?: return null
+        val manager = managers.getValue(owner.id)
+        return withContext(Dispatchers.IO) { manager.bucketState(bucket) }
+    }
 
     /**
      * A point inside the named 5° bucket — the build service works from a
@@ -522,11 +635,12 @@ object RouterGateway {
         profile: RouteProfile,
         profileContent: String,
         lookupContent: String,
-        segmentsDir: File,
+        mapSource: MultiDirMapSource,
+        key: ContextKey,
         origin: GeoPoint,
         destination: GeoPoint,
     ): RouteResult = withContext(engine_dispatcher) {
-        val routing_context = contextFor(profile, profileContent, lookupContent, segmentsDir)
+        val routing_context = contextFor(profile, profileContent, lookupContent, mapSource, key)
         val track = try {
             RoutingEngine(routing_context).doRouting(listOf(
                 waypoint(origin, "from"),
@@ -636,17 +750,47 @@ object RouterGateway {
     }
 
     /**
-     * Fills the turns' street names from the archive's
-     * `transportation_name` layer — the engine's `wayTags` can never carry
-     * one (see [StreetNameResolver]). A name must never sink the route:
-     * any failure here keeps the engine's (nameless) turns as they were.
+     * Fills the turns' street names from the installed regions'
+     * `transportation_name` layers — the engine's `wayTags` can never
+     * carry one (see [StreetNameResolver]). A route can cross regions, so
+     * one [PmtilesReader] is opened per region the route's POINTS touch,
+     * and the resolver's tile lookup dispatches by which region actually
+     * holds the requested z14 tile (a tiny tile near a border can exist in
+     * either archive — both were cut from the same OSM data, so whichever
+     * has it wins). A name must never sink the route: any failure here
+     * keeps the engine's (nameless) turns as they were.
      */
-    private suspend fun enrichTurnNames(context: Context, result: RouteResult): RouteResult {
-        val archive = ArchiveStore.archiveFile(context)
+    private suspend fun enrichTurnNames(
+        context: Context,
+        regions: List<RegionInfo>,
+        result: RouteResult,
+    ): RouteResult {
         val turns = withContext(Dispatchers.IO) {
             runCatching {
-                PmtilesReader.open(archive.absolutePath).use { reader ->
-                    StreetNameResolver.resolveNames(reader, result.points, result.turns)
+                // One reader per region that holds route points; regions
+                // the route never enters contribute nothing and are not
+                // opened. Points outside every region (an off-by-one
+                // engine node) are simply skipped by the tile dispatch.
+                val by_id = regions.associateBy { it.id }
+                val readers = regions.mapNotNull { region ->
+                    val touches = result.points.any {
+                        RegionStore.insideRegion(region, it.lon, it.lat)
+                    }
+                    if (touches) {
+                        region.id to PmtilesReader.open(
+                            RegionStore.archiveFile(RegionStore.mapDir(context), region.id).absolutePath,
+                        )
+                    } else {
+                        null
+                    }
+                }
+                try {
+                    if (readers.isEmpty()) return@runCatching result.turns
+                    StreetNameResolver.resolveNames(result.points, result.turns) { x, y ->
+                        resolveTileAcrossRegions(readers, by_id, NAME_ZOOM, x, y)
+                    }
+                } finally {
+                    readers.forEach { runCatching { it.second.close() } }
                 }
             }.getOrElse { failure ->
                 android.util.Log.w(
@@ -660,6 +804,48 @@ object RouterGateway {
         if (turns === result.turns) return result
         return result.copy(turns = turns)
     }
+
+    /**
+     * The z14 tile at ([x], [y]) from the first region that could own it
+     * and has it. Ownership is tested on the tile's corners and center —
+     * a z14 tile spans ~0.02°, far smaller than any real region, so a
+     * five-point containment test is a complete intersection answer in
+     * practice; the final fallback (try every open reader) covers the
+     * pathological sliver case without ever returning a wrong null.
+     */
+    private fun resolveTileAcrossRegions(
+        readers: List<Pair<String, PmtilesReader>>,
+        by_id: Map<String, RegionInfo>,
+        zoom: Int,
+        x: Int,
+        y: Int,
+    ): ByteArray? {
+        val n = 1 shl zoom
+        val probe_lons = doubleArrayOf(
+            x * 360.0 / n - 180.0,
+            (x + 0.5) * 360.0 / n - 180.0,
+            (x + 1.0) * 360.0 / n - 180.0,
+        )
+        val probe_lats = doubleArrayOf(
+            tileLat(y.toDouble(), n),
+            tileLat(y + 0.5, n),
+            tileLat(y + 1.0, n),
+        )
+        val claims = readers.filter { (region_id, _) ->
+            val region = by_id.getValue(region_id)
+            probe_lons.any { lon -> probe_lats.any { lat -> RegionStore.insideRegion(region, lon, lat) } }
+        }
+        val candidates = if (claims.isEmpty()) readers else claims
+        for ((_, reader) in candidates) {
+            val bytes = reader.tile(zoom, x, y)
+            if (bytes != null) return bytes
+        }
+        return null
+    }
+
+    /** Inverse-Mercator latitude of a (possibly fractional) tile row. */
+    private fun tileLat(y: Double, n: Int): Double =
+        Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * y / n))))
 
     /**
      * The engine's voice hints, mapped to the UI's turn model. Hints index
@@ -714,21 +900,24 @@ object RouterGateway {
     }
 
     /**
-     * Starts the `:graph` build for [bucket] and suspends until it is
-     * durably built (or recorded built-empty). The service itself skips
-     * buckets already on disk, so this is cheap for prepared regions; the
-     * durable truth is `build-state.json` (via [GraphBuildManager]), not
-     * the status file — a status write can be a previous run's terminal
-     * state, while the state file only ever names buckets that finished.
+     * Starts the `:graph` build for [bucket] — owned by [region], whose id
+     * rides the intent so the `:graph` process builds against the right
+     * archive — and suspends until it is durably built (or recorded
+     * built-empty). The service itself skips buckets already on disk, so
+     * this is cheap for prepared regions; the durable truth is
+     * `build-state.json` (via [GraphBuildManager]), not the status file —
+     * a status write can be a previous run's terminal state, while the
+     * state file only ever names buckets that finished.
      */
-    private suspend fun ensureBucket(context: Context, bucket: String) {
+    private suspend fun ensureBucket(context: Context, region: RegionInfo, bucket: String) {
         val point = bucketCenter(bucket)
         val sent_at = System.currentTimeMillis()
-        val manager = managerFor(context)
+        val manager = managerFor(context, region)
         try {
             context.startForegroundService(
                 Intent(context, GraphBuildService::class.java)
                     .setAction(GraphBuildService.ACTION_BUILD_FOR_LOCATION)
+                    .putExtra(GraphBuildService.EXTRA_REGION_ID, region.id)
                     .putExtra(GraphBuildService.EXTRA_LON, point.lon)
                     .putExtra(GraphBuildService.EXTRA_LAT, point.lat)
             )
@@ -787,6 +976,7 @@ object RouterGateway {
     private fun waypoint(point: GeoPoint, name: String) =
         OsmNodeNamed(Position.fromDegrees(point.lon, point.lat)).apply { this.name = name }
 
+    private const val NAME_ZOOM = 14
     private const val BUILD_POLL_MS = 2_000L
     /** Mirrors graph-prep-flow's staleness budget for a dead :graph process. */
     private const val BUILD_STALE_MS = 90_000L
@@ -805,6 +995,9 @@ object RouterGateway {
     private const val CORRIDOR_SAMPLES_PER_DEGREE = 16
     /** Generously above the engine's ~±0.03° cross-edge match range. */
     private const val WAYPOINT_EDGE_MARGIN_DEG = 0.05
+
+    /** A required bucket no installed region can build — the honest terminal failure. */
+    private const val ROUTE_LEAVES = "this route leaves the installed map regions"
 
     /** The routing thread's stack: deep enough for path chains of ~10⁵ links. */
     private const val ENGINE_STACK_BYTES = 64L * 1024 * 1024

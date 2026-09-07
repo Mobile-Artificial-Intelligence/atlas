@@ -13,7 +13,8 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.danemadsen.atlas.data.ArchiveStore
+import com.danemadsen.atlas.data.RegionInfo
+import com.danemadsen.atlas.data.RegionStore
 import com.danemadsen.atlas.graph.GraphBuildManager
 import com.danemadsen.atlas.search.AddressEntity
 import com.danemadsen.atlas.search.PlaceDatabase
@@ -24,6 +25,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.SupervisorJob
@@ -68,7 +71,17 @@ class GraphBuildService : Service() {
 
     /** The run loop is serialized onto the main thread via this handler. */
     private val main_handler = Handler(Looper.getMainLooper())
-    private var managerRef: GraphBuildManager? = null
+
+    /**
+     * The live run's region id — what a routing `ACTION_CANCEL`/timeout
+     * must cancel (the manager instance whose in-memory cancel flag the
+     * build checks). Null for search runs and between manager calls;
+     * written only from [dispatch] on the run coroutine.
+     */
+    @Volatile private var currentRegionId: String? = null
+
+    /** The per-region manager cache — see [managerFor]. */
+    private val managers = java.util.concurrent.ConcurrentHashMap<String, GraphBuildManager>()
     private lateinit var wakeLock: PowerManager.WakeLock
 
     /**
@@ -128,14 +141,15 @@ class GraphBuildService : Service() {
                 startForegroundWith(buildNotification(KIND_ROUTING))
                 val lon = intent.getDoubleExtra(EXTRA_LON, Double.NaN)
                 val lat = intent.getDoubleExtra(EXTRA_LAT, Double.NaN)
-                if (lon.isNaN() || lat.isNaN()) {
+                val region_id = intent.getStringExtra(EXTRA_REGION_ID)
+                if (lon.isNaN() || lat.isNaN() || region_id == null) {
                     // A malformed request must never touch the status file
                     // while a run is live — a terminal write here would end
                     // the live build's banner mid-run.
                     if (runJob?.isActive == true) {
-                        Log.w(TAG, "bad location extras while a run is active; ignored: $intent")
+                        Log.w(TAG, "bad location/region extras while a run is active; ignored: $intent")
                     } else {
-                        fail("bad location extras in $intent")
+                        fail("bad location/region extras in $intent")
                     }
                 } else {
                     run(intent)
@@ -154,8 +168,9 @@ class GraphBuildService : Service() {
                     cancelRequested = true
                     // Only a routing run has a manager to cancel; arming the
                     // manager's flag with no manager run live would silently
-                    // swallow the NEXT routing build.
-                    if (currentKind == KIND_ROUTING) manager().cancel()
+                    // swallow the NEXT routing build. The cancel must reach
+                    // the manager of the region the run is currently in.
+                    if (currentKind == KIND_ROUTING) currentRegionId?.let { managerFor(it).cancel() }
                 } else {
                     // No run is late (typically a stale banner after process
                     // death): publish a clean terminal status instead of
@@ -367,33 +382,91 @@ class GraphBuildService : Service() {
         // so extracting `place`/`poi` rows on the way through costs one
         // extra decode per tile — not a second archive read.
         when (intent.action) {
-            ACTION_INDEX_SEARCH -> runSearchPass()
+            ACTION_INDEX_SEARCH -> {
+                val anchor = anchorFrom(intent)
+                runSearchPass(anchor)
+            }
             else -> {
-                val deep_pass = openDeepPass()
-                try {
-                    when (intent.action) {
-                        ACTION_BUILD_ALL -> manager().buildAll(deep_pass?.sink, ::reportProgress)
-                        else -> {
-                            val lon = intent.getDoubleExtra(EXTRA_LON, Double.NaN)
-                            val lat = intent.getDoubleExtra(EXTRA_LAT, Double.NaN)
-                            if (lon.isNaN() || lat.isNaN()) throw IllegalArgumentException("bad location extras in $intent")
-                            manager().ensureBucketsFor(lon, lat, deep_pass?.sink, ::reportProgress)
+                when (intent.action) {
+                    ACTION_BUILD_ALL -> buildAllRegions()
+                    else -> {
+                        val lon = intent.getDoubleExtra(EXTRA_LON, Double.NaN)
+                        val lat = intent.getDoubleExtra(EXTRA_LAT, Double.NaN)
+                        if (lon.isNaN() || lat.isNaN()) throw IllegalArgumentException("bad location extras in $intent")
+                        // A missing id is rejected in onStartCommand; an id
+                        // naming no installed region fails the run honestly
+                        // (the status file is the caller's only surface).
+                        val region_id = intent.getStringExtra(EXTRA_REGION_ID)
+                            ?: throw IllegalStateException("no region id in $intent")
+                        val region = withContext(Dispatchers.IO) {
+                            RegionStore.load(this@GraphBuildService, region_id)
+                        } ?: throw IllegalStateException("unknown region id '$region_id' in $intent")
+                        val deep_pass = openDeepPass(region)
+                        try {
+                            currentRegionId = region.id
+                            managerFor(region.id).ensureBucketsFor(lon, lat, deep_pass?.sink, ::reportProgress)
+                        } finally {
+                            // Also on failure/cancellation: an unclosed channel would hang
+                            // the drain and an unclosed DB would leak its handle for the
+                            // process's lifetime.
+                            deep_pass?.finish()
                         }
                     }
-                } finally {
-                    // Also on failure/cancellation: an unclosed channel would hang
-                    // the drain and an unclosed DB would leak its handle for the
-                    // process's lifetime.
-                    deep_pass?.finish()
                 }
             }
         }
-        // After a routing build, the search pass follows when the index is
-        // still missing — the service-side serialization of the user's
-        // "generate the search index after the routing data" order. A
-        // cancelled run drops the chain (the user's cancel is the last
+        // After a routing build, the search pass follows when ANY region
+        // still lacks its index — the service-side serialization of the
+        // user's "generate the search index after the routing data" order.
+        // A cancelled run drops the chain (the user's cancel is the last
         // word); the next app start re-triggers via init's check.
         chainSearchIndex()
+    }
+
+    /** The search anchor carried on the intent, or null when the extras are absent. */
+    private fun anchorFrom(intent: Intent): Pair<Double, Double>? {
+        val lon = intent.getDoubleExtra(EXTRA_ANCHOR_LON, Double.NaN)
+        val lat = intent.getDoubleExtra(EXTRA_ANCHOR_LAT, Double.NaN)
+        return if (lon.isNaN() || lat.isNaN()) null else lon to lat
+    }
+
+    /**
+     * "Prepare all" across every installed region: each region is built
+     * through its own manager (its own archive + segment dir), in import
+     * order, with the build progress ACCUMULATED across regions so the
+     * banner's built/total never resets mid-run.
+     */
+    private suspend fun buildAllRegions() {
+        val regions = withContext(Dispatchers.IO) { RegionStore.loadAll(this@GraphBuildService) }
+        if (regions.isEmpty()) return
+        var built_offset = 0
+        var total_offset = 0
+        for (region in regions) {
+            currentCoroutineContext().ensureActive()
+            val deep_pass = openDeepPass(region)
+            try {
+                currentRegionId = region.id
+                var region_total = 0
+                managerFor(region.id).buildAll(deep_pass?.sink) { progress ->
+                    // A region's own total is only known once its build
+                    // enumerates the buckets; fold each region's counts on
+                    // top of the finished regions' so the banner's built and
+                    // total only grow across the run.
+                    region_total = progress.total
+                    reportProgress(
+                        progress.copy(
+                            bucket = "${region.displayName}: ${progress.bucket}",
+                            built = built_offset + progress.built,
+                            total = total_offset + progress.total,
+                        ),
+                    )
+                }
+                built_offset += region_total
+                total_offset += region_total
+            } finally {
+                deep_pass?.finish()
+            }
+        }
     }
 
     /**
@@ -404,9 +477,11 @@ class GraphBuildService : Service() {
     private fun chainSearchIndex() {
         if (currentKind != KIND_ROUTING) return
         if (File(File(filesDir, "graph"), SEARCH_DISMISSED_FLAG).isFile) return
-        if (ArchiveStore.load(this) == null) return
-        val archive_file = ArchiveStore.archiveFile(this)
-        if (SearchCoordinator.indexExists(this, archive_file)) return
+        // Chain when ANY region still lacks its complete index — the chain
+        // is the search side's "everything is indexed" safety net, so one
+        // finished region must not mask a sibling that needs it.
+        val regions = RegionStore.loadAll(this)
+        if (regions.none { !SearchCoordinator.indexExists(this, it) }) return
         main_handler.post {
             if (runJob?.isActive == true && pendingIntent == null) {
                 pendingIntent = Intent(this, GraphBuildService::class.java)
@@ -422,35 +497,72 @@ class GraphBuildService : Service() {
      * surface and its flag-based cancel. Completes by writing the
      * completion marker; a cancel leaves a partial DB that the next run
      * resumes.
+     *
+     * Multi-region: every installed region is indexed — ordered
+     * nearest-first around [anchor] (when one exists) so the places near
+     * the user become searchable before the far side of the world — and
+     * each region's completion marker gates it out of the next run. The
+     * anchor is threaded into the indexer so the sweep itself is
+     * chunk-ordered nearest-first, and overall progress is composed from
+     * the per-region fractions: `(regionIndex + regionFraction) /
+     * regionCount`.
      */
-    private suspend fun runSearchPass() {
-        if (ArchiveStore.load(this) == null) return
-        val archive_file = ArchiveStore.archiveFile(this)
-        if (SearchCoordinator.indexExists(this, archive_file)) return
-        SearchCoordinator.buildCheapIndex(
-            this,
-            archive_file,
-            onProgress = { label, fraction -> reportSearchProgress(label, fraction) },
-            isCancelled = { cancelRequested },
-        )
+    private suspend fun runSearchPass(anchor: Pair<Double, Double>?) {
+        val regions = withContext(Dispatchers.IO) { RegionStore.loadAll(this@GraphBuildService) }
+        if (regions.isEmpty()) return
+        // Nearest-first: squared equirectangular distance from the anchor
+        // to the region center — the same normalization RegionStore uses
+        // for primaryRegion, so a dateline-straddling anchor stays sane.
+        // Without an anchor, import order (nearest-first to nothing is
+        // meaningless and import order matches the UI's region list).
+        val ordered = if (anchor == null) {
+            regions
+        } else {
+            regions.sortedBy { region ->
+                var dlon = (region.centerLon - anchor.first) % 360.0
+                if (dlon > 180.0) dlon -= 360.0
+                if (dlon < -180.0) dlon += 360.0
+                val dlat = region.centerLat - anchor.second
+                dlon * dlon + dlat * dlat
+            }
+        }
+        val region_count = ordered.size
+        for ((region_index, region) in ordered.withIndex()) {
+            currentCoroutineContext().ensureActive()
+            if (SearchCoordinator.indexExists(this, region)) continue
+            SearchCoordinator.buildCheapIndex(
+                this,
+                region,
+                anchor,
+                onProgress = { label, fraction ->
+                    // Compose the overall fraction: the finished regions'
+                    // full slices plus this region's own 0..1 progress. A
+                    // null per-region fraction (an indeterminate step) stays
+                    // null overall rather than regressing the bar.
+                    val overall = fraction?.let { f ->
+                        (region_index + f) / region_count
+                    }
+                    reportSearchProgress("${region.displayName}: $label", overall)
+                },
+                isCancelled = { cancelRequested },
+            )
+        }
     }
 
     /**
-     * The deep pass for this run, or null when search has nothing to write
-     * into yet (no index DB — a fresh install whose cheap pass has not
-     * run, or an archive whose indexes were wiped). When the cheap pass is
-     * still running concurrently, a deep row can win a place key first and
-     * the cheap row is then IGNOREd on the unique index — one slightly
-     * different representative point for that place, not a correctness
-     * issue.
+     * The deep pass for [region]'s run, or null when search has nothing to
+     * write into yet (no index DB for the region — a fresh install whose
+     * cheap pass has not run, or an archive whose indexes were wiped).
+     * When the cheap pass is still running concurrently, a deep row can
+     * win a place key first and the cheap row is then IGNOREd on the
+     * unique index — one slightly different representative point for that
+     * place, not a correctness issue.
      */
-    private fun openDeepPass(): DeepPass? {
-        if (ArchiveStore.load(this) == null) return null
-        val archive_file = ArchiveStore.archiveFile(this)
-        if (!SearchCoordinator.indexExists(this, archive_file)) return null
+    private fun openDeepPass(region: RegionInfo): DeepPass? {
+        if (!SearchCoordinator.indexExists(this, region)) return null
         val db = SearchCoordinator.openDatabase(
             this,
-            SearchCoordinator.databaseFor(this, archive_file),
+            SearchCoordinator.databaseFileFor(this, region),
         )
         val place_channel = Channel<PlaceEntity>(Channel.UNLIMITED)
         val address_channel = Channel<AddressEntity>(Channel.UNLIMITED)
@@ -530,20 +642,24 @@ class GraphBuildService : Service() {
     }
 
     /**
-     * One manager for the service's lifetime — `ACTION_CANCEL` must reach
-     * the same instance that is running, since cancellation is an in-memory
-     * flag. Paths are process-independent (same filesDir/cacheDir).
+     * One manager PER REGION, cached by region id for the service's
+     * lifetime — `ACTION_CANCEL` must reach the same instance that is
+     * running, since cancellation is an in-memory flag (the live run's
+     * region is tracked in [currentRegionId]). Paths are
+     * process-independent (same filesDir/cacheDir): the archive is the
+     * region's own `map/<id>/map.pmtiles` and the segments live in
+     * `graph/segments/<id>/`, so two regions never share state.
      */
-    private fun manager(): GraphBuildManager {
-        managerRef?.let { return it }
-        val segments = File(File(filesDir, "graph"), "segments").apply { mkdirs() }
+    private fun managerFor(regionId: String): GraphBuildManager {
+        managers[regionId]?.let { return it }
+        val segments = File(File(File(filesDir, "graph"), "segments"), regionId).apply { mkdirs() }
         val work = File(cacheDir, "graph-work").apply { mkdirs() }
         return GraphBuildManager(
-            archiveFile = File(File(filesDir, "map"), "atlas.pmtiles"),
+            archiveFile = RegionStore.archiveFile(RegionStore.mapDir(this), regionId),
             segmentsDir = segments,
             workRoot = work,
             assetsDir = File(filesDir, "profiles"),
-        ).also { managerRef = it }
+        ).also { managers[regionId] = it }
     }
 
     // ---- status + notification plumbing ----
@@ -683,7 +799,7 @@ class GraphBuildService : Service() {
         timedOut = true
         // Only the routing run owns a build the manager can cancel; a
         // search run's cancel flag is read directly in the sweep.
-        if (currentKind == KIND_ROUTING) manager().cancel()
+        if (currentKind == KIND_ROUTING) currentRegionId?.let { managerFor(it).cancel() }
         if (currentKind == KIND_SEARCH) cancelRequested = true
         scope.cancel()
         reportStatus(running = false, bucket = null, built = 0, total = 0, error = "build timed out")
@@ -847,6 +963,23 @@ class GraphBuildService : Service() {
         const val SEARCH_DISMISSED_FLAG = "search-dismissed.flag"
         const val EXTRA_LON = "lon"
         const val EXTRA_LAT = "lat"
+
+        /**
+         * The region a `BUILD_FOR_LOCATION` run must build against — the
+         * caller (RouterGateway's on-demand flow, the coordinator's
+         * location trigger) resolves the owning region first; the service
+         * never guesses.
+         */
+        const val EXTRA_REGION_ID = "regionId"
+
+        /**
+         * The search-index anchor (WP5): the last fix inside any installed
+         * region, computed once in the coordinator and threaded through to
+         * [SearchCoordinator.buildCheapIndex] so per-region sweeps run
+         * nearest-first. Absent extras mean "no anchor".
+         */
+        const val EXTRA_ANCHOR_LON = "anchorLon"
+        const val EXTRA_ANCHOR_LAT = "anchorLat"
 
         private const val TAG = "GraphBuildService"
         private const val CHANNEL_ID = "graph_build"

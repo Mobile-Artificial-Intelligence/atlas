@@ -2,6 +2,8 @@ package com.danemadsen.atlas.search
 
 import android.content.Context
 import androidx.room.Room
+import com.danemadsen.atlas.data.RegionInfo
+import com.danemadsen.atlas.data.RegionStore
 import com.danemadsen.atlas.graph.copyBounded
 import com.danemadsen.atlas.graph.stageZip
 import com.danemadsen.atlas.graph.usableAbove
@@ -16,13 +18,13 @@ import java.util.zip.ZipFile
 
 /**
  * The search side's counterpart of GraphBuildCoordinator: owns the index
- * database for the current archive, runs the import-time cheap pass, and
- * serves queries through a cached DB handle.
+ * databases for ALL installed regions, runs the import-time cheap pass,
+ * and serves queries through cached DB handles.
  *
- * The index DB lives under `filesDir/search/` keyed by the archive's
+ * Each index DB lives under `filesDir/search/` keyed by its region's
  * CONTENT fingerprint ([SearchIndexer.contentFingerprint] — the same
- * 127-header-bytes identity the routing manifest keys on); replacing the
- * archive deletes the stale DBs before the new index builds.
+ * 127-header-bytes identity the routing manifest keys on); every region's
+ * index is independent, so a query fans out over the regions and merges.
  */
 object SearchCoordinator {
 
@@ -33,8 +35,15 @@ object SearchCoordinator {
      */
     private val indexing = AtomicBoolean(false)
 
-    /** The open query DB, keyed by the archive fingerprint it was opened for. */
-    private var cached_db: Pair<String, PlaceDatabase>? = null
+    /**
+     * The open query DBs, keyed by the search fingerprint they were opened
+     * for — one per region whose index is being served. A region's entry
+     * is closed and dropped when its file is replaced (an adopt-swap) or
+     * deleted (stale cleanup, full wipe); a NEW fingerprint is simply a
+     * new entry, so adding a region never disturbs the other regions'
+     * open handles.
+     */
+    private val cached_dbs = HashMap<String, PlaceDatabase>()
 
     private const val ADOPT_SCRATCH_DIR = "adopt-scratch"
     private const val STAGED_ZIP_FILE = "staged.zip"
@@ -48,13 +57,12 @@ object SearchCoordinator {
 
     fun searchDir(context: Context): File = File(context.filesDir, "search")
 
-    fun fingerprintFor(archiveFile: File): String = SearchIndexer.contentFingerprint(archiveFile)
+    /** The index DB file for [region]'s current content fingerprint. */
+    fun databaseFileFor(context: Context, region: RegionInfo): File =
+        SearchIndexer.databaseFile(searchDir(context), region.searchFingerprint)
 
-    fun databaseFor(context: Context, archiveFile: File): File =
-        SearchIndexer.databaseFile(searchDir(context), fingerprintFor(archiveFile))
-
-    private fun completionFor(context: Context, archiveFile: File): File =
-        SearchIndexer.completionFile(searchDir(context), fingerprintFor(archiveFile))
+    private fun completionFileFor(context: Context, region: RegionInfo): File =
+        SearchIndexer.completionFile(searchDir(context), region.searchFingerprint)
 
     /**
      * The app's own Room builder — the one handle-creation path, and the
@@ -70,70 +78,83 @@ object SearchCoordinator {
         ).build()
 
     /**
-     * True only for a COMPLETE index: DB plus its completion marker. A
-     * cancelled or killed pass leaves a partial DB with no marker, which
-     * must count as "needs indexing" — the next launch re-runs the pass
-     * over it (inserts are idempotent on the unique keys).
+     * True only for a COMPLETE index for [region]: DB plus its completion
+     * marker. A cancelled or killed pass leaves a partial DB with no
+     * marker, which must count as "needs indexing" — the next launch
+     * re-runs the pass over it (inserts are idempotent on the unique
+     * keys).
      */
-    fun indexExists(context: Context, archiveFile: File): Boolean =
-        databaseFor(context, archiveFile).isFile && completionFor(context, archiveFile).isFile
+    fun indexExists(context: Context, region: RegionInfo): Boolean =
+        databaseFileFor(context, region).isFile && completionFileFor(context, region).isFile
 
     /**
-     * Deletes every index DB (a replaced archive must never read a stale
-     * one) and drops the cached open handle — it points at a deleted file.
+     * Deletes every index DB and marker (a Rebuild search must never read
+     * a stale one) and closes + drops every cached open handle — they all
+     * point at deleted files.
      */
     fun deleteIndexes(context: Context) {
-        cached_db?.second?.close()
-        cached_db = null
+        closeCachedDbs()
         SearchIndexer.deleteAll(searchDir(context))
     }
 
     /**
-     * Deletes index DBs, markers and any other file other than the current
-     * archive's (an index-format bump orphans the previous fingerprint's DB
-     * — GBs of dead disk). Only called while the current index is NOT
-     * complete, and a pass never runs concurrently with this call, so no
-     * pass can hold an about-to-be-deleted file open. The current archive's
-     * own files are kept: a partial DB is worth resuming, not deleting.
+     * Deletes index DBs, markers and any other file other than the
+     * installed regions' CURRENT index files (an index-format bump or a
+     * re-imported region orphans the previous fingerprint's DB — GBs of
+     * dead disk). The keep-set is computed from [RegionStore], so every
+     * installed region's DB + marker survive regardless of whether its
+     * index is complete yet (a partial DB is worth resuming, not
+     * deleting); anything else goes. Only called while no pass is running,
+     * so no pass can hold an about-to-be-deleted file open.
      */
-    fun deleteStaleIndexes(context: Context, archiveFile: File) {
-        val current_db = databaseFor(context, archiveFile).name
-        val current_marker = completionFor(context, archiveFile).name
+    fun deleteStaleIndexes(context: Context) {
+        val keep = RegionStore.loadAll(context)
+            .flatMap { listOf(databaseFileFor(context, it).name, completionFileFor(context, it).name) }
+            .toSet()
+        dropCachedDbsExcept(keep)
         searchDir(context).listFiles()?.forEach { file ->
-            if (file.name != current_db && file.name != current_marker) file.delete()
+            if (file.name !in keep) file.delete()
         }
     }
 
-    private fun indexerFor(context: Context, archiveFile: File): SearchIndexer =
-        SearchIndexer(databaseFor(context, archiveFile)) { file ->
+    private fun indexerFor(context: Context, region: RegionInfo): SearchIndexer =
+        SearchIndexer(databaseFileFor(context, region)) { file ->
             openDatabase(context, file)
         }
 
     /**
-     * The full index pass over the archive — places (zooms 0-9, tens of
+     * The full index pass over ONE region — places (zooms 0-9, tens of
      * seconds) and, when the archive carries the merged address layer, the
-     * z14 address sweep. Runs in the `:graph` service; null when another
-     * pass is already running (the coordinator's single-flight lock).
+     * z14 address sweep. Runs in the `:graph` service per region; null
+     * when another pass is already running (the coordinator's
+     * single-flight lock).
      *
      * [onProgress] and [isCancelled] ride [SearchIndexer.indexCheapPass] —
      * the service's status file and its flag-based cancel both hang off
-     * them.
+     * them. [anchorLonLat] (`lon to lat`) orders the sweep nearest-first
+     * around the anchor so nearby addresses become searchable first; null
+     * keeps plain order.
      */
     suspend fun buildCheapIndex(
         context: Context,
-        archiveFile: File,
+        region: RegionInfo,
+        anchorLonLat: Pair<Double, Double>? = null,
         onProgress: (label: String, fraction: Float?) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): SearchIndexer.PassResult? {
         if (!indexing.compareAndSet(false, true)) return null
         try {
             // An incomplete current index (partial DB, no marker) resumes;
-            // an index-format bump orphans the previous fingerprint's DB —
-            // GBs of dead disk — cleaned up while no pass holds it open.
-            if (!indexExists(context, archiveFile)) deleteStaleIndexes(context, archiveFile)
-            val indexer = indexerFor(context, archiveFile)
-            PmtilesReader(archiveFile.absolutePath).use { reader ->
-                return indexer.indexCheapPass(reader, onProgress, isCancelled)
+            // an index-format bump or a re-imported region orphans the
+            // previous fingerprint's DB — GBs of dead disk — cleaned up
+            // while no pass holds it open (the keep-set spans all regions,
+            // so sibling regions' indexes are never touched).
+            if (!indexExists(context, region)) deleteStaleIndexes(context)
+            val indexer = indexerFor(context, region)
+            PmtilesReader(
+                RegionStore.archiveFile(RegionStore.mapDir(context), region.id).absolutePath,
+            ).use { reader ->
+                return indexer.indexCheapPass(reader, anchorLonLat, onProgress, isCancelled)
             }
         } finally {
             indexing.set(false)
@@ -141,7 +162,11 @@ object SearchCoordinator {
     }
 
     /**
-     * Top hits for [query] around the center; empty without an index.
+     * Top hits for [query] around the center, across EVERY installed
+     * region. One PlaceDatabase handle per region whose DB file exists is
+     * opened (cached per fingerprint; see [cached_dbs]) and queried via
+     * [searchPlacesMulti], which applies the single rank-then-distance
+     * ordering across all regions.
      *
      * Serves from a PARTIAL index too: stage 1's place rows commit before
      * the address sweep starts (its own doc contract), so search works
@@ -151,23 +176,60 @@ object SearchCoordinator {
      */
     suspend fun search(
         context: Context,
-        archiveFile: File,
-        query: String,
+        rawQuery: String,
         centerLon: Double,
         centerLat: Double,
     ): List<PlaceHit> {
-        if (!databaseFor(context, archiveFile).isFile) return emptyList()
-        return searchPlaces(queryDb(context, archiveFile), query, centerLon, centerLat)
+        val regions = withContext(Dispatchers.IO) { RegionStore.loadAll(context) }
+        // Per-region gate: the DB FILE exists, not the completion marker —
+        // a mid-build index serves its committed stage-1 rows (see above).
+        val dbs = regions.filter { databaseFileFor(context, it).isFile }
+            .map { queryDb(context, it) }
+        return searchPlacesMulti(dbs, rawQuery, centerLon, centerLat)
     }
 
-    private suspend fun queryDb(context: Context, archiveFile: File): PlaceDatabase {
-        val fingerprint = fingerprintFor(archiveFile)
-        cached_db?.takeIf { it.first == fingerprint }?.let { return it.second }
-        cached_db?.second?.close()
-        cached_db = null
-        val db = indexerFor(context, archiveFile).open()
-        cached_db = fingerprint to db
-        return db
+    /** The cached (or freshly opened) query handle for [region]'s fingerprint. */
+    private fun queryDb(context: Context, region: RegionInfo): PlaceDatabase {
+        val fingerprint = region.searchFingerprint
+        synchronized(cached_dbs) {
+            cached_dbs[fingerprint]?.let { return it }
+        }
+        val db = indexerFor(context, region).open()
+        synchronized(cached_dbs) {
+            // A racing close may have dropped the entry while this handle
+            // was being opened; either way exactly one handle is cached —
+            // a second open of the same file would leak one.
+            cached_dbs[fingerprint]?.let { existing ->
+                db.close()
+                return existing
+            }
+            cached_dbs[fingerprint] = db
+            return db
+        }
+    }
+
+    /** Closes and drops every cached query handle. */
+    private fun closeCachedDbs() {
+        synchronized(cached_dbs) {
+            val handles = cached_dbs.values.toList()
+            cached_dbs.clear()
+            for (db in handles) runCatching { db.close() }
+        }
+    }
+
+    /**
+     * Closes and drops every cached query handle EXCEPT [keep]'s — used
+     * when files are about to be replaced or deleted; a kept handle still
+     * points at its (surviving) file.
+     */
+    private fun dropCachedDbsExcept(keep: Set<String>) {
+        synchronized(cached_dbs) {
+            val dropped = cached_dbs.entries.filter { it.key !in keep }
+            for (entry in dropped) {
+                runCatching { entry.value.close() }
+                cached_dbs.remove(entry.key)
+            }
+        }
     }
 
     // ---- prebuilt index adoption (the search counterpart of
@@ -181,16 +243,17 @@ object SearchCoordinator {
 
     /**
      * Installs a CI-minted search index (the `atlas-search-<country>`
-     * artifact from the same build as the installed archive): search then
-     * works immediately instead of after the minutes-to-hours on-device
-     * build. Throws with a user-presentable message when the file is not
-     * a usable Atlas search index for THIS archive.
+     * artifact from the same build as [region]'s archive) for [region]:
+     * search then works immediately instead of after the minutes-to-hours
+     * on-device build. Throws with a user-presentable message when the
+     * file is not a usable Atlas search index for THIS region.
      *
      * Same hardening as the routing adoption, adapted to two files:
-     * - The manifest gate: the fingerprint must match this archive's
-     *   [content fingerprint][fingerprintFor] — a daily-rebuilt archive and
-     *   yesterday's index must not mix, and the check turns the mismatch
-     *   into an actionable refusal instead of a silently-wrong search.
+     * - The manifest gate: the fingerprint must match [region]'s
+     *   [content fingerprint][RegionInfo.searchFingerprint] — a
+     *   daily-rebuilt archive and yesterday's index must not mix, and the
+     *   check turns the mismatch into an actionable refusal instead of a
+     *   silently-wrong search.
      * - Bounded extraction: the manifest and marker read under small byte
      *   caps, the DB streams to a scratch dir under a gigabytes-scale
      *   cap, with a free-space floor before the stream starts — a crafted
@@ -206,7 +269,7 @@ object SearchCoordinator {
      */
     suspend fun adoptPrebuiltIndex(
         context: Context,
-        archiveFile: File,
+        region: RegionInfo,
         zip: InputStream,
     ): IndexAdoption = withContext(Dispatchers.IO) {
         // The same write lock as the cheap pass: an adopt must not race a
@@ -301,7 +364,7 @@ object SearchCoordinator {
                 val index_manifest = manifest
                     ?: error("the search index file has no manifest — re-download the search " +
                         "index and the map archive from the same build, then install both")
-                require(index_manifest.archiveFingerprint == fingerprintFor(archiveFile)) {
+                require(index_manifest.archiveFingerprint == region.searchFingerprint) {
                     "this search index was built from a different map archive — use the " +
                         "search index from the same download as your map archive"
                 }
@@ -317,7 +380,7 @@ object SearchCoordinator {
                 val name = db_name
                     ?: error("the search index file contains no search index — wrong file?")
                 val db_fingerprint = name.removePrefix("search-").removeSuffix(".db")
-                require(db_fingerprint == fingerprintFor(archiveFile)) {
+                require(db_fingerprint == region.searchFingerprint) {
                     "the search index inside the file was built from a different map " +
                         "archive — use the search index from the same download as your map archive"
                 }
@@ -344,12 +407,14 @@ object SearchCoordinator {
                         "re-download the search index and try again"
                 }
 
-                // Commit. The cached query handle points at whatever the
-                // search dir held before; drop it first — it may be the
-                // file the rename is about to replace.
-                cached_db?.second?.close()
-                cached_db = null
-                val live_db = databaseFor(context, archiveFile)
+                // Commit. The cached query handle for THIS region points at
+                // whatever the search dir held before; drop it first — it
+                // may be the file the rename is about to replace. Handles
+                // for OTHER regions are untouched: their files are not.
+                dropCachedDbsExcept(
+                    keptHandles(RegionStore.loadAll(context)) - region.searchFingerprint,
+                )
+                val live_db = databaseFileFor(context, region)
                 val tmp_db = File(search_dir, "${live_db.name}$TMP_SUFFIX")
                 scratch_db.copyTo(tmp_db, overwrite = true)
                 if (!tmp_db.renameTo(live_db)) {
@@ -357,7 +422,7 @@ object SearchCoordinator {
                     check(tmp_db.renameTo(live_db)) { "could not install the search index database" }
                 }
                 // The marker LAST: complete only once the DB has landed.
-                val live_marker = completionFor(context, archiveFile)
+                val live_marker = completionFileFor(context, region)
                 val tmp_marker = File(search_dir, "${live_marker.name}$TMP_SUFFIX")
                 tmp_marker.writeText("")
                 if (!tmp_marker.renameTo(live_marker)) {
@@ -370,9 +435,10 @@ object SearchCoordinator {
                 // handle still points at the unlinked old inode — it would
                 // serve stale results forever. The commit above replaced
                 // the file; this replaces the app's view of it.
-                cached_db?.second?.close()
-                cached_db = null
-                deleteStaleIndexes(context, archiveFile)
+                dropCachedDbsExcept(
+                    keptHandles(RegionStore.loadAll(context)) - region.searchFingerprint,
+                )
+                deleteStaleIndexes(context)
                 IndexAdoption(places, addresses)
             } finally {
                 scratch.deleteRecursively()
@@ -381,4 +447,8 @@ object SearchCoordinator {
             indexing.set(false)
         }
     }
+
+    /** The fingerprints whose DB+marker files survive [deleteStaleIndexes]. */
+    private fun keptHandles(regions: List<RegionInfo>): Set<String> =
+        regions.map { it.searchFingerprint }.toSet()
 }

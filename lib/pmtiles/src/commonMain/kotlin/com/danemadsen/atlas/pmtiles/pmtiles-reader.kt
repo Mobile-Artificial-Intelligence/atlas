@@ -98,6 +98,99 @@ class PmtilesReader(
         )
     }
 
+    /**
+     * [forEachTileInBounds], chunked and ordered by distance from [anchorLonLat]
+     * (as `lon to lat`): the tile raster splits into [chunkTiles]²-tile chunks,
+     * each walked with the same inner loop, chunks visited nearest-first.
+     * Addresses near the anchor become searchable long before a continental
+     * sweep reaches their side of the map.
+     *
+     * [anchorLonLat] null keeps the plain column-major order. Every tile is
+     * visited exactly once either way, and [onCellsProbed] reports cumulative
+     * cells against the FULL grid total, so progress stays monotonic and honest
+     * regardless of visit order. The callback must not suspend or throw.
+     */
+    fun forEachTileChunkInBounds(
+        zoom: Int,
+        bounds: TileBounds,
+        anchorLonLat: Pair<Double, Double>?,
+        chunkTiles: Int = CHUNK_TILES,
+        onCellsProbed: ((probed: Long, total: Long) -> Unit)? = null,
+        visitor: (z: Int, x: Int, y: Int, bytes: ByteArray) -> Unit,
+    ) {
+        val (minX, minY, maxX, maxY) = tileRange(zoom, bounds)
+        val cols = maxX - minX + 1
+        val rows = maxY - minY + 1
+        val total = cols.toLong() * rows
+        val chunk_w = chunkTiles.coerceAtLeast(1)
+        val chunks = buildList {
+            var cy = 0
+            while (cy * chunk_w < rows) {
+                var cx = 0
+                while (cx * chunk_w < cols) {
+                    val x0 = minX + cx * chunk_w
+                    val y0 = minY + cy * chunk_w
+                    add(
+                        Chunk(
+                            zoom = zoom,
+                            x0 = x0,
+                            x1 = minOf(x0 + chunk_w - 1, maxX),
+                            y0 = y0,
+                            y1 = minOf(y0 + chunk_w - 1, maxY),
+                        ),
+                    )
+                    cx++
+                }
+                cy++
+            }
+        }
+        // No anchor: keep the plain sweep's (x-major, then y) order so the
+        // chunked walk degenerates to forEachTileInBounds' visit order.
+        val ordered = if (anchorLonLat == null) {
+            chunks.sortedWith(compareBy({ it.x0 }, { it.y0 }))
+        } else {
+            val cos_lat = Math.cos(Math.toRadians(anchorLonLat.second))
+            chunks.sortedBy { chunk ->
+                val (clon, clat) = chunkCenter(chunk)
+                val dlon = shortestLonDelta(anchorLonLat.first, clon) * cos_lat
+                val dlat = anchorLonLat.second - clat
+                dlon * dlon + dlat * dlat
+            }
+        }
+        var probed = 0L
+        for (chunk in ordered) {
+            for (x in chunk.x0..chunk.x1) {
+                for (y in chunk.y0..chunk.y1) {
+                    probed++
+                    if (onCellsProbed != null && probed % PROBE_PROGRESS_EVERY == 0L) {
+                        onCellsProbed(probed, total)
+                    }
+                    val bytes = tile(zoom, x, y) ?: continue
+                    visitor(zoom, x, y, bytes)
+                }
+            }
+        }
+    }
+
+    /** Chunk-center WGS84 position, from the chunk's own tile coordinates. */
+    private fun chunkCenter(chunk: Chunk): Pair<Double, Double> {
+        val n = 1 shl chunk.zoom
+        val center_x = (chunk.x0 + chunk.x1 + 1) / 2.0
+        val center_y = (chunk.y0 + chunk.y1 + 1) / 2.0
+        val lon = center_x / n * 360.0 - 180.0
+        val lat = Math.toDegrees(Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * center_y / n))))
+        return lon to lat
+    }
+
+    /** A rectangular sub-raster of the bounds' tile grid at one zoom. */
+    private class Chunk(
+        val zoom: Int,
+        val x0: Int,
+        val x1: Int,
+        val y0: Int,
+        val y1: Int,
+    )
+
     private fun findTileEntry(z: Int, x: Int, y: Int): PmtilesEntry? {
         val tileId = HilbertTileId.tileId(z, x, y)
         var directory = rootDirectory
@@ -138,7 +231,24 @@ class PmtilesReader(
 
     override fun close() = file.close()
 
+    /** Longitudinal delta from [a] to [b] folded into (-180, 180], so
+     *  distance comparisons work across the antimeridian. */
+    private fun shortestLonDelta(a: Double, b: Double): Double {
+        val delta = (b - a) % 360.0
+        return when {
+            delta > 180.0 -> delta - 360.0
+            delta <= -180.0 -> delta + 360.0
+            else -> delta
+        }
+    }
+
     companion object {
+        /** Side length (in tiles) of the chunk raster used by
+         * [forEachTileChunkInBounds] — 64² tiles is small enough that the
+         * nearest chunk starts streaming addresses within seconds, large
+         * enough that chunk sorting overhead is negligible. */
+        const val CHUNK_TILES = 64
+
         private const val LEAF_CACHE_LIMIT = 64
         private const val PROBE_PROGRESS_EVERY = 4096L
 

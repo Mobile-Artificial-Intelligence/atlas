@@ -272,6 +272,93 @@ class PmtilesReaderTest {
             maxY = PmtilesReader.latToTileY(bounds.south, zoom),
         )
 
+    // ---- chunk-ordered sweep (forEachTileChunkInBounds) ----
+
+    /** A 3x3 raster at z2 (tiles x 0..2, y 0..2), every tile present. */
+    private fun buildNineTileArchive(): ByteArray = buildArchive(
+        buildMap {
+            for (x in 0..2) for (y in 0..2) {
+                put(HilbertTileId.tileId(2, x, y), "tile-$x-$y".toByteArray())
+            }
+        },
+    )
+
+    /** The z2 bounds whose tileRange is exactly the 3x3 raster above. */
+    private val NINE_TILE_BOUNDS = TileBounds(-180.0, 0.0, 45.0, 85.0)
+
+    @Test
+    fun chunkSweepWithoutAnchorEqualsBoundsOrder() {
+        val reader = openReader(buildNineTileArchive())
+        reader.use {
+            val plain = ArrayList<Pair<Int, Int>>()
+            it.forEachTileInBounds(2, NINE_TILE_BOUNDS) { _, x, y, _ -> plain.add(x to y) }
+            val chunked = ArrayList<Pair<Int, Int>>()
+            it.forEachTileChunkInBounds(2, NINE_TILE_BOUNDS, null, chunkTiles = 1) { _, x, y, _ ->
+                chunked.add(x to y)
+            }
+            assertEquals(plain, chunked)
+            assertEquals(9, plain.size)
+        }
+    }
+
+    @Test
+    fun chunkSweepVisitsEveryTileExactlyOnceNearestFirst() {
+        val reader = openReader(buildNineTileArchive())
+        reader.use {
+            val visited = ArrayList<Pair<Int, Int>>()
+            it.forEachTileChunkInBounds(2, NINE_TILE_BOUNDS, 40.0 to -60.0, chunkTiles = 1) { _, x, y, _ ->
+                visited.add(x to y)
+            }
+            // Every grid cell exactly once…
+            assertEquals(9, visited.size)
+            assertEquals(9, visited.toSet().size)
+            // …in ascending equirectangular distance from the anchor. The
+            // expected order is hand-derived from the chunk-center formula
+            // (tile centers x: -135/-45/45, y: 84.4/41.0/-41.0; anchor
+            // 40,-60; longitude scaled by cos(60°) = 0.5) — an independent
+            // spec.
+            assertEquals(
+                listOf(
+                    2 to 2, // 368
+                    1 to 2, // 2168
+                    0 to 2, // 8018
+                    2 to 1, // 10203
+                    1 to 1, // 12003
+                    0 to 1, // 17853
+                    2 to 0, // 20857
+                    1 to 0, // 22657
+                    0 to 0, // 28507
+                ),
+                visited,
+            )
+        }
+    }
+
+    @Test
+    fun chunkSweepProgressReportsTheFullRasterTotal() {
+        // A one-tile archive, but a whole-world z6 raster: 64x64 = 4096
+        // cells, so the probe callback fires exactly once, at the end, with
+        // the full total — progress is cumulative against the grid, never
+        // per-chunk, and the sweep visits all 4096 cells even though none
+        // of them holds a tile.
+        val reader = openReader(
+            buildArchive(mapOf(HilbertTileId.tileId(0, 0, 0) to "t".toByteArray())),
+        )
+        reader.use {
+            val reports = ArrayList<Pair<Long, Long>>()
+            var visited = 0
+            it.forEachTileChunkInBounds(
+                6,
+                TileBounds(-180.0, -85.05112878, 180.0, 85.05112878),
+                0.0 to 0.0,
+                chunkTiles = 8,
+                onCellsProbed = { probed, total -> reports.add(probed to total) },
+            ) { _, _, _, _ -> visited++ }
+            assertEquals(listOf(4096L to 4096L), reports)
+            assertEquals(0, visited)
+        }
+    }
+
     // ---- integration: the dev corpus (skipped when absent) ----
 
     @Test

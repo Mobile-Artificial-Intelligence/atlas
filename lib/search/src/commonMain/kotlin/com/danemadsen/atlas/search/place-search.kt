@@ -36,16 +36,41 @@ suspend fun searchPlaces(
     centerLon: Double,
     centerLat: Double,
     limit: Int = RESULT_LIMIT,
+): List<PlaceHit> = searchPlacesMulti(
+    dbs = listOf(db),
+    rawQuery = rawQuery,
+    centerLon = centerLon,
+    centerLat = centerLat,
+    limit = limit,
+)
+
+/**
+ * [searchPlaces] over several installed regions' indexes: every DB runs the
+ * same per-DB query (the SQL pre-order and [HARD_LIMIT] window are per-DB, so
+ * each region's best candidates survive), results merge under the single
+ * rank-then-distance ordering, and the top [limit] win. A region whose DB is
+ * mid-build (partial rows) simply contributes what it has — search during
+ * indexing already works per DB.
+ */
+suspend fun searchPlacesMulti(
+    dbs: List<PlaceDatabase>,
+    rawQuery: String,
+    centerLon: Double,
+    centerLat: Double,
+    limit: Int = RESULT_LIMIT,
 ): List<PlaceHit> = withContext(Dispatchers.IO) {
+    if (dbs.isEmpty()) return@withContext emptyList()
     val pattern = ftsPattern(rawQuery) ?: return@withContext emptyList()
-    val candidates = db.placeDao().match(pattern, centerLon, centerLat, HARD_LIMIT).map {
-        PlaceHit(it.name, it.kind, it.subclass, it.rank, it.lon, it.lat)
-    } + if (isAddressQuery(rawQuery)) {
-        db.addressDao().match(pattern, centerLon, centerLat, ADDRESS_HARD_LIMIT).map {
-            PlaceHit(it.name, SearchIndexer.KIND_ADDRESS, it.city, SearchIndexer.ADDRESS_RANK, it.lon, it.lat)
+    val candidates = dbs.flatMap { db ->
+        db.placeDao().match(pattern, centerLon, centerLat, HARD_LIMIT).map {
+            PlaceHit(it.name, it.kind, it.subclass, it.rank, it.lon, it.lat)
+        } + if (isAddressQuery(rawQuery)) {
+            db.addressDao().match(pattern, centerLon, centerLat, ADDRESS_HARD_LIMIT).map {
+                PlaceHit(it.name, SearchIndexer.KIND_ADDRESS, it.city, SearchIndexer.ADDRESS_RANK, it.lon, it.lat)
+            }
+        } else {
+            emptyList()
         }
-    } else {
-        emptyList()
     }
     candidates
         .sortedWith(

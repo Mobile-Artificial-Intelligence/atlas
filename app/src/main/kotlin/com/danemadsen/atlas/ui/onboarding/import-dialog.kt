@@ -46,41 +46,45 @@ import com.danemadsen.atlas.ui.ImportStage
 /**
  * First-launch flow: pick the files Atlas runs from, then watch them land.
  *
- * Three files come from the same download (`.pmtiles`, the routing ZIP and
- * the search index have no registered MIME types, so every picker accepts
- * all files): the map archive is what Atlas is; the routing and search files
- * are the prebuilt counterparts of background builds that otherwise take
- * ~30 minutes per region and minutes-to-hours respectively on this device.
- * Each is its own row — seen, considered, and only then skipped.
+ * The rows are MULTI-select: any number of map archives can land in one
+ * import (each becomes its own region — `us-georgia`, `us-colorado`, …),
+ * and any number of routing/search ZIPs alongside them. Atlas matches each
+ * routing/search ZIP to the map archive it was built from automatically —
+ * by fingerprint, not pick order — and skips a ZIP that pairs with no
+ * selected archive.
  *
  * The import itself renders as a stage checklist: what is done, what is
  * running, what is next — a several-GB copy otherwise looks frozen behind
- * a bare spinner.
+ * a bare spinner. The running row names the file it is working on.
  */
 @Composable
 fun ImportArchiveFlow(
     state: AtlasUiState,
-    onImport: (archive: android.net.Uri, routingData: android.net.Uri?, searchData: android.net.Uri?) -> Unit,
+    onImport: (
+        archives: List<android.net.Uri>,
+        routingZips: List<android.net.Uri>,
+        searchZips: List<android.net.Uri>,
+    ) -> Unit,
     onRetry: () -> Unit,
 ) {
     // Picked-but-not-yet-imported files: the dialog is a staged choice,
     // not a one-tap import, so the optional rows can be considered before
     // anything is copied. The picks survive into the Importing checklist —
     // it needs them to know which stages the user actually asked for.
-    var picked_archive by remember { mutableStateOf<android.net.Uri?>(null) }
-    var picked_routing by remember { mutableStateOf<android.net.Uri?>(null) }
-    var picked_search by remember { mutableStateOf<android.net.Uri?>(null) }
+    var picked_archives by remember { mutableStateOf(listOf<android.net.Uri>()) }
+    var picked_routing by remember { mutableStateOf(listOf<android.net.Uri>()) }
+    var picked_search by remember { mutableStateOf(listOf<android.net.Uri>()) }
 
     val context = LocalContext.current
     val archive_launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri -> if (uri != null) picked_archive = uri }
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> if (!uris.isNullOrEmpty()) picked_archives = uris }
     val routing_launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri -> if (uri != null) picked_routing = uri }
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> if (!uris.isNullOrEmpty()) picked_routing = uris }
     val search_launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri -> if (uri != null) picked_search = uri }
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> if (!uris.isNullOrEmpty()) picked_search = uris }
 
     when (state) {
         is AtlasUiState.NeedsArchive -> AlertDialog(
@@ -98,10 +102,10 @@ fun ImportArchiveFlow(
                         icon = Icons.Outlined.Map,
                         title = "Map archive",
                         tag = "required",
-                        helper = "Your country's PMTiles map. Copied into the app.",
-                        pickedName = picked_archive?.let { displayName(context, it) },
+                        helper = "One or more regional PMTiles maps. Copied into the app.",
+                        pickedSummary = pickedSummary(context, picked_archives),
                         onPick = { archive_launcher.launch(arrayOf("*/*")) },
-                        pickLabel = "Choose map archive",
+                        pickLabel = if (picked_archives.isEmpty()) "Choose map archive" else "Choose different files",
                     )
                     HorizontalDivider(Modifier.padding(vertical = 2.dp))
                     DataFileRow(
@@ -110,9 +114,9 @@ fun ImportArchiveFlow(
                         tag = "recommended",
                         helper = "Without it, routing prepares on this device — " +
                             "about 30 minutes per region.",
-                        pickedName = picked_routing?.let { displayName(context, it) },
+                        pickedSummary = pickedSummary(context, picked_routing),
                         onPick = { routing_launcher.launch(arrayOf("*/*")) },
-                        pickLabel = if (picked_routing == null) "Add routing data" else "Choose different file",
+                        pickLabel = if (picked_routing.isEmpty()) "Add routing data" else "Choose different files",
                     )
                     HorizontalDivider(Modifier.padding(vertical = 2.dp))
                     DataFileRow(
@@ -120,17 +124,27 @@ fun ImportArchiveFlow(
                         title = "Search index",
                         tag = "recommended",
                         helper = "Without it, search builds on this device after the import.",
-                        pickedName = picked_search?.let { displayName(context, it) },
+                        pickedSummary = pickedSummary(context, picked_search),
                         onPick = { search_launcher.launch(arrayOf("*/*")) },
-                        pickLabel = if (picked_search == null) "Add search index" else "Choose different file",
+                        pickLabel = if (picked_search.isEmpty()) "Add search index" else "Choose different files",
+                    )
+                    Text(
+                        // The pairing promise, in the picker's own words: the
+                        // user never pairs files by hand.
+                        "Atlas matches each routing and search ZIP to the map " +
+                            "archive it was built from automatically.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
                     )
                 }
             },
             confirmButton = {
-                val archive = picked_archive
                 TextButton(
-                    onClick = { if (archive != null) onImport(archive, picked_routing, picked_search) },
-                    enabled = archive != null,
+                    onClick = {
+                        onImport(picked_archives, picked_routing, picked_search)
+                    },
+                    enabled = picked_archives.isNotEmpty(),
                 ) {
                     Text("Import")
                 }
@@ -138,11 +152,11 @@ fun ImportArchiveFlow(
             dismissButton = {
                 // Only meaningful once a file is picked; the initial dialog
                 // has nothing to go back to.
-                if (picked_archive != null || picked_routing != null || picked_search != null) {
+                if (picked_archives.isNotEmpty() || picked_routing.isNotEmpty() || picked_search.isNotEmpty()) {
                     TextButton(onClick = {
-                        picked_archive = null
-                        picked_routing = null
-                        picked_search = null
+                        picked_archives = emptyList()
+                        picked_routing = emptyList()
+                        picked_search = emptyList()
                     }) { Text("Clear") }
                 }
             },
@@ -157,14 +171,20 @@ fun ImportArchiveFlow(
                     // The stage list is what the user actually asked for:
                     // a skipped optional file is not a stage that can run.
                     val steps = buildList {
-                        add(ImportStage.COPY_ARCHIVE to "Copying map archive")
-                        if (picked_routing != null) add(ImportStage.INSTALL_ROUTING to "Installing routing data")
-                        if (picked_search != null) add(ImportStage.INSTALL_SEARCH to "Installing search index")
+                        add(ImportStage.COPY_ARCHIVE to "Copying map archive" +
+                            if (picked_archives.size > 1) " (${picked_archives.size} regions)" else "")
+                        if (picked_routing.isNotEmpty()) {
+                            add(ImportStage.INSTALL_ROUTING to "Installing routing data")
+                        }
+                        if (picked_search.isNotEmpty()) {
+                            add(ImportStage.INSTALL_SEARCH to "Installing search index")
+                        }
                     }
                     steps.forEachIndexed { index, (stage, label) ->
                         val running = stage == state.stage
                         ImportStageRow(
                             label = label,
+                            detail = if (running) state.detail else null,
                             done = stage < state.stage,
                             running = running,
                             last = index == steps.lastIndex,
@@ -194,9 +214,9 @@ fun ImportArchiveFlow(
             // picks re-seed the dialog and the confirm button becomes
             // "Import" — one tap re-runs the identical failing import.
             LaunchedEffect(state) {
-                picked_archive = null
-                picked_routing = null
-                picked_search = null
+                picked_archives = emptyList()
+                picked_routing = emptyList()
+                picked_search = emptyList()
             }
             AlertDialog(
             onDismissRequest = { },
@@ -210,23 +230,23 @@ fun ImportArchiveFlow(
 
         is AtlasUiState.MapReady -> {
             // A successful import clears the picks. They otherwise survive
-            // into the NEXT import (Settings' "Replace map archive" opens
-            // this dialog's Importing checklist) and would render phantom
+            // into the NEXT import (Settings' "Add map region" re-uses this
+            // dialog's Importing checklist) and would render phantom
             // "Installing routing data"/"Installing search index" stages for
             // files that import is not going to install.
             LaunchedEffect(state) {
-                picked_archive = null
-                picked_routing = null
-                picked_search = null
+                picked_archives = emptyList()
+                picked_routing = emptyList()
+                picked_search = emptyList()
             }
         }
     }
 }
 
 /**
- * One pickable file: a tinted icon disc, what it is, whether it is chosen
- * yet, and the way to choose it. The disc gives the row list a shape the
- * plain-text version lacked — three rows of prose read as a paragraph;
+ * One pickable file group: a tinted icon disc, what it is, whether it is
+ * chosen yet, and the way to choose it. The disc gives the row list a shape
+ * the plain-text version lacked — three rows of prose read as a paragraph;
  * three of these read as a checklist.
  */
 @Composable
@@ -235,7 +255,7 @@ private fun DataFileRow(
     title: String,
     tag: String,
     helper: String,
-    pickedName: String?,
+    pickedSummary: String?,
     onPick: () -> Unit,
     pickLabel: String,
 ) {
@@ -271,7 +291,7 @@ private fun DataFileRow(
                 )
             }
         }
-        if (pickedName != null) {
+        if (pickedSummary != null) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 52.dp)) {
                 Icon(
                     Icons.Outlined.Check,
@@ -280,7 +300,7 @@ private fun DataFileRow(
                     modifier = Modifier.size(16.dp),
                 )
                 Text(
-                    pickedName,
+                    pickedSummary,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(start = 4.dp),
@@ -299,7 +319,13 @@ private fun DataFileRow(
  * "in progress, with these still to come", not as a hang.
  */
 @Composable
-private fun ImportStageRow(label: String, done: Boolean, running: Boolean, last: Boolean) {
+private fun ImportStageRow(
+    label: String,
+    detail: String?,
+    done: Boolean,
+    running: Boolean,
+    last: Boolean,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(top = 8.dp),
@@ -322,16 +348,24 @@ private fun ImportStageRow(label: String, done: Boolean, running: Boolean, last:
                     .semantics { contentDescription = "waiting" },
             )
         }
-        Text(
-            label,
-            style = if (running) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
-            color = when {
-                done -> MaterialTheme.colorScheme.primary
-                running -> MaterialTheme.colorScheme.onSurface
-                else -> MaterialTheme.colorScheme.onSurfaceVariant
-            },
-            modifier = Modifier.padding(start = 12.dp),
-        )
+        Column(modifier = Modifier.padding(start = 12.dp)) {
+            Text(
+                label,
+                style = if (running) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+                color = when {
+                    done -> MaterialTheme.colorScheme.primary
+                    running -> MaterialTheme.colorScheme.onSurface
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            if (detail != null) {
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
     if (!last) {
         // A thin connector makes the rows one list, not three siblings.
@@ -354,3 +388,19 @@ private fun displayName(
         if (name_index >= 0 && cursor.moveToFirst()) cursor.getString(name_index) else null
     }
 }.getOrNull()?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment ?: "chosen file"
+
+/**
+ * What a multi-select row shows once files are chosen: the first file's
+ * name, plus a count when there are more — one line, never a wall of names.
+ */
+private fun pickedSummary(
+    context: android.content.Context,
+    uris: List<android.net.Uri>,
+): String? = when (uris.size) {
+    0 -> null
+    1 -> displayName(context, uris.first())
+    else -> {
+        val first = displayName(context, uris.first())
+        "$first +${uris.size - 1} more"
+    }
+}

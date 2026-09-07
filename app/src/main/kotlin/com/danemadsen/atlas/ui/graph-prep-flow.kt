@@ -87,10 +87,12 @@ fun GraphPrepFlow(state: AtlasUiState, routeState: RouteUiState) {
         }
     }
 
-    LaunchedEffect(state.archive) {
+    LaunchedEffect(state) {
         // A build the user explicitly dismissed must not restart behind
         // their back; the tombstone is only cleared by a new archive
-        // import.
+        // import. Keyed on the whole MapReady state (the region list now
+        // that a payload is a list of regions): a re-key fires on the same
+        // occasions the single-archive key did — a fresh import or replace.
         if (GraphBuildCoordinator.isBuildDismissed(context)) return@LaunchedEffect
         if (GraphBuildCoordinator.hasLocationPermission(context)) {
             GraphBuildCoordinator.triggerLocalBuild(context)

@@ -8,8 +8,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.PermissionChecker
-import com.danemadsen.atlas.data.ArchiveInfo
-import com.danemadsen.atlas.data.ArchiveStore
+import com.danemadsen.atlas.data.RegionInfo
+import com.danemadsen.atlas.data.RegionStore
 import com.danemadsen.atlas.graph.GraphBuildManager
 import com.danemadsen.atlas.search.SearchCoordinator
 import com.danemadsen.atlas.services.GraphBuildService
@@ -32,6 +32,11 @@ import kotlin.coroutines.resume
  * area" build runs ONLY when location permission has actually been granted
  * — with permission denied nothing is scheduled here (the on-demand flow
  * at route time covers it later).
+ *
+ * Atlas installs any number of map regions side by side (see
+ * [RegionStore]); every coordinator entry point resolves WHICH region a
+ * trigger is about — the region containing the current fix, or all of
+ * them for the "prepare all" / search-index sweeps.
  */
 object GraphBuildCoordinator {
 
@@ -112,20 +117,23 @@ object GraphBuildCoordinator {
 
     /**
      * Prepares the routing graph for the user's current area when (and only
-     * when) location permission is granted. Only a fix INSIDE the loaded
-     * archive's bbox can trigger a build — a passive provider can hand back
-     * another app's fix from anywhere on Earth (the emulator's default
-     * Mountain View fix did exactly that), and building a bucket the archive
-     * doesn't cover is pure waste. The bucket name is decided in the service;
-     * the status file carries it to the UI.
+     * when) location permission is granted. Only a fix INSIDE SOME
+     * installed region's bbox can trigger a build — a passive provider can
+     * hand back another app's fix from anywhere on Earth (the emulator's
+     * default Mountain View fix did exactly that), and building a bucket no
+     * region covers is pure waste. The bucket name is decided in the
+     * service; the status file carries it to the UI.
      */
     suspend fun triggerLocalBuild(context: Context) {
         if (!hasLocationPermission(context)) return
-        val info = ArchiveStore.load(context) ?: return
-        val location = currentLocation(context, info) ?: return
+        val regions = withContext(Dispatchers.IO) { RegionStore.loadAll(context) }
+        val location = currentLocation(context, regions) ?: return
+        val region = RegionStore.regionForPoint(regions, location.longitude, location.latitude)
+            ?: return
         val intent = serviceIntent(context, GraphBuildService.ACTION_BUILD_FOR_LOCATION)
             .putExtra(GraphBuildService.EXTRA_LON, location.longitude)
             .putExtra(GraphBuildService.EXTRA_LAT, location.latitude)
+            .putExtra(GraphBuildService.EXTRA_REGION_ID, region.id)
         start(context, intent)
     }
 
@@ -136,11 +144,12 @@ object GraphBuildCoordinator {
     /**
      * Starts the on-device search-index build, honoring the product order:
      * routing data first, search second. Called from the import flow and
-     * the resume hook — the places where a brand-new archive needs its
+     * the resume hook — the places where a brand-new region needs its
      * index.
      *
      * The decision tree, in order:
-     * - Index already complete → nothing to do.
+     * - EVERY region's index already complete → nothing to do. (The gate
+     *   is per region, exactly as it was for the single archive.)
      * - A build is live (any kind) → send the intent anyway; the service
      *   queues it in its pending-intent slot and runs it after the current
      *   run finishes.
@@ -151,6 +160,11 @@ object GraphBuildCoordinator {
      *   queue with the lesser job.
      * - Otherwise (permission denied — no location build will ever trigger
      *   — or buckets already prepared) → start the search run now.
+     *
+     * The anchor (the last fix inside any region, else null) is computed
+     * ONCE here and rides the intent: the `:graph` service orders its
+     * per-region passes nearest-first around it and threads it into the
+     * indexer, so nearby addresses become searchable first (WP5).
      */
     suspend fun triggerSearchIndex(context: Context, force: Boolean = false) {
         // The search-cancel tombstone: a cancelled pass must not restart
@@ -158,50 +172,68 @@ object GraphBuildCoordinator {
         // explicit rebuild.
         if (!force && isSearchDismissed(context)) return
         if (force) setSearchDismissed(context, false)
-        val archive_file = ArchiveStore.archiveFile(context)
-        if (SearchCoordinator.indexExists(context, archive_file)) return
+        val regions = withContext(Dispatchers.IO) { RegionStore.loadAll(context) }
+        if (regions.all { SearchCoordinator.indexExists(context, it) }) return
+        val anchor = currentLocationInRegions(context)
         val status = readStatus(context)
         if (status?.running == true) {
-            start(context, serviceIntent(context, GraphBuildService.ACTION_INDEX_SEARCH))
+            start(context, anchorIntent(context, anchor))
             return
         }
-        if (!hasLocationPermission(context) || hasPreparedBuckets(context)) {
-            start(context, serviceIntent(context, GraphBuildService.ACTION_INDEX_SEARCH))
+        if (!hasLocationPermission(context) || hasPreparedBuckets(context, regions)) {
+            start(context, anchorIntent(context, anchor))
         }
         // else: the location build will chain the search pass service-side.
     }
 
-    /** Whether any routing buckets are already prepared for this archive. */
-    private suspend fun hasPreparedBuckets(context: Context): Boolean =
+    /**
+     * The search-index intent with the anchor extras applied: doubles when
+     * a fix exists, nothing when it does not (the service distinguishes
+     * "no anchor" by the extras' absence, not by a NaN sentinel).
+     */
+    private fun anchorIntent(context: Context, anchor: android.location.Location?): Intent =
+        serviceIntent(context, GraphBuildService.ACTION_INDEX_SEARCH).apply {
+            if (anchor != null) {
+                putExtra(GraphBuildService.EXTRA_ANCHOR_LON, anchor.longitude)
+                putExtra(GraphBuildService.EXTRA_ANCHOR_LAT, anchor.latitude)
+            }
+        }
+
+    /** Whether ANY region has routing buckets already prepared. */
+    private suspend fun hasPreparedBuckets(context: Context, regions: List<RegionInfo>): Boolean =
         withContext(Dispatchers.IO) {
-            val manager = GraphBuildManager(
-                archiveFile = ArchiveStore.archiveFile(context),
-                segmentsDir = File(File(context.filesDir, "graph"), "segments"),
-                workRoot = File(context.cacheDir, "graph-work"),
-                assetsDir = ensureBuildAssets(context),
-            )
-            manager.builtBuckets().isNotEmpty()
+            val assets_dir = ensureBuildAssets(context)
+            regions.any { region ->
+                GraphBuildManager(
+                    archiveFile = RegionStore.archiveFile(RegionStore.mapDir(context), region.id),
+                    segmentsDir = segmentsDir(context, region.id),
+                    workRoot = File(context.cacheDir, "graph-work"),
+                    assetsDir = assets_dir,
+                ).builtBuckets().isNotEmpty()
+            }
         }
 
     /**
-     * A recent fix inside the archive, for routing origins — the same
-     * bounds-checked lookup the build trigger uses. Null when location
-     * permission is denied (per the offline product rule, routes do not
-     * calculate without it) or when no fix is available yet.
+     * A recent fix inside ANY installed region, for routing origins and
+     * the search-index anchor — the same bounds-checked lookup the build
+     * trigger uses. Null when location permission is denied (per the
+     * offline product rule, routes do not calculate without it) or when no
+     * fix is available yet.
      */
-    suspend fun currentLocationInArchive(context: Context): android.location.Location? {
+    suspend fun currentLocationInRegions(context: Context): android.location.Location? {
         if (!hasLocationPermission(context)) return null
-        val info = ArchiveStore.load(context) ?: return null
-        return currentLocation(context, info)
+        val regions = withContext(Dispatchers.IO) { RegionStore.loadAll(context) }
+        return currentLocation(context, regions)
     }
 
     /**
      * The Settings "rebuild routing data" action: deletes every prepared
-     * bucket and the build-state record of them, so the next build
-     * starts from nothing. (The fingerprint-keyed wipe inside
-     * [com.danemadsen.atlas.graph.GraphBuildManager] only fires when the
-     * ARCHIVE changed — this is the same wipe for when the profile
-     * assets changed instead.) Callers must stop any live routing
+     * bucket and the build-state record of them — for ALL regions, since
+     * the flag is a profile-asset recovery path, not a region operation —
+     * so the next build starts from nothing. (The fingerprint-keyed wipe
+     * inside [com.danemadsen.atlas.graph.GraphBuildManager] only fires when
+     * a region's ARCHIVE changed — this is the same wipe for when the
+     * profile assets changed instead.) Callers must stop any live routing
      * first: a session mid-drive is reading those very files.
      */
     suspend fun wipeRoutingData(context: Context) = withContext(Dispatchers.IO) {
@@ -220,11 +252,13 @@ object GraphBuildCoordinator {
 
     /**
      * Installs a user-supplied prebuilt routing-data ZIP (a set of `.rd5`
-     * bucket segments) for the freshly imported archive, so routing works
-     * immediately instead of after the ~30-minute-per-region on-device
-     * build. Throws with a user-presentable message when the file is not a
-     * usable Atlas routing bundle — the caller falls back to on-device
-     * preparation and surfaces the failure.
+     * bucket segments) for the region [regionId] names — the caller
+     * resolves the region from the ZIP's manifest fingerprint pairing — so
+     * routing works immediately instead of after the ~30-minute-per-region
+     * on-device build. Throws with a user-presentable message when the
+     * file is not a usable Atlas routing bundle (or the region id names no
+     * installed region) — the caller falls back to on-device preparation
+     * and surfaces the failure.
      *
      * No build is started here; the buckets land in build-state as already
      * built, so the location-triggered and on-demand builds no-op for them.
@@ -232,12 +266,15 @@ object GraphBuildCoordinator {
      * genuinely has no roads for, and marking them built is what stops the
      * location trigger from re-scanning ocean.
      */
-    suspend fun installRoutingData(context: Context, zip: android.net.Uri): Int =
+    suspend fun installRoutingData(context: Context, regionId: String, zip: android.net.Uri): Int =
         withContext(Dispatchers.IO) {
+            val region = RegionStore.load(context, regionId)
+                ?: error("no installed map region matches this routing data — re-download the " +
+                    "routing data and the map archive from the same build")
             val assets_dir = ensureBuildAssets(context)
             val manager = GraphBuildManager(
-                archiveFile = ArchiveStore.archiveFile(context),
-                segmentsDir = File(File(context.filesDir, "graph"), "segments"),
+                archiveFile = RegionStore.archiveFile(RegionStore.mapDir(context), region.id),
+                segmentsDir = segmentsDir(context, region.id),
                 workRoot = File(context.cacheDir, "graph-work"),
                 assetsDir = assets_dir,
             )
@@ -255,7 +292,7 @@ object GraphBuildCoordinator {
      * The Dismiss tombstone: without it, deleting the status file re-arms
      * the resume hook's automatic trigger, and the build the user just
      * dismissed silently restarts on their next return to the app. A new
-     * archive import clears it.
+     * region import clears it.
      */
     fun setBuildDismissed(context: Context, dismissed: Boolean) {
         val flag = File(File(context.filesDir, "graph"), DISMISSED_FLAG)
@@ -316,6 +353,10 @@ object GraphBuildCoordinator {
     private fun serviceIntent(context: Context, action: String): Intent =
         Intent(context, GraphBuildService::class.java).setAction(action)
 
+    /** One region's segment dir — the same layout [RouterGateway] and the service use. */
+    private fun segmentsDir(context: Context, regionId: String): File =
+        File(File(File(context.filesDir, "graph"), "segments"), regionId)
+
     fun hasLocationPermission(context: Context): Boolean =
         PermissionChecker.checkSelfPermission(
             context,
@@ -327,17 +368,17 @@ object GraphBuildCoordinator {
             ) == PermissionChecker.PERMISSION_GRANTED
 
     /**
-     * Last known fix inside the archive if one exists, else one fresh fix
-     * (bounded wait). The app never had network, so providers are
-     * GPS/passive only — but a passive fix can come from another app and be
-     * anywhere at all, so every candidate is bounds-checked against
-     * [ArchiveStore] and the most recent in-archive fix wins. A fresh fix
-     * outside the archive yields null (no build) rather than a bucket the
-     * archive doesn't cover.
+     * Last known fix inside any installed region if one exists, else one
+     * fresh fix (bounded wait). The app never had network, so providers
+     * are GPS/passive only — but a passive fix can come from another app
+     * and be anywhere at all, so every candidate is bounds-checked against
+     * [RegionStore] and the most recent in-region fix wins. A fresh fix
+     * outside every region yields null (no build) rather than a bucket no
+     * region covers.
      */
     private suspend fun currentLocation(
         context: Context,
-        bounds: ArchiveInfo,
+        regions: List<RegionInfo>,
     ): android.location.Location? {
         val manager = context.getSystemService(LocationManager::class.java) ?: return null
         val candidates = ArrayList<android.location.Location>()
@@ -345,27 +386,39 @@ object GraphBuildCoordinator {
             val last = runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
             if (last != null &&
                 System.currentTimeMillis() - last.time <= MAX_LAST_KNOWN_AGE_MS &&
-                insideArchive(last.longitude, last.latitude, bounds)
+                insideAnyRegion(regions, last.longitude, last.latitude)
             ) {
                 candidates.add(last)
             }
         }
         candidates.maxByOrNull { it.time }?.let { return it }
         return withTimeoutOrNull(FRESH_FIX_TIMEOUT_MS) { freshFix(manager) }
-            ?.takeIf { insideArchive(it.longitude, it.latitude, bounds) }
+            ?.takeIf { insideAnyRegion(regions, it.longitude, it.latitude) }
     }
 
-    fun insideArchive(lon: Double, lat: Double, bounds: ArchiveInfo): Boolean {
-        if (lat < bounds.south || lat > bounds.north) return false
+    /**
+     * The bbox containment rule for ONE region — kept for callers that
+     * already hold a [RegionInfo] (and its tests). Safe against a region
+     * straddling the antimeridian (west > east means the bbox is the
+     * union of both sides). New code should prefer
+     * [RegionStore.regionForPoint]/[insideAnyRegion], which resolve the
+     * owning region directly.
+     */
+    fun insideArchive(lon: Double, lat: Double, region: RegionInfo): Boolean {
+        if (lat < region.south || lat > region.north) return false
         // An archive straddling the antimeridian has west > east; then the
         // bbox is the union of both sides, not empty.
-        val lon_in = if (bounds.west <= bounds.east) {
-            lon >= bounds.west && lon <= bounds.east
+        val lon_in = if (region.west <= region.east) {
+            lon >= region.west && lon <= region.east
         } else {
-            lon >= bounds.west || lon <= bounds.east
+            lon >= region.west || lon <= region.east
         }
         return lon_in
     }
+
+    /** Whether ANY installed region's bbox contains the point. */
+    fun insideAnyRegion(regions: List<RegionInfo>, lon: Double, lat: Double): Boolean =
+        regions.any { insideArchive(lon, lat, it) }
 
     private suspend fun freshFix(
         manager: LocationManager,

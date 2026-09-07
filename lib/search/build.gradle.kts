@@ -54,6 +54,12 @@ kotlin {
             implementation(libs.junit)
             implementation(libs.coroutines.core)
         }
+        jvmTest.dependencies {
+            implementation(kotlin("test"))
+            // The bundled driver lets jvmTest mint real Room DBs — the same
+            // way the jvmMain CLI does — for the multi-DB merge tests.
+            implementation("androidx.sqlite:sqlite-bundled-jvm:2.6.0")
+        }
         jvmMain.dependencies {
             // The bundled SQLite driver the JVM target's CLI opens the index
             // DB through (Android uses its platform driver instead).

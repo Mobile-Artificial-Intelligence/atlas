@@ -12,9 +12,12 @@ class StyleBuilderTest {
     private val template: String =
         File("src/main/assets/style-template.json").readText()
 
-    private val melbourne = StyleBuilder.SourceInfo(
-        archivePath = "/data/user/0/com.danemadsen.atlas/files/map/atlas.pmtiles",
-    )
+    private fun sources(vararg ids: String) =
+        ids.mapIndexed { i, id ->
+            StyleBuilder.RegionSource(id, "/data/user/0/com.danemadsen.atlas/files/map/$id/map.pmtiles")
+        }
+
+    private val melbourne = sources("atlas")
 
     @Test
     fun outputIsFullyOffline() {
@@ -36,7 +39,7 @@ class StyleBuilderTest {
         // MapLibre reads zooms/bounds from the archive header itself, so the
         // source is just a pmtiles:// url — no z/x/y tile template.
         assertTrue(
-            "\"url\": \"pmtiles://file:///data/user/0/com.danemadsen.atlas/files/map/atlas.pmtiles\"" in style,
+            "\"url\": \"pmtiles://file:///data/user/0/com.danemadsen.atlas/files/map/atlas/map.pmtiles\"" in style,
         )
         assertTrue("/{z}/{x}/{y}" !in style)
     }
@@ -56,8 +59,8 @@ class StyleBuilderTest {
     fun darkHidesSpritePatternLayers() {
         val light = StyleBuilder.buildStyleJson(template, Themes.LIGHT, melbourne)
         val dark = StyleBuilder.buildStyleJson(template, Themes.DARK, melbourne)
-        assertEquals(0, "\"visibility\": \"none\"".toRegex().findAll(light).count())
-        assertEquals(2, "\"visibility\": \"none\"".toRegex().findAll(dark).count())
+        // One hidden pair per region source.
+        assertEquals(2 * melbourne.size, "\"visibility\": \"none\"".toRegex().findAll(dark).count())
         assertTrue("\"name\": \"Dark Matter\"" in dark)
         assertTrue("\"name\": \"OSM Liberty\"" in light)
     }
@@ -93,5 +96,43 @@ class StyleBuilderTest {
         assertFailsWith<IllegalArgumentException> {
             StyleBuilder.buildStyleJson(template, broken, melbourne)
         }
+    }
+
+    @Test
+    fun everySourcedLayerIsDuplicatedPerRegion() {
+        val two = sources("australia", "us-georgia")
+        val style = StyleBuilder.buildStyleJson(template, Themes.LIGHT, two)
+        for (region in two) {
+            assertTrue(
+                "\"openmaptiles-${region.regionId}\"" in style,
+                "missing source for ${region.regionId}",
+            )
+        }
+        assertTrue("\"openmaptiles-us-georgia\"" in style)
+        // `source` fields pointing at the template's placeholder name must
+        // all be gone.
+        val leftovers = Regex("\"source\"\\s*:\\s*\"openmaptiles\"").findAll(style).count()
+        assertEquals(0, leftovers)
+    }
+
+    @Test
+    fun layerIdsStayUniqueAcrossRegions() {
+        val two = sources("australia", "us-georgia")
+        val style = StyleBuilder.buildStyleJson(template, Themes.LIGHT, two)
+        val ids = Regex("\"id\"\\s*:\\s*\"([^\"]+)\"").findAll(style).map { it.groupValues[1] }.toList()
+        assertEquals(ids.size, ids.toSet().size, "duplicate layer id in multi-source style")
+    }
+
+    @Test
+    fun sourceLayerAndPaintAreUntouched() {
+        val two = sources("australia", "us-georgia")
+        val style = StyleBuilder.buildStyleJson(template, Themes.LIGHT, two)
+        val template_layers = Regex("\"source-layer\"\\s*:\\s*\"([^\"]+)\"")
+            .findAll(template).map { it.groupValues[1] }.toList()
+        val style_layers = Regex("\"source-layer\"\\s*:\\s*\"([^\"]+)\"")
+            .findAll(style).map { it.groupValues[1] }.toList()
+        // Each template layer is duplicated per region, copies consecutive.
+        val expected = template_layers.flatMap { list -> List(two.size) { list } }
+        assertEquals(expected, style_layers)
     }
 }

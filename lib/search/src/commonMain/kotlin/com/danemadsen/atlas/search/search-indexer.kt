@@ -81,9 +81,15 @@ class SearchIndexer(
      * background-service run renders. [isCancelled] is checked at the same
      * brackets as coroutine cancellation: the caller in the `:graph`
      * service cancels through a flag, not through the job.
+     *
+     * [anchorLonLat] (`lon to lat`) orders both sweeps nearest-first around
+     * that point (see [PmtilesReader.forEachTileChunkInBounds]) so a user
+     * can search nearby addresses while the sweep is still crawling the far
+     * side of the archive; null keeps plain order.
      */
     suspend fun indexCheapPass(
         reader: PmtilesReader,
+        anchorLonLat: Pair<Double, Double>? = null,
         onProgress: (label: String, fraction: Float?) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): PassResult = withContext(Dispatchers.IO) {
@@ -104,7 +110,7 @@ class SearchIndexer(
             val zoom_span = max_zoom - MIN_INDEX_ZOOM + 1
             onProgress("Indexing places", null)
             for (zoom in MIN_INDEX_ZOOM..max_zoom) {
-                reader.forEachTileInBounds(zoom, bounds) { _, x, y, bytes ->
+                reader.forEachTileChunkInBounds(zoom, bounds, anchorLonLat) { _, x, y, bytes ->
                     for (candidate in placeCandidates(MvtTile.decode(bytes), zoom, x, y)) {
                         seen++
                         if (beatsExisting(candidate, existing, offered)) {
@@ -156,9 +162,10 @@ class SearchIndexer(
                     }
                     drain.start()
                     var since_check = 0
-                    reader.forEachTileInBounds(
+                    reader.forEachTileChunkInBounds(
                         ADDRESS_INDEX_ZOOM,
                         bounds,
+                        anchorLonLat,
                         onCellsProbed = { probed, total ->
                             onProgress(
                                 "Indexing addresses",

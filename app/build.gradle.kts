@@ -129,6 +129,10 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(kotlin("test"))
+    // The real org.json implementation for JVM tests: android.jar's stubs
+    // throw "not mocked", and the region registry persists its index
+    // through JSONObject/JSONArray.
+    testImplementation("org.json:json:20240303")
     // Session-level car tests later if wanted; plain-JVM model tests below
     // need only the main artifact.
     testImplementation(libs.androidx.car.app.testing)

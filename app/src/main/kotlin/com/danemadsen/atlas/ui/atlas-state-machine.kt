@@ -7,8 +7,16 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.danemadsen.atlas.AtlasApplication
-import com.danemadsen.atlas.data.ArchiveInfo
 import com.danemadsen.atlas.data.PmtilesRepository
+import com.danemadsen.atlas.data.RegionInfo
+import com.danemadsen.atlas.data.RegionStore
+// The routing adoption's bounded-IO helpers (stage-to-file + manifest parse)
+// are internal top-level functions of the same module — reused here so the
+// UI's fingerprint pairing reads exactly what the adoption will read.
+import com.danemadsen.atlas.graph.copyBounded
+import com.danemadsen.atlas.graph.parseRoutingManifest
+import com.danemadsen.atlas.graph.stageZip
+import com.danemadsen.atlas.search.SearchIndexer
 import com.danemadsen.atlas.intent.ExternalMapIntentHandler
 import com.danemadsen.atlas.intent.MapIntentRequest
 import com.danemadsen.atlas.intent.LocationIntentLauncher
@@ -43,6 +51,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.File
 
 /**
  * The whole UI is a function of this state:
@@ -52,9 +61,23 @@ import kotlinx.coroutines.launch
  */
 sealed interface AtlasUiState {
     data object NeedsArchive : AtlasUiState
-    data class Importing(val progress: Float?, val stage: ImportStage = ImportStage.COPY_ARCHIVE) : AtlasUiState
+    data class Importing(
+        val progress: Float?,
+        val stage: ImportStage = ImportStage.COPY_ARCHIVE,
+        /** What the running stage is working on — the file/region being copied or installed. */
+        val detail: String? = null,
+    ) : AtlasUiState
     data class ImportFailed(val message: String) : AtlasUiState
-    data class MapReady(val archive: ArchiveInfo) : AtlasUiState
+
+    /**
+     * Any number of installed map regions ([RegionStore]); [primary] is the
+     * one the camera, maxZoom clamps and search anchor default to — the
+     * nearest to the user's view, or the newest import.
+     */
+    data class MapReady(
+        val regions: List<RegionInfo>,
+        val primary: RegionInfo,
+    ) : AtlasUiState
 }
 
 /**
@@ -333,13 +356,13 @@ class AtlasViewModel(
         // install from before search existed) gets its build triggered
         // here — through the coordinator's ordering rule, so a routing
         // build that is about to run goes first.
-        if ((state.value as? AtlasUiState.MapReady)?.archive != null) {
+        if (state.value is AtlasUiState.MapReady) {
             viewModelScope.launch { GraphBuildCoordinator.triggerSearchIndex(app) }
         }
         // Same for the engine warmup: with an archive on disk the map is
         // already usable, so the cold-engine cost belongs here in the
         // background, not on the user's first route.
-        if ((state.value as? AtlasUiState.MapReady)?.archive != null) warmEngine()
+        if (state.value is AtlasUiState.MapReady) warmEngine()
     }
 
     /**
@@ -356,11 +379,12 @@ class AtlasViewModel(
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             delay(SEARCH_DEBOUNCE_MS)
-            val archive = (state.value as? AtlasUiState.MapReady)?.archive ?: return@launch
-            val center = mapCenter ?: GeoPoint(archive.centerLon, archive.centerLat)
+            val ready = state.value as? AtlasUiState.MapReady ?: return@launch
+            val center = mapCenter ?: GeoPoint(ready.primary.centerLon, ready.primary.centerLat)
+            // Multi-region: the coordinator opens a handle per installed
+            // region's DB and merges — no archive handle in the UI contract.
             val hits = SearchCoordinator.search(
                 app,
-                com.danemadsen.atlas.data.ArchiveStore.archiveFile(app),
                 query,
                 center.lon,
                 center.lat,
@@ -530,16 +554,14 @@ class AtlasViewModel(
             .apply()
         routeJob = viewModelScope.launch {
             _routeState.value = RouteUiState.Preparing(null)
-            // A long-press on the gray void beyond the archive's tiles can
-            // never route — fail before spending a build on it.
-            val archive = repository.loadArchiveInfo()
-            if (archive == null ||
-                !GraphBuildCoordinator.insideArchive(destination.lon, destination.lat, archive)
-            ) {
-                failRoute("the destination is outside the loaded map area")
+            // A long-press on the gray void beyond every installed region's
+            // tiles can never route — fail before spending a build on it.
+            val regions = repository.loadRegions()
+            if (RegionStore.regionForPoint(regions, destination.lon, destination.lat) == null) {
+                failRoute("the destination is outside the loaded map areas")
                 return@launch
             }
-            val origin = GraphBuildCoordinator.currentLocationInArchive(app)
+            val origin = GraphBuildCoordinator.currentLocationInRegions(app)
                 ?: run {
                     failRoute(
                         "no location fix for the origin — grant location permission and wait for a GPS fix",
@@ -870,13 +892,12 @@ class AtlasViewModel(
 
     /**
      * Settings' "Install routing data": adopts a prebuilt routing ZIP — the
-     * CI artifact paired with this map archive — instead of building every
-     * region on-device. The ZIP's manifest pins the archive fingerprint, so
-     * a ZIP from a different download is refused with the actionable
-     * message rather than silently installing roads the archive doesn't
-     * have. This is also the recovery path after "Replace map archive":
-     * replacing the archive alone leaves routing unbuilt, and this
-     * re-pairs it in one tap.
+     * CI artifact paired with one of the installed map regions. The ZIP's
+     * manifest pins the archive fingerprint, so the target region resolves
+     * by fingerprint (NOT pick order), and a ZIP no installed region was
+     * built from is skipped with a toast rather than installing silently
+     * wrong roads. This is also the recovery path when a region's routing
+     * data was never installed alongside its archive.
      */
     fun installRoutingData(uri: Uri) {
         // Same rule as rebuild: a live session reads those segment files.
@@ -893,7 +914,7 @@ class AtlasViewModel(
             toast("Wait for the route to finish preparing before installing routing data")
             return
         }
-        // Single flight, like importArchive: two adoptions share the
+        // Single flight, like the import flow: two adoptions share the
         // manager's fixed adopt-scratch dir and build-state tmp file, and
         // the second would delete the first's extracted segments
         // mid-validation.
@@ -905,26 +926,9 @@ class AtlasViewModel(
             try {
                 // A live :graph build writes the same segments dir and
                 // build-state file the adoption renames into — stop it
-                // first. Cancel is cooperative (observed between buckets
-                // and at sub-step boundaries), so wait it out; a status
-                // older than the staleness budget means the :graph process
-                // already died mid-build and there is nothing to wait for.
-                if (GraphBuildCoordinator.readStatusAsync(app)?.running == true) {
-                    toast("Stopping the running build first…")
-                    GraphBuildCoordinator.cancel(app)
-                    while (true) {
-                        val status = GraphBuildCoordinator.readStatusAsync(app)
-                        if (status?.running != true) break
-                        if (System.currentTimeMillis() - status.timestampMs >
-                            BUILD_STOP_STALE_MS
-                        ) {
-                            break
-                        }
-                        delay(2_000)
-                    }
-                }
-                val buckets = GraphBuildCoordinator.installRoutingData(app, uri)
-                toast("Routing data installed for $buckets region(s) — routing is ready.")
+                // first (the same handshake the import flow uses).
+                awaitStoppedBuild()
+                installPairedRoutingZip(uri, repository.loadRegions())
             } catch (e: CancellationException) {
                 // ViewModel cleared mid-install: not a user-facing failure.
                 throw e
@@ -937,11 +941,11 @@ class AtlasViewModel(
 
     /**
      * Settings' "Load search index": adopts the prebuilt search index —
-     * the CI artifact paired with this map archive — instead of building
-     * it on-device. Same pairing contract as installRoutingData: the
-     * manifest pins the archive's content fingerprint, so an index from a
-     * different download is refused with the actionable message rather
-     * than installing a silently-wrong search.
+     * the CI artifact paired with one of the installed map regions. Same
+     * fingerprint pairing as the routing install: the DB file's name pins
+     * the region's [RegionInfo.searchFingerprint], so the target region
+     * resolves by content, and a ZIP no installed region was built from is
+     * skipped with a toast rather than installing a silently-wrong search.
      */
     fun installSearchData(uri: Uri) {
         // Single flight: two adoptions share the coordinator's fixed
@@ -957,21 +961,7 @@ class AtlasViewModel(
                 // renames into — stop it first, same handshake the routing
                 // install uses. Cancel is cooperative, so wait it out.
                 awaitStoppedBuild()
-                val input = app.contentResolver.openInputStream(uri)
-                    ?: error("the search index file could not be opened")
-                val adoption = try {
-                    SearchCoordinator.adoptPrebuiltIndex(
-                        app,
-                        com.danemadsen.atlas.data.ArchiveStore.archiveFile(app),
-                        input,
-                    )
-                } finally {
-                    input.close()
-                }
-                toast(
-                    "Search index installed — ${adoption.places} places and " +
-                        "${adoption.addresses} addresses are searchable.",
-                )
+                installPairedSearchZip(uri, repository.loadRegions())
             } catch (e: CancellationException) {
                 // ViewModel cleared mid-install: not a user-facing failure.
                 throw e
@@ -989,7 +979,7 @@ class AtlasViewModel(
      * it leaves the Settings tab for the Map tab.
      */
     fun rebuildSearchIndex() {
-        if ((_state.value as? AtlasUiState.MapReady)?.archive == null) return
+        if (_state.value !is AtlasUiState.MapReady) return
         _activeTab.value = Tab.MAP
         viewModelScope.launch {
             awaitStoppedBuild()
@@ -1034,147 +1024,325 @@ class AtlasViewModel(
         _routeState.value = RouteUiState.Idle
     }
 
-    fun importArchive(uri: Uri, routingDataUri: Uri? = null, searchDataUri: Uri? = null) {
+    /**
+     * Onboarding's multi-region import (and, via [addRegions], the Settings
+     * "Add map region" flow): copies every selected map archive, then
+     * installs the routing ZIPs, then the search-index ZIPs, then triggers
+     * the search pass for anything still un-indexed.
+     *
+     * Pairing is by FINGERPRINT, not pick order: each routing ZIP's
+     * manifest names the archive fingerprint it was built from, and each
+     * search ZIP's DB file name pins the search fingerprint — the ZIP is
+     * adopted by whichever installed region carries that fingerprint, and
+     * a ZIP matching no region is skipped with a toast, never a failure
+     * (the map works; the on-device build is the designed fallback).
+     */
+    fun importRegions(
+        archiveUris: List<Uri>,
+        routingZips: List<Uri>,
+        searchZips: List<Uri>,
+    ) {
         // Two taps can land in one input batch before recomposition removes
         // the Import button: both would copy into the SAME staging file and
         // interleave (or the second job would follow the first's rename).
         if (_state.value is AtlasUiState.Importing) return
+        importRegionsInternal(archiveUris, routingZips, searchZips)
+    }
+
+    /**
+     * Settings' "Add map region": the same shared body as [importRegions] —
+     * the only behavioral difference is the prefs wipe below, which is
+     * scoped to the empty→non-empty transition or a primary-fingerprint
+     * change, so adding a second region never drops the saved camera.
+     */
+    fun addRegions(
+        archiveUris: List<Uri>,
+        routingZips: List<Uri> = emptyList(),
+        searchZips: List<Uri> = emptyList(),
+    ) = importRegionsInternal(archiveUris, routingZips, searchZips)
+
+    private fun importRegionsInternal(
+        archive_uris: List<Uri>,
+        routing_zips: List<Uri>,
+        search_zips: List<Uri>,
+    ) {
+        if (archive_uris.isEmpty()) return
         // A replace chosen from Settings: the import dialog must be the
         // topmost surface, so the user sees its progress.
         _activeTab.value = Tab.MAP
-        // The old archive's route must not survive the replace: its
+        // The replaced region's route must not survive the import: its
         // in-memory preview would paint over the new tiles and the fit
         // would fly the camera to the old city, with a Start button
         // offering navigation on a route computed against the replaced
         // graph. The prefs wipe below only covers the restore path —
         // the live route needs the full teardown.
         dismissRoute()
+        val regions_before = repository.loadRegions()
+        val primary_before = RegionStore.primaryRegion(regions_before, cameraAnchor())
         _state.value = AtlasUiState.Importing(null)
         viewModelScope.launch {
             try {
-                val info = repository.importArchive(uri) { progress ->
-                    _state.value = AtlasUiState.Importing(progress)
-                }
-                // The prebuilt routing data is the production path; its
-                // installation is part of the import, not a background
-                // follow-up — the user waits here while segments land.
-                // A failure is NOT an import failure: the map works and
-                // the on-device build is the designed fallback, so the
-                // message surfaces as a toast and the flow continues.
-                if (routingDataUri != null) {
-                    _state.value = AtlasUiState.Importing(null, ImportStage.INSTALL_ROUTING)
-                    val buckets = try {
-                        GraphBuildCoordinator.installRoutingData(app, routingDataUri)
-                    } catch (e: Exception) {
-                        // The adopt path throws user-actionable messages by
-                        // design; anything that slips through with a null or
-                        // blank message must not render as "(null)".
-                        val reason = e.message?.takeIf { it.isNotBlank() }
-                            ?: "an unexpected error"
-                        toast(
-                            "Routing data was not installed ($reason) — " +
-                                "Atlas will prepare routing on this device instead.",
-                        )
-                        0
+                // 1. Copy every archive first — a region that fails its copy
+                // fails the import (the map cannot render without it), while
+                // the optional ZIPs below degrade to toasts.
+                var copied = 0
+                for (uri in archive_uris) {
+                    val label = repository.displayName(uri) ?: "map archive"
+                    val detail = if (archive_uris.size > 1) {
+                        "$label (${copied + 1} of ${archive_uris.size})"
+                    } else {
+                        label
                     }
-                    if (buckets > 0) {
-                        toast("Routing data installed for $buckets region(s) — routing is ready.")
+                    _state.value = AtlasUiState.Importing(null, ImportStage.COPY_ARCHIVE, detail)
+                    repository.importRegion(uri) { progress ->
+                        _state.value =
+                            AtlasUiState.Importing(progress, ImportStage.COPY_ARCHIVE, detail)
                     }
+                    copied++
                 }
-                // Nor its search index: unwind the old archive's running
-                // pass (if any) BEFORE wiping the DBs — cancel() alone is
-                // asynchronous, and the still-"active" job would make
-                // ensureSearchIndex return early and leave the new archive
-                // unindexed until the next launch. Then either adopt the
-                // user's prebuilt index (same stage of the import as the
-                // routing ZIP above) or build the cheap pass for the new
-                // archive (tens of seconds, surfaced through the search
-                // state). The order matters: deleteIndexes must not run
-                // AFTER a successful adopt, or it wipes what just landed.
-                // The Settings install job joins the coordinator's same
-                // write lock as the cheap pass — unwind BOTH before wiping,
-                // or a replace-archive that lands mid-adopt deletes the
-                // adopt's live DB out from under it (and this import's own
-                // adopt below would hit the still-held lock and silently
-                // never run).
-                awaitStoppedBuild()
-                SearchCoordinator.deleteIndexes(app)
-                val archive_file = com.danemadsen.atlas.data.ArchiveStore.archiveFile(app)
-                var search_installed = false
-                if (searchDataUri != null) {
-                    _state.value = AtlasUiState.Importing(null, ImportStage.INSTALL_SEARCH)
-                    // A failure is NOT an import failure (same reasoning as
-                    // the routing ZIP): the map works, and the on-device
-                    // build is the designed fallback.
-                    try {
-                        val input = app.contentResolver.openInputStream(searchDataUri)
-                        if (input == null) {
-                            toast(
-                                "Search index was not installed (the file could not be " +
-                                    "opened) — Atlas will build the search index on this device instead.",
-                            )
+                val regions_after = repository.loadRegions()
+                // 2. Routing ZIPs, paired by manifest fingerprint. A failure
+                // is NOT an import failure: the map works and the on-device
+                // build is the designed fallback, so the message surfaces
+                // as a toast and the flow continues.
+                var routing_index = 0
+                for (zip in routing_zips) {
+                    val label = repository.displayName(zip) ?: "routing data"
+                    _state.value = AtlasUiState.Importing(
+                        null,
+                        ImportStage.INSTALL_ROUTING,
+                        if (routing_zips.size > 1) {
+                            "$label (${routing_index + 1} of ${routing_zips.size})"
                         } else {
-                            try {
-                                val adoption = SearchCoordinator.adoptPrebuiltIndex(app, archive_file, input)
-                                search_installed = true
-                                toast(
-                                    "Search index installed — ${adoption.places} places and " +
-                                        "${adoption.addresses} addresses are searchable.",
-                                )
-                            } finally {
-                                input.close()
-                            }
-                        }
-                    } catch (e: CancellationException) {
-                        // The import coroutine was cancelled (ViewModel
-                        // cleared): not a user-facing failure, and the
-                        // generic catch below would toast a false "was not
-                        // installed" from it.
-                        throw e
-                    } catch (e: Exception) {
-                        val reason = e.message?.takeIf { it.isNotBlank() }
-                            ?: "an unexpected error"
-                        toast(
-                            "Search index was not installed ($reason) — Atlas will build " +
-                                "the search index on this device instead.",
-                        )
-                    }
+                            label
+                        },
+                    )
+                    installPairedRoutingZip(zip, regions_after)
+                    routing_index++
                 }
-                if (!search_installed) ensureSearchIndex()
-                _state.value = AtlasUiState.MapReady(info)
-                // A new archive must not inherit the previous archive's
+                // 3. Search-index ZIPs, paired by DB-file-name fingerprint —
+                // same skip-don't-fail contract. The adoptions join the
+                // search pass's write lock, so unwind any running pass
+                // FIRST (cancel() alone is asynchronous, and a still-"active"
+                // pass would make the adopt refuse and the import leave the
+                // region unindexed until the next launch).
+                awaitStoppedBuild()
+                var search_index = 0
+                for (zip in search_zips) {
+                    val label = repository.displayName(zip) ?: "search index"
+                    _state.value = AtlasUiState.Importing(
+                        null,
+                        ImportStage.INSTALL_SEARCH,
+                        if (search_zips.size > 1) {
+                            "$label (${search_index + 1} of ${search_zips.size})"
+                        } else {
+                            label
+                        },
+                    )
+                    installPairedSearchZip(zip, regions_after)
+                    search_index++
+                }
+                // 4. Everything still un-indexed (no adopted ZIP, or a ZIP
+                // that failed) builds through the background pass.
+                ensureSearchIndex()
+                _state.value = readyState(regions_after)
+                    ?: error("the map regions vanished during the import")
+                // A new region must not inherit the previous install's
                 // dismissed-build tombstones — either kind.
                 GraphBuildCoordinator.setBuildDismissed(app, false)
                 GraphBuildCoordinator.setSearchDismissed(app, false)
-                // Nor its camera or any route aimed at the old tiles:
-                // both restores are bounds-checked against the new
-                // archive, but the clean slate is simpler and correct.
-                // The wiped keys are all archive-derived state — user-curated
+                // The camera/destination wipe is SCOPED: only a fresh
+                // install (empty→non-empty) or a primary-region UPDATE (the
+                // same region re-imported from a newer build carries a
+                // different fingerprint) invalidates the saved view —
+                // adding a second region must not drop the camera. The
+                // wiped keys are all region-derived state; user-curated
                 // data (saved.locations, tts.muted) is deliberately NOT in
-                // this list: a routine archive update must not destroy the
-                // user's Home pin, and a stale coordinate degrades honestly
-                // via requestRoute's insideArchive check → Failed drawer.
-                prefs.edit()
-                    .remove(KEY_CAMERA_LON)
-                    .remove(KEY_CAMERA_LAT)
-                    .remove(KEY_CAMERA_ZOOM)
-                    .remove(KEY_CAMERA_BEARING)
-                    .remove(KEY_DEST_LON)
-                    .remove(KEY_DEST_LAT)
-                    .remove(KEY_PROFILE)
-                    .apply()
-                initial_camera = null
-                // The warmup is keyed to nothing archive-specific — but a
+                // this list, and a stale destination coordinate degrades
+                // honestly via requestRoute's bounds check → Failed drawer.
+                val empty_to_nonempty = regions_before.isEmpty()
+                val primary_changed = primary_before?.let { before ->
+                    regions_after.firstOrNull { it.id == before.id }
+                        ?.routingFingerprint != before.routingFingerprint
+                } ?: false
+                if (empty_to_nonempty || primary_changed) {
+                    prefs.edit()
+                        .remove(KEY_CAMERA_LON)
+                        .remove(KEY_CAMERA_LAT)
+                        .remove(KEY_CAMERA_ZOOM)
+                        .remove(KEY_CAMERA_BEARING)
+                        .remove(KEY_DEST_LON)
+                        .remove(KEY_DEST_LAT)
+                        .remove(KEY_PROFILE)
+                        .apply()
+                    initial_camera = null
+                }
+                // The warmup is keyed to nothing region-specific — but a
                 // fresh import is the natural moment to ensure it has run
-                // for THIS archive's routing data.
+                // for THIS region's routing data.
                 warmEngine()
             } catch (e: Exception) {
                 _state.value = AtlasUiState.ImportFailed(
-                    e.message ?: "the archive could not be imported",
+                    e.message ?: "the map archive could not be imported",
                 )
             }
         }
     }
+
+    /**
+     * Adopts one routing ZIP into the installed region whose
+     * [RegionInfo.routingFingerprint] matches the ZIP's manifest. The ZIP
+     * is staged to the cache dir first — the manifest read needs the
+     * central directory (ZipInputStream refuses GitHub-artifact ZIPs), and
+     * the staged copy is what the adoption consumes, so the bytes are
+     * read exactly twice: once here, once into the segments dir.
+     * Unmatched / unreadable ZIPs degrade to a toast, never a failure.
+     */
+    private suspend fun installPairedRoutingZip(zip: Uri, regions: List<RegionInfo>) {
+        var staged: File? = null
+        try {
+            val staged_file = stageZipForPairing(zip, "the routing data file")
+            staged = staged_file
+            val fingerprint = routingZipFingerprint(staged_file)
+            val region = fingerprint?.let { fp ->
+                regions.firstOrNull { it.routingFingerprint == fp }
+            }
+            if (region == null) {
+                toast(
+                    "\"${zipDisplayName(zip)}\" was not built from any installed map " +
+                        "region — skipped. Atlas will prepare routing on this device instead.",
+                )
+                return
+            }
+            GraphBuildCoordinator.installRoutingData(app, region.id, Uri.fromFile(staged_file))
+            toast("Routing data installed for ${region.displayName} — routing is ready.")
+        } catch (e: CancellationException) {
+            // The import coroutine was cancelled (ViewModel cleared): not a
+            // user-facing failure, and the generic catch below would toast
+            // a false "was not installed" from it.
+            throw e
+        } catch (e: Exception) {
+            // The adopt path throws user-actionable messages by design;
+            // anything that slips through with a null or blank message
+            // must not render as "(null)".
+            val reason = e.message?.takeIf { it.isNotBlank() } ?: "an unexpected error"
+            toast(
+                "Routing data was not installed ($reason) — " +
+                    "Atlas will prepare routing on this device instead.",
+            )
+        } finally {
+            staged?.delete()
+        }
+    }
+
+    /**
+     * Adopts one search-index ZIP into the installed region whose
+     * [RegionInfo.searchFingerprint] matches the ZIP's DB file name — the
+     * same pairing the adoption itself validates against its manifest.
+     * Unmatched / unreadable ZIPs degrade to a toast, never a failure.
+     */
+    private suspend fun installPairedSearchZip(zip: Uri, regions: List<RegionInfo>) {
+        var staged: File? = null
+        var input: java.io.InputStream? = null
+        try {
+            val staged_file = stageZipForPairing(zip, "the search index file")
+            staged = staged_file
+            val fingerprint = searchZipFingerprint(staged_file)
+            val region = fingerprint?.let { fp ->
+                regions.firstOrNull { it.searchFingerprint == fp }
+            }
+            if (region == null) {
+                toast(
+                    "\"${zipDisplayName(zip)}\" was not built from any installed map " +
+                        "region — skipped. Atlas will build the search index on this device instead.",
+                )
+                return
+            }
+            val stream = app.contentResolver.openInputStream(Uri.fromFile(staged_file))
+                ?: error("the search index file could not be opened")
+            input = stream
+            val adoption = SearchCoordinator.adoptPrebuiltIndex(app, region, stream)
+            toast(
+                "Search index installed for ${region.displayName} — ${adoption.places} places " +
+                    "and ${adoption.addresses} addresses are searchable.",
+            )
+        } catch (e: CancellationException) {
+            // Same reasoning as the routing pairing above.
+            throw e
+        } catch (e: Exception) {
+            val reason = e.message?.takeIf { it.isNotBlank() } ?: "an unexpected error"
+            toast(
+                "Search index was not installed ($reason) — Atlas will build " +
+                    "the search index on this device instead.",
+            )
+        } finally {
+            input?.close()
+            staged?.delete()
+        }
+    }
+
+    /**
+     * Copies a routing/search ZIP into the cache dir so its central
+     * directory can be read: the CI artifacts' STORED entries carry data
+     * descriptors ZipInputStream refuses, so pairing needs a real file
+     * ([stageZip]). Bounded by the same caps the adoption uses — a huge or
+     * hostile file cannot fill the partition with an opaque ENOSPC.
+     */
+    private suspend fun stageZipForPairing(zip: Uri, what: String): File =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val staged = File(app.cacheDir, "pairing-" + System.nanoTime() + ".zip")
+            try {
+                val input = app.contentResolver.openInputStream(zip)
+                    ?: error("$what could not be opened")
+                input.use { stageZip(it, staged, PAIRING_ZIP_CAP_BYTES, PAIRING_FREE_FLOOR_BYTES, what) }
+                staged
+            } catch (e: Exception) {
+                staged.delete()
+                throw e
+            }
+        }
+
+    /**
+     * The archive fingerprint a staged routing ZIP's manifest pins, or
+     * null when the ZIP carries no manifest (a hand-made ZIP — the
+     * adoption's "trust the user" case has no fingerprint to pair by).
+     * A malformed manifest throws: that is a genuinely broken ZIP.
+     */
+    private fun routingZipFingerprint(staged: File): String? {
+        val zf = java.util.zip.ZipFile(staged)
+        try {
+            val entry = zf.entries().asSequence()
+                .firstOrNull { it.name.substringAfterLast('/') == "manifest.json" }
+                ?: return null
+            val out = java.io.ByteArrayOutputStream()
+            copyBounded(zf.getInputStream(entry), out, PAIRING_MANIFEST_CAP_BYTES, "the routing data manifest")
+            return parseRoutingManifest(out.toString(Charsets.UTF_8)).first
+        } finally {
+            zf.close()
+        }
+    }
+
+    /**
+     * The search fingerprint a staged search ZIP pins, read from the DB
+     * entry's name (`search-<fingerprint>.db` — the fingerprint IS the
+     * file name, per SearchIndexer.databaseFile), or null when no DB entry
+     * is present (nothing to pair by — skipped, not failed).
+     */
+    private fun searchZipFingerprint(staged: File): String? {
+        val zf = java.util.zip.ZipFile(staged)
+        try {
+            val name = zf.entries().asSequence()
+                .map { it.name.substringAfterLast('/') }
+                .firstOrNull { SEARCH_DB_ENTRY_RE.matchEntire(it) != null }
+                ?: return null
+            return SEARCH_DB_ENTRY_RE.matchEntire(name)!!.groupValues[1]
+        } finally {
+            zf.close()
+        }
+    }
+
+    /** A picked ZIP's display name for toasts and progress detail. */
+    private fun zipDisplayName(zip: Uri): String = repository.displayName(zip) ?: "the selected file"
 
     /** The one user-facing channel while no map/dialog surface exists yet. */
     private fun toast(message: String) {
@@ -1185,9 +1353,80 @@ class AtlasViewModel(
         _state.value = AtlasUiState.NeedsArchive
     }
 
-    private fun initialState(): AtlasUiState =
-        repository.loadArchiveInfo()?.let { AtlasUiState.MapReady(it) }
-            ?: AtlasUiState.NeedsArchive
+    /**
+     * Removes one installed region: the registry entry, its map tiles, its
+     * routing segments and its search DB + completion marker — the whole
+     * per-region footprint. The last removal lands back in NeedsArchive.
+     */
+    fun removeRegion(region: RegionInfo) {
+        // A live session may be reading exactly the segments (or snapping
+        // against the tiles) this delete removes — never under a driver.
+        if (navState.value !is NavigationCoordinator.NavState.Idle) {
+            toast("Stop navigation before removing map data")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                // A running :graph build (either kind) may hold the region's
+                // segment files or search DB open — stop it first, the same
+                // handshake the install paths use.
+                awaitStoppedBuild()
+                RegionStore.remove(app, region.id)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    // Per-region routing segments (WP3's per-region layout);
+                    // a missing dir is already a no-op for deleteRecursively.
+                    File(File(app.filesDir, "graph"), "segments/${region.id}").deleteRecursively()
+                    // The region's search index, fingerprint-keyed files.
+                    val search_dir = SearchCoordinator.searchDir(app)
+                    SearchIndexer.databaseFile(search_dir, region.searchFingerprint).delete()
+                    SearchIndexer.completionFile(search_dir, region.searchFingerprint).delete()
+                }
+                val regions = repository.loadRegions()
+                val next = readyState(regions)
+                if (next == null) {
+                    // The last region is gone: no tiles to render, no map
+                    // state to hold — the onboarding flow starts over. The
+                    // route goes with it (nothing left to route against).
+                    dismissRoute()
+                    _state.value = AtlasUiState.NeedsArchive
+                } else {
+                    _state.value = next
+                }
+                toast("Removed ${region.displayName}")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val reason = e.message?.takeIf { it.isNotBlank() } ?: "an unexpected error"
+                toast("The region could not be removed ($reason)")
+            }
+        }
+    }
+
+    /**
+     * The MapReady state for a region list, with [RegionStore.primaryRegion]
+     * resolved against the user's current view — null when the list is
+     * empty (→ NeedsArchive).
+     */
+    private fun readyState(regions: List<RegionInfo>): AtlasUiState? {
+        if (regions.isEmpty()) return null
+        val primary = RegionStore.primaryRegion(regions, cameraAnchor()) ?: regions.first()
+        return AtlasUiState.MapReady(regions, primary)
+    }
+
+    /**
+     * The anchor the primary region is picked by: where the user is
+     * looking (the persisted camera, else the last reported map center).
+     * Null before either exists — the newest import wins then.
+     */
+    private fun cameraAnchor(): Pair<Double, Double>? =
+        initial_camera?.let { it.lon to it.lat } ?: mapCenter?.let { it.lon to it.lat }
+
+    private fun initialState(): AtlasUiState {
+        // No camera anchor yet at construction time (initial_camera is
+        // initialized after _state) — the newest import is primary.
+        val regions = repository.loadRegions()
+        return readyState(regions) ?: AtlasUiState.NeedsArchive
+    }
 }
 
 /** The single AtlasViewModel, wired to the app container (manual DI). */
@@ -1227,3 +1466,15 @@ private const val SEARCH_DEBOUNCE_MS = 250L
 // Mirrors GraphPrepFlow's staleness budget: a running status older than
 // this means the :graph process died mid-build.
 private const val BUILD_STOP_STALE_MS = 90_000L
+
+// The fingerprint-pairing reads are bounded by the same caps the adoption
+// paths use: a routing ZIP can be ~GB scale (the CI artifacts are stored
+// uncompressed), the manifest a few MB, and 256 MB must stay free before
+// any of it is staged to the cache dir.
+private const val PAIRING_ZIP_CAP_BYTES = 16L shl 30 // 16 GB
+private const val PAIRING_MANIFEST_CAP_BYTES = 4L shl 20 // 4 MB
+private const val PAIRING_FREE_FLOOR_BYTES = 256L shl 20 // leave 256 MB free
+
+// The search-index ZIP's DB entry name carries its pairing fingerprint:
+// `search-<64 hex>.db` (SearchIndexer.databaseFile's layout).
+private val SEARCH_DB_ENTRY_RE = Regex("search-([0-9a-f]{64})\\.db")

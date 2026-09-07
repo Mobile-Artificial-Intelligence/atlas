@@ -33,8 +33,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.danemadsen.atlas.data.ArchiveInfo
-import com.danemadsen.atlas.data.ArchiveStore
+import com.danemadsen.atlas.data.RegionInfo
+import com.danemadsen.atlas.data.RegionStore
 import com.danemadsen.atlas.intent.ExternalMapIntentHandler
 import com.danemadsen.atlas.location.LocationPresence
 import com.danemadsen.atlas.location.LocationPresenceTracker
@@ -42,7 +42,6 @@ import com.danemadsen.atlas.mapstyle.StyleBuilder
 import com.danemadsen.atlas.mapstyle.Themes
 import com.danemadsen.atlas.nav.NavigationCoordinator
 import com.danemadsen.atlas.routing.GeoPoint
-import com.danemadsen.atlas.routing.GraphBuildCoordinator
 import com.danemadsen.atlas.routing.LocationPuck
 import com.danemadsen.atlas.routing.RouteRenderer
 import com.danemadsen.atlas.search.PlaceHit
@@ -121,10 +120,13 @@ fun MapScreen() {
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        val archive = (state as? AtlasUiState.MapReady)?.archive
-        if (archive != null) {
+        val ready = state as? AtlasUiState.MapReady
+        val regions = ready?.regions ?: emptyList()
+        val primary = ready?.primary
+        if (ready != null) {
             AtlasMap(
-                archive = archive,
+                regions = regions,
+                primary = ready.primary,
                 routeState = route_state,
                 navState = nav_state,
                 selectedPlace = selected_place,
@@ -136,7 +138,7 @@ fun MapScreen() {
                 onCameraSettled = view_model::onCameraSettled,
             )
         }
-        if (archive != null) {
+        if (ready != null) {
             // Edge-to-edge puts raw map labels behind the transparent
             // status bar, and with nothing behind them the system clock
             // collides head-on with street labels (measured: "5:31"
@@ -166,8 +168,8 @@ fun MapScreen() {
         }
         ImportArchiveFlow(
             state = state,
-            onImport = { archive, routing_data, search_data ->
-                view_model.importArchive(archive, routing_data, search_data)
+            onImport = { archives, routing_zips, search_zips ->
+                view_model.importRegions(archives, routing_zips, search_zips)
             },
             onRetry = view_model::dismissError,
         )
@@ -178,7 +180,7 @@ fun MapScreen() {
         val tts_muted by view_model.ttsMuted.collectAsStateWithLifecycle()
         val overlay_enabled by view_model.overlayEnabled.collectAsStateWithLifecycle()
         val ask_nav_notifications = rememberNavNotificationAsker()
-        if (archive != null) {
+        if (ready != null) {
             Column(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -218,7 +220,7 @@ fun MapScreen() {
                 }
             }
         }
-        if (archive != null) {
+        if (ready != null) {
             if (nav_state is NavigationCoordinator.NavState.Idle) {
                 // The bottom chrome is a tab layout, not an overlay: the
                 // Settings tab fills everything above the tab bar (the
@@ -235,13 +237,16 @@ fun MapScreen() {
                     when (active_tab) {
                         Tab.SETTINGS -> {
                             SettingsScreen(
-                            archive = archive,
+                            regions = regions,
                             ttsMuted = tts_muted,
                             onToggleTtsMute = view_model::toggleMute,
                             overlayEnabled = overlay_enabled,
                             onToggleOverlay = view_model::setOverlayEnabled,
                             onDismiss = view_model::closeSettings,
-                            onReplaceArchive = { uri -> view_model.importArchive(uri) },
+                            onAddRegions = { archives, routing_zips, search_zips ->
+                                view_model.addRegions(archives, routing_zips, search_zips)
+                            },
+                            onRemoveRegion = view_model::removeRegion,
                             onInstallRoutingData = view_model::installRoutingData,
                             onInstallSearchData = view_model::installSearchData,
                             onPrepareAllRoutingData = view_model::prepareAllRoutingData,
@@ -340,10 +345,16 @@ fun MapScreen() {
     }
 }
 
-/** The offline MapLibre map, restyled whenever the system theme flips. */
+/**
+ * The offline MapLibre map, restyled whenever the system theme flips. Every
+ * installed region contributes one vector source; [primary] wins symbol
+ * collisions (it is passed LAST to the style builder) and owns the fit and
+ * maxZoom clamps.
+ */
 @Composable
 fun AtlasMap(
-    archive: ArchiveInfo,
+    regions: List<RegionInfo>,
+    primary: RegionInfo,
     routeState: RouteUiState,
     navState: NavigationCoordinator.NavState,
     selectedPlace: PlaceHit?,
@@ -590,15 +601,29 @@ fun AtlasMap(
         (if (dark_theme) Themes.DARK else Themes.LIGHT).withMaterialAccent(material_accent_argb)
     val casing_argb = themeColorArgb(map_theme.colors.getValue("background"))
 
-    LaunchedEffect(map_libre, map_theme, archive) {
+    LaunchedEffect(map_libre, map_theme, regions) {
         val map = map_libre ?: return@LaunchedEffect
         val theme = map_theme
+        val active_primary = primary
+        val map_dir = RegionStore.mapDir(context)
+        // One vector source per region; the PRIMARY region goes LAST — the
+        // regions' list order is the render order, and the last region's
+        // symbols win style-wide collisions at the borders.
+        val sources = regions
+            .filter { it.id != active_primary.id }
+            .map { region ->
+                StyleBuilder.RegionSource(
+                    regionId = region.id,
+                    archivePath = RegionStore.archiveFile(map_dir, region.id).absolutePath,
+                )
+            } + StyleBuilder.RegionSource(
+            regionId = active_primary.id,
+            archivePath = RegionStore.archiveFile(map_dir, active_primary.id).absolutePath,
+        )
         val style_json = StyleBuilder.buildStyleJson(
             templateJson = loadStyleTemplate(context),
             theme = theme,
-            source = StyleBuilder.SourceInfo(
-                archivePath = ArchiveStore.archiveFile(context).absolutePath,
-            ),
+            sources = sources,
         )
         // setStyle() detaches the previous Style synchronously (its
         // validateState then throws IllegalStateException on ANY access),
@@ -612,7 +637,7 @@ fun AtlasMap(
         map.setStyle(Style.Builder().fromJson(style_json)) { style ->
             loaded_style = style
             // A theme restyle is not a camera reset: only the very first
-            // style load fits the archive. Reuse the camera the user had
+            // style load fits the regions. Reuse the camera the user had
             // (route rendering re-animates to the route bounds on top of
             // this, if a route is showing). A deep link applied while THIS
             // style was loading wins over both branches — the collector's
@@ -624,12 +649,12 @@ fun AtlasMap(
                     map.moveCamera(CameraUpdateFactory.newCameraPosition(previous_camera))
                 } else {
                     // Process death: reopen where the user left off, not
-                    // at the whole-archive fit — but only when the saved
-                    // camera is inside THIS archive (a replaced archive
-                    // clears it, and the bounds check is the second
+                    // at the whole-region fit — but only when the saved
+                    // camera is inside ANY installed region (a replaced
+                    // region clears it, and the bounds check is the second
                     // line of defense).
                     val saved = savedCamera?.takeIf {
-                        GraphBuildCoordinator.insideArchive(it.lon, it.lat, archive)
+                        RegionStore.regionForPoint(regions, it.lon, it.lat) != null
                     }
                     if (saved != null) {
                         programmatic_camera = true
@@ -644,7 +669,7 @@ fun AtlasMap(
                         )
                     } else {
                         programmatic_camera = true
-                        fitCameraToArchive(map, archive)
+                        fitCameraToRegion(map, active_primary)
                     }
                 }
             }
@@ -705,9 +730,9 @@ fun AtlasMap(
                             CameraUpdateFactory.newLatLngBounds(bounds.build(), ROUTE_BOUNDS_PADDING_PX)
                         )
                     } else {
-                        val capped = if (fitted.zoom > archive.maxZoom + PREVIEW_MAX_OVERZOOM) {
+                        val capped = if (fitted.zoom > primary.maxZoom + PREVIEW_MAX_OVERZOOM) {
                             CameraPosition.Builder(fitted)
-                                .zoom(archive.maxZoom + PREVIEW_MAX_OVERZOOM)
+                                .zoom(primary.maxZoom + PREVIEW_MAX_OVERZOOM)
                                 .build()
                         } else {
                             fitted
@@ -815,10 +840,10 @@ fun AtlasMap(
     }
 }
 
-private fun fitCameraToArchive(map: MapLibreMap, archive: ArchiveInfo) {
+private fun fitCameraToRegion(map: MapLibreMap, region: RegionInfo) {
     val bounds = LatLngBounds.Builder()
-        .include(LatLng(archive.north, archive.west))
-        .include(LatLng(archive.south, archive.east))
+        .include(LatLng(region.north, region.west))
+        .include(LatLng(region.south, region.east))
         .build()
     map.moveCamera(CameraUpdateFactory.newLatLngBounds(bounds, FIT_BOUNDS_PADDING_PX))
 }

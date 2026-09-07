@@ -36,25 +36,30 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
-import com.danemadsen.atlas.data.ArchiveInfo
+import com.danemadsen.atlas.data.RegionInfo
 
 /**
  * The Settings tab of the bottom navigation. Inline content (not a
  * dialog anymore — the tab bar stays reachable): the actions here are
- * consequential — replacing the archive, rebuilding routing data — and
- * deserve the whole screen with the map hidden underneath. Back and the
- * Map tab are the same way out; there is no close button to duplicate
- * them.
+ * consequential — adding or removing map regions, rebuilding routing
+ * data — and deserve the whole screen with the map hidden underneath.
+ * Back and the Map tab are the same way out; there is no close button to
+ * duplicate them.
  */
 @Composable
 fun SettingsScreen(
-    archive: ArchiveInfo,
+    regions: List<RegionInfo>,
     ttsMuted: Boolean,
     onToggleTtsMute: () -> Unit,
     overlayEnabled: Boolean,
     onToggleOverlay: (Boolean) -> Unit,
     onDismiss: () -> Unit,
-    onReplaceArchive: (uri: android.net.Uri) -> Unit,
+    onAddRegions: (
+        archives: List<android.net.Uri>,
+        routingZips: List<android.net.Uri>,
+        searchZips: List<android.net.Uri>,
+    ) -> Unit,
+    onRemoveRegion: (region: RegionInfo) -> Unit,
     onInstallRoutingData: (uri: android.net.Uri) -> Unit,
     onInstallSearchData: (uri: android.net.Uri) -> Unit,
     onPrepareAllRoutingData: () -> Unit,
@@ -69,11 +74,18 @@ fun SettingsScreen(
     // gets the same confirm step the destination picker would.
     var confirm_rebuild by remember { mutableStateOf(false) }
 
+    // The region row the user asked to remove — the confirm dialog below
+    // makes the deletion (tiles + routing + search data) explicit.
+    var pending_remove by remember { mutableStateOf<RegionInfo?>(null) }
+
     // `.pmtiles` has no registered MIME type — the picker accepts all
-    // files, exactly like the first-launch import.
-    val archive_launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri -> if (uri != null) onReplaceArchive(uri) }
+    // files, exactly like the first-launch import. Multi-select: any
+    // number of regions can land in one pass.
+    val add_regions_launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (!uris.isNullOrEmpty()) onAddRegions(uris, emptyList(), emptyList())
+    }
 
     // Same story for the routing ZIP: no registered MIME type for a file
     // the user side-loads from a CI artifact download.
@@ -165,18 +177,40 @@ fun SettingsScreen(
                     // A little air between the header's divider and the
                     // first section title.
                     SettingsSectionLabel("Map data", Modifier.padding(top = 12.dp))
-                    Text(
-                        "${archive.fileName} · ${formatBytes(archive.sizeBytes)}",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    Text(
-                        "zooms ${archive.minZoom}–${archive.maxZoom}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                    TextButton(onClick = { archive_launcher.launch(arrayOf("*/*")) }) {
-                        Text("Replace map archive")
+                    // One row per installed region: what it covers (name,
+                    // size, zoom range) and the one destructive action it
+                    // carries. Replacement is re-importing the same-named
+                    // archive — a fingerprint match updates a region in
+                    // place, so no separate "replace" action exists.
+                    regions.forEach { region ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 6.dp),
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "${region.displayName} · ${formatBytes(region.sizeBytes)}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                Text(
+                                    "zooms ${region.minZoom}–${region.maxZoom}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                )
+                            }
+                            TextButton(onClick = { pending_remove = region }) {
+                                Text("Remove")
+                            }
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { add_regions_launcher.launch(arrayOf("*/*")) },
+                        modifier = Modifier.padding(top = 8.dp),
+                    ) {
+                        Text("Add map region")
                     }
 
                     HorizontalDivider(Modifier.padding(vertical = 12.dp))
@@ -313,6 +347,28 @@ fun SettingsScreen(
                 }
             }
         }
+
+    pending_remove?.let { region ->
+        AlertDialog(
+            onDismissRequest = { pending_remove = null },
+            title = { Text("Remove ${region.displayName}?") },
+            text = {
+                Text(
+                    "Its map tiles, routing data and search index are deleted " +
+                        "from the device. Other regions are not affected.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pending_remove = null
+                    onRemoveRegion(region)
+                }) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pending_remove = null }) { Text("Cancel") }
+            },
+        )
+    }
 
     if (confirm_rebuild) {
         AlertDialog(

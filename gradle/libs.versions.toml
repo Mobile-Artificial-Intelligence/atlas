@@ -8,6 +8,7 @@ maplibre-android = "13.6.0"
 core-ktx = "1.17.0"
 coroutines = "1.10.2"
 kotlinx-io = "0.8.2"
+kotlinx-serialization-json = "1.9.0"
 spatialk-geojson = "0.6.1"
 androidx-collection = "1.5.0"
 room = "2.8.0"
@@ -34,6 +35,7 @@ coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-
 coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 kotlinx-io-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-io-core", version.ref = "kotlinx-io" }
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinx-serialization-json" }
 spatialk-geojson = { group = "org.maplibre.spatialk", name = "geojson", version.ref = "spatialk-geojson" }
 spatialk-turf = { group = "org.maplibre.spatialk", name = "turf", version.ref = "spatialk-geojson" }
 spatialk-units = { group = "org.maplibre.spatialk", name = "units", version.ref = "spatialk-geojson" }
