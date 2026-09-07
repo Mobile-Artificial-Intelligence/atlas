@@ -182,28 +182,44 @@ fun ImportArchiveFlow(
                     }
                     steps.forEachIndexed { index, (stage, label) ->
                         val running = stage == state.stage
+                        // The copy progress bar lives INSIDE its row — below
+                        // the label, above the row's trailing divider — so it
+                        // reads as part of the copy stage, not the next one.
+                        val bar: (@Composable () -> Unit)? = when {
+                            running && stage == ImportStage.COPY_ARCHIVE && state.progress != null -> {
+                                {
+                                    LinearProgressIndicator(
+                                        progress = { state.progress },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 2.dp, bottom = 4.dp),
+                                    )
+                                }
+                            }
+                            // A bare copy with no percentage yet (the file
+                            // size query can stall) must not look frozen.
+                            // Guarded on progress==null, or it stacks under
+                            // the determinate bar the moment the percentage
+                            // starts arriving; and on steps.size==1, or the
+                            // running row's spinner already says as much.
+                            running && stage == ImportStage.COPY_ARCHIVE &&
+                                steps.size == 1 && state.progress == null -> {
+                                {
+                                    LinearProgressIndicator(
+                                        Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 4.dp),
+                                    )
+                                }
+                            }
+                            else -> null
+                        }
                         ImportStageRow(
                             label = label,
                             detail = if (running) state.detail else null,
                             done = stage < state.stage,
                             running = running,
                             last = index == steps.lastIndex,
+                            bar = bar,
                         )
-                        if (running && stage == ImportStage.COPY_ARCHIVE && state.progress != null) {
-                            LinearProgressIndicator(
-                                progress = { state.progress },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(start = 32.dp, top = 2.dp, bottom = 4.dp),
-                            )
-                        }
-                    }
-                    if (steps.size == 1 && state.progress == null) {
-                        // A bare copy with no percentage yet (the file size
-                        // query can stall) must not look frozen. Guarded on
-                        // progress==null, or it stacks under the determinate
-                        // bar the moment the percentage starts arriving.
-                        LinearProgressIndicator(Modifier.fillMaxWidth().padding(start = 32.dp, top = 2.dp))
                     }
                 }
             },
@@ -325,6 +341,7 @@ private fun ImportStageRow(
     done: Boolean,
     running: Boolean,
     last: Boolean,
+    bar: (@Composable () -> Unit)? = null,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -364,6 +381,11 @@ private fun ImportStageRow(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            if (bar != null) {
+                // Starts at the column's own inset — text and bar already
+                // align 32.dp in from the row edge, no extra start padding.
+                bar()
             }
         }
     }
