@@ -99,7 +99,13 @@ object StyleBuilder {
             "sources",
             buildJsonObject {
                 for (region in sources) {
-                    put(region.regionId, buildJsonObject {
+                    // The key must match what the layers reference:
+                    // sourceName(regionId) — splitLayersAcrossSources rewrites
+                    // every sourced layer's `source` to it. Keying by the raw
+                    // region id leaves every layer pointing at a source that
+                    // does not exist (MapLibre skips such layers, rendering
+                    // background only — the black-map regression).
+                    put(sourceName(region.regionId), buildJsonObject {
                         put("type", "vector")
                         put("url", "pmtiles://file://" + region.archivePath)
                     })

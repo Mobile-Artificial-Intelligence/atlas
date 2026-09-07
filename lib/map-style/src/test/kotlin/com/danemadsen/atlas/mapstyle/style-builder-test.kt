@@ -116,6 +116,31 @@ class StyleBuilderTest {
     }
 
     @Test
+    fun everyLayerSourceExistsInTheSourcesMap() {
+        // The black-map regression: the sources map was keyed by raw region
+        // id ("australia") while layers referenced "openmaptiles-australia"
+        // — MapLibre skips layers whose source is missing, leaving only the
+        // background. A layer's `source` must always resolve.
+        val two = sources("australia", "us-georgia")
+        val style = StyleBuilder.buildStyleJson(template, Themes.DARK, two)
+        val json = kotlinx.serialization.json.Json
+        val root = json.parseToJsonElement(style) as kotlinx.serialization.json.JsonObject
+        val declared = (root["sources"] as kotlinx.serialization.json.JsonObject).keys
+        assertTrue("openmaptiles-australia" in declared)
+        assertTrue("openmaptiles-us-georgia" in declared)
+        for (layer in root["layers"]!! as kotlinx.serialization.json.JsonArray) {
+            val obj = layer as kotlinx.serialization.json.JsonObject
+            val source = (obj["source"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+            if (source != null) {
+                assertTrue(
+                    source in declared,
+                    "layer ${obj["id"]} references missing source $source",
+                )
+            }
+        }
+    }
+
+    @Test
     fun layerIdsStayUniqueAcrossRegions() {
         val two = sources("australia", "us-georgia")
         val style = StyleBuilder.buildStyleJson(template, Themes.LIGHT, two)
