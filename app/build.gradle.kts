@@ -72,6 +72,12 @@ android {
             if (release_signing_complete) {
                 signingConfig = signingConfigs.getByName("release")
             }
+            // Sideloading gate: Android Auto's phone host hides any app not
+            // from the Play Store unless the APK is debuggable (plus the
+            // "Unknown sources" toggle in AA's developer settings). Without
+            // this flag Atlas never shows in the AA app menu — silent, no
+            // error. TODO(release): flip off for store builds.
+            isDebuggable = true
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
