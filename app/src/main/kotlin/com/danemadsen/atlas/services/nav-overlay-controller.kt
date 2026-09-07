@@ -208,15 +208,20 @@ private class OverlayLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner {
 }
 
 /**
- * The window's content: the in-app banner (which owns the null-snapshot
- * "Waiting for a GPS fix…" and past-the-last-turn ARRIVE states for free)
- * plus a remaining/ETA row. The 280.dp width keeps the touchable region
- * exactly the banner — FLAG_NOT_TOUCH_MODAL routes everything else to the
- * app underneath.
+ * The window's content: the in-app banner plus a remaining/ETA row. It
+ * renders nothing before the first fix (TurnBanner owns that null-snapshot
+ * silence, and the message would just duplicate the bottom panel's) and
+ * owns the past-the-last-turn ARRIVE state for free. The 280.dp width
+ * keeps the touchable region exactly the banner — FLAG_NOT_TOUCH_MODAL
+ * routes everything else to the app underneath.
  */
 @Composable
 private fun OverlayBanner(state: NavigationCoordinator.NavState, onDrag: (Float, Float) -> Unit) {
     val snapshot = (state as? NavigationCoordinator.NavState.Navigating)?.snapshot
+    // No fix yet: there is no guidance to float, and the message would
+    // duplicate the bottom panel's while the app is foregrounded. The
+    // window stays attached but renders nothing until the first fix.
+    if (snapshot == null) return
     Surface(
         modifier = Modifier
             .width(280.dp)
@@ -235,22 +240,20 @@ private fun OverlayBanner(state: NavigationCoordinator.NavState, onDrag: (Float,
     ) {
         Column {
             TurnBanner(snapshot = snapshot)
-            if (snapshot != null) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                ) {
-                    Text(
-                        formatDistance(snapshot.remainingMeters.roundToInt()),
-                        style = MaterialTheme.typography.labelLarge,
-                    )
-                    Spacer(Modifier.padding(start = 10.dp))
-                    Text(
-                        "· ${formatDuration(snapshot.remainingSeconds)}",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    formatDistance(snapshot.remainingMeters.roundToInt()),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Spacer(Modifier.padding(start = 10.dp))
+                Text(
+                    "· ${formatDuration(snapshot.remainingSeconds)}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

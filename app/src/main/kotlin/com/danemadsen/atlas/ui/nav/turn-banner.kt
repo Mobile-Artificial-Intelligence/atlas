@@ -25,25 +25,22 @@ import kotlin.math.roundToInt
  * maneuver icon, the live distance to it, and the instruction with the
  * street it leads onto. Google-Maps-shaped: the distance is what glances
  * read first, the instruction second.
+ *
+ * Renders nothing before the first snapshot: with no GPS fix there is no
+ * maneuver to show, and the bottom panel already carries the "Waiting for
+ * a GPS fix…" message — saying it here too would just duplicate it.
  */
 @Composable
 fun TurnBanner(
     snapshot: NavigationProgress.Snapshot?,
     modifier: Modifier = Modifier,
 ) {
+    if (snapshot == null) return
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surfaceContainer,
         shadowElevation = 6.dp,
     ) {
-        if (snapshot == null) {
-            Text(
-                "Waiting for a GPS fix…",
-                modifier = Modifier.padding(16.dp),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            return@Surface
-        }
         val turn = snapshot.nextTurn
         Row(
             verticalAlignment = Alignment.CenterVertically,
