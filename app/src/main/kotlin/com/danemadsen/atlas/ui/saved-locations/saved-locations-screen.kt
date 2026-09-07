@@ -3,6 +3,7 @@ package com.danemadsen.atlas.ui.savedlocations
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,11 +11,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Work
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -31,15 +38,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import java.util.Locale
 
 /**
- * The Saved tab of the bottom navigation: the Home/Work pins, the arbitrary
- * saved places, and the ways to create them. Inline content like Settings —
- * the whole screen with the map hidden underneath; Back and the Map tab are
- * the same way out.
+ * The Saved tab of the bottom navigation: a list of the user's saved
+ * locations — Home and Work at the top when set, then the rest. Slots are
+ * set from the map's location menu (a long-press); this screen routes,
+ * renames, and deletes. Inline content like Settings — the whole screen
+ * with the map hidden underneath; Back and the Map tab are the same way
+ * out.
  */
 @Composable
 fun SavedLocationsScreen(
@@ -48,8 +58,6 @@ fun SavedLocationsScreen(
     onRename: (id: String, name: String) -> Unit,
     onDelete: (id: String) -> Unit,
     onClearSlot: (id: String) -> Unit,
-    onBeginPick: (slot: SavedSlot?) -> Unit,
-    onSaveMapCenter: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -92,57 +100,29 @@ fun SavedLocationsScreen(
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp),
             ) {
-                // Pinned slots, fixed order, each either filled or promptable.
-                SettingsSectionLabel("Pinned")
-                for (slot in SavedSlot.entries) {
-                    val pinned = savedLocations.firstOrNull { it.slot == slot }
-                    if (pinned != null) {
+                // Home and Work, only when set — the top of the list, with
+                // the most-tapped pins up front. Unset slots say nothing:
+                // the empty-state hint and the map's location menu teach
+                // where they come from.
+                val pinned = SavedSlot.entries.mapNotNull { slot ->
+                    savedLocations.firstOrNull { it.slot == slot }
+                }
+                if (pinned.isNotEmpty()) {
+                    SettingsSectionLabel("Pinned")
+                    for (location in pinned) {
                         SavedLocationRow(
-                            location = pinned,
-                            displayName = pinned.name.ifBlank { slot.defaultLabel() },
-                            onRoute = { onRouteToSaved(pinned) },
-                            onOpenActions = { actions_for = pinned },
+                            location = location,
+                            displayName = location.name.ifBlank { location.slot?.defaultLabel() ?: DEFAULT_PIN_NAME },
+                            icon = slotIcon(location.slot),
+                            onRoute = { onRouteToSaved(location) },
+                            onOpenActions = { actions_for = location },
                         )
-                    } else {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 6.dp),
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("${slot.defaultLabel()} not set", style = MaterialTheme.typography.titleSmall)
-                                Text(
-                                    "Long-press the map to set it, or save from search.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                            TextButton(onClick = { onBeginPick(slot) }) { Text("Set from the map") }
-                        }
                     }
                 }
 
-                HorizontalDivider(Modifier.padding(vertical = 12.dp))
-                SettingsSectionLabel("Add")
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(vertical = 4.dp),
-                ) {
-                    TextButton(onClick = onSaveMapCenter) { Text("Save map center") }
-                    Spacer(Modifier.height(8.dp))
-                    TextButton(onClick = { onBeginPick(null) }) { Text("Pick on map") }
-                }
-                Text(
-                    "Save the place you are looking at, or arm the map's long-press: " +
-                        "the next long-press saves instead of routing.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-
                 val general = savedLocations.filter { it.slot == null }
                 if (general.isNotEmpty()) {
-                    HorizontalDivider(Modifier.padding(vertical = 12.dp))
+                    if (pinned.isNotEmpty()) HorizontalDivider(Modifier.padding(vertical = 12.dp))
                     SettingsSectionLabel("Places")
                     // A plain Column (not LazyColumn): nested scrolling inside
                     // the verticalScroll parent must be avoided.
@@ -151,6 +131,7 @@ fun SavedLocationsScreen(
                             SavedLocationRow(
                                 location = location,
                                 displayName = location.name.ifBlank { DEFAULT_PIN_NAME },
+                                icon = Icons.Filled.Place,
                                 onRoute = { onRouteToSaved(location) },
                                 onOpenActions = { actions_for = location },
                             )
@@ -160,7 +141,7 @@ fun SavedLocationsScreen(
 
                 if (savedLocations.isEmpty()) {
                     Text(
-                        "Pin Home and Work for one-tap routing, or save places from search.",
+                        "Long-press the map to set Home and Work or save a location.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 16.dp),
@@ -263,6 +244,7 @@ private fun RenameDialog(
 private fun SavedLocationRow(
     location: SavedLocation,
     displayName: String,
+    icon: ImageVector,
     onRoute: () -> Unit,
     onOpenActions: () -> Unit,
 ) {
@@ -273,8 +255,23 @@ private fun SavedLocationRow(
             // Tap routes; long-press opens the action dialog — with the
             // trailing MoreVert as the discoverable alternative.
             .combinedClickable(onClick = onRoute, onLongClick = onOpenActions)
-            .padding(vertical = 6.dp),
+            .padding(vertical = 8.dp),
     ) {
+        // The leading avatar: Home/Work get their own icon, places a pin.
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.secondaryContainer,
+            modifier = Modifier.size(40.dp),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(displayName, style = MaterialTheme.typography.titleSmall)
             Text(
@@ -289,29 +286,11 @@ private fun SavedLocationRow(
     }
 }
 
-/**
- * Shown on the Map tab while a pick is armed, so the armed state — the
- * next long-press saves instead of routing — is always visible and
- * cancellable. Exported for MapScreen's bottom column.
- */
-@Composable
-fun SavedPickBanner(onCancel: () -> Unit) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shadowElevation = 4.dp,
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 16.dp),
-        ) {
-            Text(
-                "Long-press the map to save this location",
-                modifier = Modifier.weight(1f),
-            )
-            TextButton(onClick = onCancel) { Text("Cancel") }
-        }
-    }
+/** The leading-avatar icon for a pinned slot. */
+private fun slotIcon(slot: SavedSlot?): ImageVector = when (slot) {
+    SavedSlot.HOME -> Icons.Filled.Home
+    SavedSlot.WORK -> Icons.Filled.Work
+    null -> Icons.Filled.Place
 }
 
 @Composable

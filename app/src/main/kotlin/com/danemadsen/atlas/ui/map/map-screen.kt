@@ -60,7 +60,6 @@ import com.danemadsen.atlas.ui.rememberAtlasViewModel
 import com.danemadsen.atlas.ui.Tab
 import com.danemadsen.atlas.ui.route.RoutePreviewPanel
 import com.danemadsen.atlas.ui.savedlocations.SavedLocationsScreen
-import com.danemadsen.atlas.ui.savedlocations.SavedPickBanner
 import com.danemadsen.atlas.ui.search.SearchBar
 import com.danemadsen.atlas.ui.search.SearchResultsPanel
 import com.danemadsen.atlas.ui.settings.SettingsScreen
@@ -144,7 +143,7 @@ fun MapScreen() {
             onRetry = view_model::dismissError,
         )
         val active_tab by view_model.activeTab.collectAsStateWithLifecycle()
-        val pick_pending by view_model.pickPending.collectAsStateWithLifecycle()
+        val location_menu_point by view_model.locationMenuPoint.collectAsStateWithLifecycle()
         val saved_locations by view_model.savedLocations.collectAsStateWithLifecycle()
         val tts_muted by view_model.ttsMuted.collectAsStateWithLifecycle()
         val overlay_enabled by view_model.overlayEnabled.collectAsStateWithLifecycle()
@@ -170,7 +169,6 @@ fun MapScreen() {
                     // them would be an interactive hole in that panel.
                     SearchBar(
                         query = search_query,
-                        searchState = search_state,
                         onQueryChange = { query ->
                             search_query = query
                             view_model.onSearchQueryChange(query)
@@ -223,21 +221,26 @@ fun MapScreen() {
                             onRename = view_model::renameSavedLocation,
                             onDelete = view_model::deleteSavedLocation,
                             onClearSlot = view_model::clearSavedSlot,
-                            onBeginPick = view_model::beginPickSavedLocation,
-                            onSaveMapCenter = view_model::saveMapCenter,
                             onDismiss = view_model::closeSettings,
                             modifier = Modifier.weight(1f),
                         )
-                        // A routing build can also be running (or fail)
-                        // while the user sits on this tab — the banner and
-                        // its Cancel button must not unmount with the Map
-                        // tab, or a 30-minute job has no visible surface.
+                        // A routing or search build can also be running
+                        // (or fail) while the user sits on this tab — the
+                        // banner and its Cancel button must not unmount
+                        // with the Map tab, or a 30-minute job has no
+                        // visible surface.
                         GraphPrepFlow(state, route_state)
                     }
                     Tab.MAP -> {
-                        // The armed pick mode is always visible so the
-                        // next long-press's meaning is never a surprise.
-                        pick_pending?.let { SavedPickBanner(onCancel = view_model::cancelPickSavedLocation) }
+                        // The long-press location menu: route, save as
+                        // Home/Work, or save as a plain location.
+                        LocationMenuPanel(
+                            point = location_menu_point,
+                            onDismiss = view_model::dismissLocationMenu,
+                            onRoute = view_model::routeHere,
+                            onSetSlot = view_model::setSlotFromMenu,
+                            onSave = view_model::saveMenuPoint,
+                        )
                         // Navigation owns the drawer from Start until it
                         // ends (arrived, failed, or Stop) — exactly one
                         // way out, never a route preview stacked under a

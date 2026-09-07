@@ -86,8 +86,6 @@ sealed interface RouteUiState {
 /** The search side of the screen: query → debounced results → drawer. */
 sealed interface SearchUiState {
     data object Idle : SearchUiState
-    /** The index pass is running — results cannot exist yet. */
-    data class Indexing(val indexed: Boolean) : SearchUiState
     data class Results(val hits: List<PlaceHit>) : SearchUiState
 }
 
@@ -138,7 +136,6 @@ class AtlasViewModel(
 
     /** The debounced query job; a new keystroke cancels the old one. */
     private var searchJob: Job? = null
-    private var searchIndexJob: Job? = null
 
     /** The in-flight routing-ZIP install — single flight, see installRoutingData. */
     private var install_job: Job? = null
@@ -225,14 +222,18 @@ class AtlasViewModel(
     val savedLocations: StateFlow<List<SavedLocation>> = _savedLocations.asStateFlow()
 
     /**
-     * The armed pick-on-map mode: the next long-press saves a location
-     * instead of routing. Single-shot — the first long-press consumes it —
-     * and always visible on the Map tab via the SavedPickBanner.
+     * The map's long-press location menu: a chosen point the user can
+     * route to, save as Home/Work, or save as a plain location — the one
+     * place slots are set from, now that the saved-locations screen no
+     * longer sets them.
      */
-    data class SavedPickRequest(val slot: SavedSlot?)
+    private val _locationMenuPoint = MutableStateFlow<GeoPoint?>(null)
+    val locationMenuPoint: StateFlow<GeoPoint?> = _locationMenuPoint.asStateFlow()
 
-    private val _pickPending = MutableStateFlow<SavedPickRequest?>(null)
-    val pickPending: StateFlow<SavedPickRequest?> = _pickPending.asStateFlow()
+    /** The menu's tap-away/Cancel: clears the menu without side effects. */
+    fun dismissLocationMenu() {
+        _locationMenuPoint.value = null
+    }
 
     /**
      * Voice-guidance mute, persisted so it survives process death and
@@ -306,10 +307,11 @@ class AtlasViewModel(
             }
         }
         // An archive without an index (a mid-import process death, or an
-        // install from before search existed) gets its cheap pass here —
-        // search then works on first launch of an existing install too.
+        // install from before search existed) gets its build triggered
+        // here — through the coordinator's ordering rule, so a routing
+        // build that is about to run goes first.
         if ((state.value as? AtlasUiState.MapReady)?.archive != null) {
-            ensureSearchIndex(com.danemadsen.atlas.data.ArchiveStore.archiveFile(app))
+            viewModelScope.launch { GraphBuildCoordinator.triggerSearchIndex(app) }
         }
         // Same for the engine warmup: with an archive on disk the map is
         // already usable, so the cold-engine cost belongs here in the
@@ -367,30 +369,15 @@ class AtlasViewModel(
         }
     }
 
-    private fun ensureSearchIndex(archiveFile: java.io.File) {
-        if (SearchCoordinator.indexExists(app, archiveFile)) return
-        if (searchIndexJob?.isActive == true) return
-        _searchState.value = SearchUiState.Indexing(false)
-        searchIndexJob = viewModelScope.launch {
-            try {
-                SearchCoordinator.buildCheapIndex(app, archiveFile)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                // An unhandled coroutine exception would take the whole
-                // process down — and this runs from init on every cold
-                // start while the index is missing, so a persistently
-                // failing build would crash-loop the app. Instead the
-                // failure surfaces once and search degrades to empty
-                // results until the next launch retries it.
-                toast(
-                    "Search index could not be built — search is unavailable " +
-                        "(${e.message?.takeIf { it.isNotBlank() } ?: "an unexpected error"})",
-                )
-            } finally {
-                _searchState.value = SearchUiState.Idle
-            }
-        }
+    /**
+     * Kicks the search-index build through the coordinator's ordering
+     * rule — routing data first, search second. The on-device pass runs
+     * in the background `:graph` service; progress lands in the same
+     * status banner routing uses, and a failure is announced by the
+     * service's done notification.
+     */
+    private fun ensureSearchIndex(force: Boolean = false) {
+        viewModelScope.launch { GraphBuildCoordinator.triggerSearchIndex(app, force) }
     }
 
     /**
@@ -616,41 +603,53 @@ class AtlasViewModel(
     }
 
     /**
-     * Arms pick-on-map and jumps to the Map tab (the pick happens there).
-     * The pick is consumed by the next long-press — [onMapLongPress] — and
-     * the banner on the Map tab keeps the armed state visible.
+     * The map's long-press now opens the location menu instead of routing
+     * straight away — the menu (route / save as Home / save as Work /
+     * save as a location) is the one place slots get set from.
      */
-    fun beginPickSavedLocation(slot: SavedSlot?) {
-        _pickPending.value = SavedPickRequest(slot)
-        _activeTab.value = Tab.MAP
+    fun onMapLongPress(point: GeoPoint) {
+        _locationMenuPoint.value = point
     }
 
-    fun cancelPickSavedLocation() {
-        _pickPending.value = null
+    /** The menu's Route button: the same choke point every destination
+     * uses, then the menu goes away. */
+    fun routeHere(point: GeoPoint) {
+        _locationMenuPoint.value = null
+        requestRoute(point)
     }
 
     /**
-     * The map's long-press: a pick-pending interception in front of
-     * [requestRoute], so arming a save redirects exactly one long-press.
-     * Byte-identical routing behavior when no pick is pending.
+     * The menu's save buttons: Home/Work land in their slots (replacing
+     * any previous occupant), a plain save appends. Both clear the menu —
+     * the point is consumed either way.
      */
-    fun onMapLongPress(point: GeoPoint) {
-        val pick = _pickPending.value
-        if (pick != null) {
-            _pickPending.value = null
-            saveLocation(
-                SavedLocation(
-                    id = SavedLocationStore.newId(),
-                    name = pick.slot?.defaultLabel() ?: DEFAULT_PIN_NAME,
-                    lon = point.lon,
-                    lat = point.lat,
-                    slot = pick.slot,
-                ),
-            )
-            toast("Location saved")
-            return
-        }
-        requestRoute(point)
+    fun setSlotFromMenu(slot: SavedSlot) {
+        val point = _locationMenuPoint.value ?: return
+        saveLocation(
+            SavedLocation(
+                id = SavedLocationStore.newId(),
+                name = slot.defaultLabel(),
+                lon = point.lon,
+                lat = point.lat,
+                slot = slot,
+            ),
+        )
+        _locationMenuPoint.value = null
+        toast("Set as ${slot.defaultLabel()}")
+    }
+
+    fun saveMenuPoint() {
+        val point = _locationMenuPoint.value ?: return
+        saveLocation(
+            SavedLocation(
+                id = SavedLocationStore.newId(),
+                name = DEFAULT_PIN_NAME,
+                lon = point.lon,
+                lat = point.lat,
+            ),
+        )
+        _locationMenuPoint.value = null
+        toast("Location saved")
     }
 
     /** Search results' Save button: a named save, staying on the Map tab. */
@@ -822,11 +821,10 @@ class AtlasViewModel(
         }
         search_install_job = viewModelScope.launch {
             try {
-                // A running cheap pass writes the very DB file the adoption
-                // renames into — stop it first. Its cancellation is
-                // cooperative (checked every zoom bracket / 256 tiles), so
-                // join, don't race it.
-                searchIndexJob?.cancelAndJoin()
+                // A running pass (either kind) writes files the adoption
+                // renames into — stop it first, same handshake the routing
+                // install uses. Cancel is cooperative, so wait it out.
+                awaitStoppedBuild()
                 val input = app.contentResolver.openInputStream(uri)
                     ?: error("the search index file could not be opened")
                 val adoption = try {
@@ -853,30 +851,37 @@ class AtlasViewModel(
     }
 
     /**
-     * Settings' "Rebuild search index": the DBs are wiped and the cheap
-     * pass re-runs (tens of seconds, surfaced through the search state).
-     * Like the other two rebuild actions, it leaves the Settings tab —
-     * its only progress surface (the "Indexing places" chip) lives in
-     * the search bar on the Map tab.
+     * Settings' "Rebuild search index": the DBs are wiped and the pass
+     * re-runs through the background service — progress lands in the
+     * same status banner routing uses. Like the other rebuild actions,
+     * it leaves the Settings tab for the Map tab.
      */
     fun rebuildSearchIndex() {
         if ((_state.value as? AtlasUiState.MapReady)?.archive == null) return
         _activeTab.value = Tab.MAP
         viewModelScope.launch {
-            // cancel() alone is asynchronous — ensureSearchIndex below would
-            // see the old job still "active" and return without scheduling
-            // anything, leaving search dead until the next launch. Wait for
-            // the pass to unwind (it checks cancellation every 256 tiles /
-            // zoom bracket) before wiping the DBs it may still hold open.
-            // The Settings install joins the coordinator's same write lock,
-            // so it must unwind too — wiping under it would delete the live
-            // DB mid-adopt, and the rebuild's recovery pass would then hit
-            // the still-held lock and silently never run.
-            searchIndexJob?.cancelAndJoin()
-            search_install_job?.cancelAndJoin()
+            awaitStoppedBuild()
             SearchCoordinator.deleteIndexes(app)
-            _searchState.value = SearchUiState.Idle
-            ensureSearchIndex(com.danemadsen.atlas.data.ArchiveStore.archiveFile(app))
+            ensureSearchIndex(force = true)
+        }
+    }
+
+    /**
+     * Stops any live `:graph` build (either kind) and waits for the
+     * service to unwind — the same handshake installRoutingData uses,
+     * shared now that search builds in the service too. Used by the
+     * Settings install/rebuild paths before they touch the files a live
+     * run is writing.
+     */
+    private suspend fun awaitStoppedBuild() {
+        if (GraphBuildCoordinator.readStatusAsync(app)?.running != true) return
+        toast("Stopping the running build first…")
+        GraphBuildCoordinator.cancel(app)
+        while (true) {
+            val status = GraphBuildCoordinator.readStatusAsync(app)
+            if (status?.running != true) break
+            if (System.currentTimeMillis() - status.timestampMs > BUILD_STOP_STALE_MS) break
+            delay(2_000)
         }
     }
 
@@ -960,8 +965,7 @@ class AtlasViewModel(
                 // adopt's live DB out from under it (and this import's own
                 // adopt below would hit the still-held lock and silently
                 // never run).
-                searchIndexJob?.cancelAndJoin()
-                search_install_job?.cancelAndJoin()
+                awaitStoppedBuild()
                 SearchCoordinator.deleteIndexes(app)
                 val archive_file = com.danemadsen.atlas.data.ArchiveStore.archiveFile(app)
                 var search_installed = false
@@ -1004,11 +1008,12 @@ class AtlasViewModel(
                         )
                     }
                 }
-                if (!search_installed) ensureSearchIndex(archive_file)
+                if (!search_installed) ensureSearchIndex()
                 _state.value = AtlasUiState.MapReady(info)
                 // A new archive must not inherit the previous archive's
-                // dismissed-build tombstone.
+                // dismissed-build tombstones — either kind.
                 GraphBuildCoordinator.setBuildDismissed(app, false)
+                GraphBuildCoordinator.setSearchDismissed(app, false)
                 // Nor its camera or any route aimed at the old tiles:
                 // both restores are bounds-checked against the new
                 // archive, but the clean slate is simpler and correct.

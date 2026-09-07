@@ -82,6 +82,13 @@ class GraphBuildService : Service() {
     @Volatile private var timedOut = false
 
     /**
+     * The active run's kind ("routing" or "search"), set at [run] start and
+     * read by ACTION_CANCEL (only routing has a manager to cancel) and by
+     * the finally's kind-aware announcements.
+     */
+    @Volatile private var currentKind = KIND_ROUTING
+
+    /**
      * True once this run actually built something: a run whose buckets were
      * all already built (the routine no-op case) must not announce itself.
      */
@@ -118,7 +125,7 @@ class GraphBuildService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_BUILD_FOR_LOCATION -> {
-                startForegroundWith(buildNotification())
+                startForegroundWith(buildNotification(KIND_ROUTING))
                 val lon = intent.getDoubleExtra(EXTRA_LON, Double.NaN)
                 val lat = intent.getDoubleExtra(EXTRA_LAT, Double.NaN)
                 if (lon.isNaN() || lat.isNaN()) {
@@ -135,19 +142,26 @@ class GraphBuildService : Service() {
                 }
             }
             ACTION_BUILD_ALL -> {
-                startForegroundWith(buildNotification())
+                startForegroundWith(buildNotification(KIND_ROUTING))
+                run(intent)
+            }
+            ACTION_INDEX_SEARCH -> {
+                startForegroundWith(buildNotification(KIND_SEARCH))
                 run(intent)
             }
             ACTION_CANCEL -> {
                 if (runJob?.isActive == true) {
                     cancelRequested = true
-                    manager().cancel()
+                    // Only a routing run has a manager to cancel; arming the
+                    // manager's flag with no manager run live would silently
+                    // swallow the NEXT routing build.
+                    if (currentKind == KIND_ROUTING) manager().cancel()
                 } else {
-                    // No run is active (typically a stale banner after
-                    // process death): publish a clean terminal status
-                    // instead of arming the manager's cancel flag, which
-                    // would silently swallow the next build.
-                    reportStatus(running = false, bucket = null, built = 0, total = 0, error = null)
+                    // No run is late (typically a stale banner after process
+                    // death): publish a clean terminal status instead of
+                    // arming the manager's cancel flag, which would silently
+                    // swallow the next build.
+                    reportStatus(running = false, bucket = null, built = 0, total = 0, error = null, kind = currentKind)
                     stopSelfResult(startId)
                 }
             }
@@ -197,6 +211,11 @@ class GraphBuildService : Service() {
         timedOut = false
         sawBuildWork = false
         cancelRequested = false
+        // The run's kind decides the status file's `kind` field, the
+        // notification's title and the done-notification's wording. Set
+        // BEFORE the first status write so the very first snapshot already
+        // names the run.
+        currentKind = if (intent.action == ACTION_INDEX_SEARCH) KIND_SEARCH else KIND_ROUTING
         wakeLock.acquire(WAKE_LOCK_SLICE_MS)
         // The first status write happens HERE, synchronously, not at the
         // run coroutine's first progress tick: between intent delivery and
@@ -207,7 +226,7 @@ class GraphBuildService : Service() {
         // conclude nothing is running and race the very build it is trying
         // to avoid. bucket=null renders as the banner's neutral "reading
         // the map archive…". A tiny main-thread file write, once per run.
-        reportStatus(running = true, bucket = null, built = 0, total = 0, error = null)
+        reportStatus(running = true, bucket = null, built = 0, total = 0, error = null, kind = currentKind)
         runJob = scope.launch {
             // Heartbeat: the old single 6h wake lock could expire mid-build
             // for a long buildAll, so the lock is held in 10-minute slices
@@ -283,6 +302,17 @@ class GraphBuildService : Service() {
                 // start a run the capture could miss.
                 val saw_work = sawBuildWork
                 val was_cancelled = cancelRequested
+                if (was_cancelled && currentKind == KIND_SEARCH) {
+                    // The user's cancel of the search pass is the last word
+                    // on the CHAIN too: without this tombstone, the next
+                    // no-op routing trigger (the UI's resume hook re-fires
+                    // it on every tab switch) would chain the index build
+                    // straight back. Cleared by an explicit rebuild or a
+                    // new archive import — deliberate requests.
+                    runCatching {
+                        File(File(filesDir, "graph"), SEARCH_DISMISSED_FLAG).writeText("dismissed")
+                    }
+                }
                 // The pending-intent snapshot-and-clear must run on the
                 // main thread, like every other pendingIntent access:
                 // doing it here on a Default worker races a concurrent
@@ -303,7 +333,7 @@ class GraphBuildService : Service() {
                         // run's buckets, and its status writes would
                         // overwrite this error before anyone sees it.
                         if (terminalError != null) {
-                            notifyDone("Routing data preparation failed", terminalError)
+                            notifyDone(failureTitle(currentKind), terminalError)
                         }
                         run(pending)
                     } else {
@@ -314,15 +344,9 @@ class GraphBuildService : Service() {
                         // announces. Posted under NOTIFICATION_DONE_ID so it
                         // survives stopSelf() removing the foreground one.
                         if (terminalError != null) {
-                            notifyDone(
-                                "Routing data preparation failed",
-                                terminalError,
-                            )
+                            notifyDone(failureTitle(currentKind), terminalError)
                         } else if (!was_cancelled && completed_normally && saw_work) {
-                            notifyDone(
-                                "Routing data ready",
-                                "Routing in your prepared area is available.",
-                            )
+                            notifyDone(readyTitle(currentKind), readyBody(currentKind))
                         }
                         if (runJob?.isActive != true) {
                             // A run that started in the gap owns the wake
@@ -342,23 +366,73 @@ class GraphBuildService : Service() {
         // already decompresses every tile the archive holds for the bucket,
         // so extracting `place`/`poi` rows on the way through costs one
         // extra decode per tile — not a second archive read.
-        val deep_pass = openDeepPass()
-        try {
-            when (intent.action) {
-                ACTION_BUILD_ALL -> manager().buildAll(deep_pass?.sink, ::reportProgress)
-                else -> {
-                    val lon = intent.getDoubleExtra(EXTRA_LON, Double.NaN)
-                    val lat = intent.getDoubleExtra(EXTRA_LAT, Double.NaN)
-                    if (lon.isNaN() || lat.isNaN()) throw IllegalArgumentException("bad location extras in $intent")
-                    manager().ensureBucketsFor(lon, lat, deep_pass?.sink, ::reportProgress)
+        when (intent.action) {
+            ACTION_INDEX_SEARCH -> runSearchPass()
+            else -> {
+                val deep_pass = openDeepPass()
+                try {
+                    when (intent.action) {
+                        ACTION_BUILD_ALL -> manager().buildAll(deep_pass?.sink, ::reportProgress)
+                        else -> {
+                            val lon = intent.getDoubleExtra(EXTRA_LON, Double.NaN)
+                            val lat = intent.getDoubleExtra(EXTRA_LAT, Double.NaN)
+                            if (lon.isNaN() || lat.isNaN()) throw IllegalArgumentException("bad location extras in $intent")
+                            manager().ensureBucketsFor(lon, lat, deep_pass?.sink, ::reportProgress)
+                        }
+                    }
+                } finally {
+                    // Also on failure/cancellation: an unclosed channel would hang
+                    // the drain and an unclosed DB would leak its handle for the
+                    // process's lifetime.
+                    deep_pass?.finish()
                 }
             }
-        } finally {
-            // Also on failure/cancellation: an unclosed channel would hang
-            // the drain and an unclosed DB would leak its handle for the
-            // process's lifetime.
-            deep_pass?.finish()
         }
+        // After a routing build, the search pass follows when the index is
+        // still missing — the service-side serialization of the user's
+        // "generate the search index after the routing data" order. A
+        // cancelled run drops the chain (the user's cancel is the last
+        // word); the next app start re-triggers via init's check.
+        chainSearchIndex()
+    }
+
+    /**
+     * Queues the follow-on search-index run when the index is missing and
+     * nothing is queued yet. Runs on the main thread (the handler post)
+     * like every pendingIntent access.
+     */
+    private fun chainSearchIndex() {
+        if (currentKind != KIND_ROUTING) return
+        if (File(File(filesDir, "graph"), SEARCH_DISMISSED_FLAG).isFile) return
+        if (ArchiveStore.load(this) == null) return
+        val archive_file = ArchiveStore.archiveFile(this)
+        if (SearchCoordinator.indexExists(this, archive_file)) return
+        main_handler.post {
+            if (runJob?.isActive == true && pendingIntent == null) {
+                pendingIntent = Intent(this, GraphBuildService::class.java)
+                    .setAction(ACTION_INDEX_SEARCH)
+            }
+        }
+    }
+
+    /**
+     * The background search-index pass: the full index build (places then,
+     * when the archive carries the address layer, the z14 sweep) through
+     * [SearchCoordinator.buildCheapIndex], with the service's progress
+     * surface and its flag-based cancel. Completes by writing the
+     * completion marker; a cancel leaves a partial DB that the next run
+     * resumes.
+     */
+    private suspend fun runSearchPass() {
+        if (ArchiveStore.load(this) == null) return
+        val archive_file = ArchiveStore.archiveFile(this)
+        if (SearchCoordinator.indexExists(this, archive_file)) return
+        SearchCoordinator.buildCheapIndex(
+            this,
+            archive_file,
+            onProgress = { label, fraction -> reportSearchProgress(label, fraction) },
+            isCancelled = { cancelRequested },
+        )
     }
 
     /**
@@ -484,8 +558,25 @@ class GraphBuildService : Service() {
             error = null,
             label = progress.label,
             fraction = progress.fraction,
+            kind = currentKind,
         ))
         updateNotification(progress)
+    }
+
+    /** The search pass's progress tick: status file + notification. */
+    private fun reportSearchProgress(label: String, fraction: Float?) {
+        sawBuildWork = true
+        writeStatus(BuildSnapshot(
+            running = true,
+            bucket = null,
+            built = 0,
+            total = 0,
+            error = null,
+            label = label,
+            fraction = fraction,
+            kind = KIND_SEARCH,
+        ))
+        updateSearchNotification(label, fraction)
     }
 
     private fun reportStatus(
@@ -494,8 +585,9 @@ class GraphBuildService : Service() {
         built: Int,
         total: Int,
         error: String?,
+        kind: String = currentKind,
     ) {
-        writeStatus(BuildSnapshot(running, bucket, built, total, error, label = null, fraction = null))
+        writeStatus(BuildSnapshot(running, bucket, built, total, error, kind = kind))
     }
 
     private data class BuildSnapshot(
@@ -504,6 +596,8 @@ class GraphBuildService : Service() {
         val built: Int,
         val total: Int,
         val error: String?,
+        /** "routing" or "search" — which background job this status describes. */
+        val kind: String = KIND_ROUTING,
         /** The current step within the bucket build, or null at boundaries. */
         val label: String? = null,
         /** 0..1 through [label]'s step, or null while its size is unknown. */
@@ -532,6 +626,7 @@ class GraphBuildService : Service() {
                         .put("error", snapshot.error ?: "")
                         .put("label", snapshot.label ?: "")
                         .put("fraction", snapshot.fraction?.toDouble() ?: -1.0)
+                        .put("kind", snapshot.kind)
                         .put("ts", System.currentTimeMillis())
                         .toString(),
                 )
@@ -570,14 +665,33 @@ class GraphBuildService : Service() {
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
         timedOut = true
-        manager().cancel()
+        // Only the routing run owns a build the manager can cancel; a
+        // search run's cancel flag is read directly in the sweep.
+        if (currentKind == KIND_ROUTING) manager().cancel()
+        if (currentKind == KIND_SEARCH) cancelRequested = true
         scope.cancel()
         reportStatus(running = false, bucket = null, built = 0, total = 0, error = "build timed out")
         if (wakeLock.isHeld) wakeLock.release()
         stopSelf()
     }
 
-    private fun buildNotification(): Notification {
+    /** The done-notification title for a run of [kind] that failed. */
+    private fun failureTitle(kind: String): String =
+        if (kind == KIND_SEARCH) "Search index preparation failed" else "Routing data preparation failed"
+
+    /** The done-notification title for a run of [kind] that succeeded. */
+    private fun readyTitle(kind: String): String =
+        if (kind == KIND_SEARCH) "Search index ready" else "Routing data ready"
+
+    /** The done-notification body for a run of [kind] that succeeded. */
+    private fun readyBody(kind: String): String =
+        if (kind == KIND_SEARCH) {
+            "Search is now available across the whole map."
+        } else {
+            "Routing in your prepared area is available."
+        }
+
+    private fun buildNotification(kind: String): Notification {
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             manager.createNotificationChannel(
@@ -586,7 +700,7 @@ class GraphBuildService : Service() {
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Preparing routing data")
+            .setContentTitle(if (kind == KIND_SEARCH) "Preparing search index" else "Preparing routing data")
             .setContentText("Reading the map archive…")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -633,6 +747,33 @@ class GraphBuildService : Service() {
     }
 
     /**
+     * The search pass's ongoing notification — same channel as routing's,
+     * the title the user's order requirement names ("search index"), a
+     * determinate bar whenever the sweep reports a real fraction.
+     */
+    private fun updateSearchNotification(label: String, fraction: Float?) {
+        runCatching {
+            val text = if (fraction != null) {
+                "$label (${(fraction * 100).toInt()}%)"
+            } else {
+                label
+            }
+            val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("Preparing search index")
+                .setContentText(text)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+            if (fraction != null) {
+                builder.setProgress(100, (fraction * 100).toInt().coerceIn(0, 100), false)
+            } else {
+                builder.setProgress(0, 0, true)
+            }
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, builder.build())
+        }.onFailure { Log.w(TAG, "search progress notification update failed", it) }
+    }
+
+    /**
      * The one-shot end-of-build notification. Separate ID and channel from
      * the ongoing progress one: it must survive stopSelf() (which removes
      * the foreground notification) and it is meant to be seen, not tracked.
@@ -673,6 +814,21 @@ class GraphBuildService : Service() {
         const val ACTION_BUILD_FOR_LOCATION = "com.danemadsen.atlas.graph.BUILD_FOR_LOCATION"
         const val ACTION_BUILD_ALL = "com.danemadsen.atlas.graph.BUILD_ALL"
         const val ACTION_CANCEL = "com.danemadsen.atlas.graph.CANCEL"
+        const val ACTION_INDEX_SEARCH = "com.danemadsen.atlas.graph.INDEX_SEARCH"
+
+        /** The status-file/announcement `kind` values: what a run is building. */
+        const val KIND_ROUTING = "routing"
+        const val KIND_SEARCH = "search"
+
+        /**
+         * The search run's cancel tombstone (in `filesDir/graph/`): set
+         * service-side when a search run is cancelled, checked by the
+         * chain and by [com.danemadsen.atlas.routing.GraphBuildCoordinator]'s
+         * auto-trigger — otherwise the next no-op routing trigger would
+         * silently re-chain the build the user just cancelled. Cleared by
+         * an explicit rebuild or a new archive import.
+         */
+        const val SEARCH_DISMISSED_FLAG = "search-dismissed.flag"
         const val EXTRA_LON = "lon"
         const val EXTRA_LAT = "lat"
 

@@ -162,7 +162,9 @@ fun SettingsScreen(
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp),
             ) {
-                    SettingsSectionLabel("Map data")
+                    // A little air between the header's divider and the
+                    // first section title.
+                    SettingsSectionLabel("Map data", Modifier.padding(top = 12.dp))
                     Text(
                         "${archive.fileName} · ${formatBytes(archive.sizeBytes)}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -336,12 +338,12 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SettingsSectionLabel(label: String) {
+private fun SettingsSectionLabel(label: String, modifier: Modifier = Modifier) {
     Text(
         label,
         style = MaterialTheme.typography.titleSmall,
         color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(bottom = 4.dp),
+        modifier = modifier.padding(bottom = 4.dp),
     )
 }
 

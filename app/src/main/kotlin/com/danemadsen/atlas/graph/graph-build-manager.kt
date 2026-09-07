@@ -5,11 +5,9 @@ import com.danemadsen.atlas.beerouter.map.PhysicalFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
-import java.io.BufferedInputStream
 import java.io.File
 import java.io.InputStream
 import java.security.MessageDigest
-import java.util.zip.ZipInputStream
 
 /**
  * Schedules and records 5-degree-bucket `.rd5` builds for one PMTiles
@@ -277,12 +275,20 @@ class GraphBuildManager(
      * build-state records.
      *
      * The ZIP is arbitrary user-picked content, so extraction is bounded
-     * against decompression bombs as it streams: `lookups.dat` is read
-     * into memory with a hard byte cap (this runs on the UI-process
-     * heap), rd5 entries stream to the scratch dir under a per-segment
-     * cap, a free-space floor stops a disk-filling ZIP with a clean
-     * message, and the segment count is bounded during extraction, not
-     * only after it.
+     * against decompression bombs: `lookups.dat` is read into memory with
+     * a hard byte cap (this runs on the UI-process heap), rd5 entries
+     * stream to the scratch dir under a per-segment cap, a free-space
+     * floor stops a disk-filling ZIP with a clean message, and the
+     * segment count is bounded during extraction, not only after it.
+     *
+     * The stream is first staged to a scratch file and re-opened as a
+     * [java.util.zip.ZipFile] rather than read as a
+     * [java.util.zip.ZipInputStream]: GitHub's artifact ZIPs (upload-
+     * artifact with compression-level 0) are STORED entries flagged with
+     * a trailing data descriptor, which ZipInputStream rejects (OpenJDK
+     * throws a ZipException; older Android runtimes just stop iterating)
+     * and ZipFile — central-directory based — reads fine. Exactly the
+     * failure that made CI-generated routing data "invalid".
      *
      * A ZIP-declared `lookups.dat` that differs from the app's own asset
      * is rejected outright: segments built against different lookup
@@ -306,9 +312,17 @@ class GraphBuildManager(
                 val segments = LinkedHashMap<String, File>()
                 var zip_lookups: ByteArray? = null
                 var zip_manifest: String? = null
-                ZipInputStream(BufferedInputStream(zip)).use { input ->
-                    while (true) {
-                        val entry = input.nextEntry ?: break
+                val staged = File(scratch, STAGED_ZIP_FILE)
+                stageZip(zip, staged, MAX_STAGED_ZIP_BYTES, MIN_FREE_DISK_BYTES, "the routing data file")
+                val zip_file = runCatching { java.util.zip.ZipFile(staged) }
+                    .getOrElse {
+                        throw IllegalStateException(
+                            "the routing data file is not a readable ZIP archive — wrong file?",
+                            it,
+                        )
+                    }
+                try {
+                    for (entry in zip_file.entries()) {
                         if (entry.isDirectory) continue
                         val name = entry.name.substringAfterLast('/')
                         when {
@@ -319,7 +333,7 @@ class GraphBuildManager(
                                 // lands on the UI-process heap — the app's
                                 // own lookups.dat is ~28 KB.
                                 val out = java.io.ByteArrayOutputStream()
-                                copyBounded(input, out, MAX_LOOKUPS_BYTES, LOOKUPS_FILE)
+                                copyBounded(zip_file.getInputStream(entry), out, MAX_LOOKUPS_BYTES, LOOKUPS_FILE)
                                 zip_lookups = out.toByteArray()
                             }
                             name == MANIFEST_FILE -> {
@@ -327,7 +341,7 @@ class GraphBuildManager(
                                 // real manifest is a fingerprint plus at
                                 // most a few thousand bucket names (~100 KB).
                                 val out = java.io.ByteArrayOutputStream()
-                                copyBounded(input, out, MAX_MANIFEST_BYTES, MANIFEST_FILE)
+                                copyBounded(zip_file.getInputStream(entry), out, MAX_MANIFEST_BYTES, MANIFEST_FILE)
                                 zip_manifest = out.toString(Charsets.UTF_8)
                             }
                             RD5_ENTRY_RE.matchEntire(name) != null -> {
@@ -353,18 +367,20 @@ class GraphBuildManager(
                                 // as a free-space floor: an extraction that
                                 // would fill the partition fails here with an
                                 // actionable message, not an opaque ENOSPC.
-                                require(scratch.usableSpace > MIN_FREE_DISK_BYTES) {
+                                require(usableAbove(scratch, MIN_FREE_DISK_BYTES)) {
                                     "not enough free storage to install the routing data"
                                 }
                                 val out = File(scratch, name)
                                 out.outputStream().use { output ->
-                                    copyBounded(input, output, MAX_SEGMENT_BYTES, "segment $bucket")
+                                    copyBounded(zip_file.getInputStream(entry), output, MAX_SEGMENT_BYTES, "segment $bucket")
                                 }
                                 segments[bucket] = out
                             }
                             // Anything else (readme, checksums) is ignored.
                         }
                     }
+                } finally {
+                    zip_file.close()
                 }
                 require(segments.isNotEmpty() || zip_manifest != null) {
                     "the routing data file contains no Atlas .rd5 segments"
@@ -589,7 +605,12 @@ class GraphBuildManager(
         const val RD5_SUFFIX = ".rd5"
         const val MANIFEST_FILE = "manifest.json"
         const val TMP_SUFFIX = ".tmp"
-        const val ADOPT_SCRATCH_DIR = "adopt-scratch"
+        const val ADOPT_SCRATCH_DIR = "graph-adopt-scratch"
+        const val STAGED_ZIP_FILE = "staged.zip"
+        // Uncompressible raw bytes staged to disk: cap generous (the real
+        // artifacts run to a few GB) but bounded, with the running
+        // free-space floor in [stageZip] as the real disk-fill guard.
+        const val MAX_STAGED_ZIP_BYTES = 16L shl 30 // 16 GB
         const val MAX_ADOPT_BUCKETS = 2_592 // 72*36: every 5-degree bucket on Earth
 
         // Extraction bounds against decompression bombs (deflate expands
@@ -706,3 +727,62 @@ internal fun copyBounded(
         output.write(buffer, 0, n)
     }
 }
+
+/**
+ * True when [dir] reports more than [floorBytes] free — but a zero reading
+ * means "unknown" (some sandboxed/quirky statfs implementations report 0 on
+ * a healthy volume), not "full": treat it as unbounded rather than rejecting
+ * every install. A genuinely full volume still fails the write itself, with
+ * a message the adopt paths already map to an actionable error.
+ *
+ * internal: shared with the search coordinator's adoption bounds.
+ */
+internal fun usableAbove(dir: File, floorBytes: Long): Boolean {
+    val usable = dir.usableSpace
+    return usable <= 0L || usable > floorBytes
+}
+
+/**
+ * Stages an untrusted ZIP stream to a real file so it can be opened as a
+ * [java.util.zip.ZipFile]. ZipInputStream cannot read the STORED entries
+ * GitHub's upload-artifact mints (compression-level 0 entries carry a data
+ * descriptor, which ZipInputStream refuses) — the central-directory reader
+ * can. Bounded: a byte cap plus a running free-space floor keep a huge or
+ * hostile file from filling the partition with an opaque ENOSPC; [what]
+ * names the file in the user-facing message.
+ *
+ * internal: exercised directly by the adopt tests.
+ */
+internal fun stageZip(
+    input: InputStream,
+    target: File,
+    capBytes: Long,
+    freeFloorBytes: Long,
+    what: String,
+) {
+    require(usableAbove(target, freeFloorBytes)) {
+        "not enough free storage to read $what"
+    }
+    val buffer = ByteArray(64 * 1024)
+    var total = 0L
+    input.use { source ->
+        target.outputStream().use { output ->
+            while (true) {
+                val n = source.read(buffer)
+                if (n < 0) return
+                total += n
+                require(total <= capBytes) { "$what is larger than $capBytes bytes — wrong file?" }
+                // The floor is re-checked every 32 MB of raw bytes: an
+                // uncompressible file fills disk as fast as it reads.
+                if (total % STAGE_FLOOR_CHECK_EVERY == 0L &&
+                    !usableAbove(target, freeFloorBytes)
+                ) {
+                    error("not enough free storage to read $what")
+                }
+                output.write(buffer, 0, n)
+            }
+        }
+    }
+}
+
+private const val STAGE_FLOOR_CHECK_EVERY = 32L shl 20 // re-check disk every 32 MB staged

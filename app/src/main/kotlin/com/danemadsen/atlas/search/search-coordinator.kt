@@ -3,15 +3,16 @@ package com.danemadsen.atlas.search
 import android.content.Context
 import androidx.room.Room
 import com.danemadsen.atlas.graph.copyBounded
+import com.danemadsen.atlas.graph.stageZip
+import com.danemadsen.atlas.graph.usableAbove
 import com.danemadsen.atlas.pmtiles.PmtilesReader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.ZipInputStream
+import java.util.zip.ZipFile
 
 /**
  * The search side's counterpart of GraphBuildCoordinator: owns the index
@@ -36,6 +37,7 @@ object SearchCoordinator {
     private var cached_db: Pair<String, PlaceDatabase>? = null
 
     private const val ADOPT_SCRATCH_DIR = "adopt-scratch"
+    private const val STAGED_ZIP_FILE = "staged.zip"
     private const val TMP_SUFFIX = ".tmp"
     private const val MAX_MANIFEST_BYTES = 1L shl 20 // 1 MB
     private const val MAX_MARKER_BYTES = 1L shl 10 // 1 KB; the real marker is empty
@@ -108,12 +110,20 @@ object SearchCoordinator {
         }
 
     /**
-     * The import-time (or lazy-resume) pass over the archive's place zooms
-     * 0-9. Null when another pass is already running.
+     * The full index pass over the archive — places (zooms 0-9, tens of
+     * seconds) and, when the archive carries the merged address layer, the
+     * z14 address sweep. Runs in the `:graph` service; null when another
+     * pass is already running (the coordinator's single-flight lock).
+     *
+     * [onProgress] and [isCancelled] ride [SearchIndexer.indexCheapPass] —
+     * the service's status file and its flag-based cancel both hang off
+     * them.
      */
     suspend fun buildCheapIndex(
         context: Context,
         archiveFile: File,
+        onProgress: (label: String, fraction: Float?) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
     ): SearchIndexer.PassResult? {
         if (!indexing.compareAndSet(false, true)) return null
         try {
@@ -123,7 +133,7 @@ object SearchCoordinator {
             if (!indexExists(context, archiveFile)) deleteStaleIndexes(context, archiveFile)
             val indexer = indexerFor(context, archiveFile)
             PmtilesReader(archiveFile.absolutePath).use { reader ->
-                return indexer.indexCheapPass(reader)
+                return indexer.indexCheapPass(reader, onProgress, isCancelled)
             }
         } finally {
             indexing.set(false)
@@ -215,9 +225,22 @@ object SearchCoordinator {
                 var manifest: SearchManifest? = null
                 var db_name: String? = null
                 var marker_name: String? = null
-                ZipInputStream(BufferedInputStream(zip)).use { input ->
-                    while (true) {
-                        val entry = input.nextEntry ?: break
+                // GitHub's artifact ZIPs (upload-artifact, compression-level
+                // 0) are STORED entries flagged with a trailing data
+                // descriptor — ZipInputStream refuses them (OpenJDK throws,
+                // older Android stops iterating), which is exactly the "no
+                // manifest" failure CI-generated search indexes hit. Staging
+                // to a file and reading the central directory instead reads
+                // both layouts. stageZip keeps the floor guards; the DB's
+                // declared entry size is the fit check below.
+                val staged = File(scratch, STAGED_ZIP_FILE)
+                stageZip(zip, staged, MAX_INDEX_DB_BYTES, MIN_FREE_DISK_BYTES, "the search index file")
+                val zip_file = runCatching { ZipFile(staged) }
+                    .getOrElse {
+                        error("the search index file is not a readable ZIP archive — wrong file?")
+                    }
+                try {
+                    for (entry in zip_file.entries()) {
                         if (entry.isDirectory) continue
                         val name = entry.name.substringAfterLast('/')
                         when {
@@ -226,7 +249,7 @@ object SearchCoordinator {
                                 // decompress GBs onto the UI-process heap;
                                 // the real manifest is one short line.
                                 val out = ByteArrayOutputStream()
-                                copyBounded(input, out, MAX_MANIFEST_BYTES, "the search index manifest")
+                                copyBounded(zip_file.getInputStream(entry), out, MAX_MANIFEST_BYTES, "the search index manifest")
                                 manifest = parseSearchManifest(out.toString(Charsets.UTF_8))
                             }
                             INDEX_DB_ENTRY_RE.matchEntire(name) != null -> {
@@ -242,19 +265,20 @@ object SearchCoordinator {
                                 // single floor probe against it would still
                                 // let the copy run the partition dry and
                                 // die with the system message mid-stream.
-                                require(scratch.usableSpace > MIN_FREE_DISK_BYTES) {
+                                require(usableAbove(scratch, MIN_FREE_DISK_BYTES)) {
                                     "not enough free storage to install the " +
                                         "search index — free up space and try again"
                                 }
                                 if (entry.size > 0) {
-                                    require(scratch.usableSpace - MIN_FREE_DISK_BYTES >= entry.size) {
+                                    val usable = scratch.usableSpace
+                                    require(usable <= 0 || usable - MIN_FREE_DISK_BYTES >= entry.size) {
                                         "not enough free storage to install the " +
                                             "search index — free up space and try again"
                                     }
                                 }
                                 val out = File(scratch, name)
                                 out.outputStream().use { output ->
-                                    copyBounded(input, output, MAX_INDEX_DB_BYTES, "the search index database")
+                                    copyBounded(zip_file.getInputStream(entry), output, MAX_INDEX_DB_BYTES, "the search index database")
                                 }
                                 db_name = name
                             }
@@ -262,12 +286,14 @@ object SearchCoordinator {
                                 // Zero bytes in a real artifact; bounded for
                                 // the same bomb reason as the manifest.
                                 val out = ByteArrayOutputStream()
-                                copyBounded(input, out, MAX_MARKER_BYTES, "the search index marker")
+                                copyBounded(zip_file.getInputStream(entry), out, MAX_MARKER_BYTES, "the search index marker")
                                 marker_name = name
                             }
                             // Anything else (readme, checksums) is ignored.
                         }
                     }
+                } finally {
+                    zip_file.close()
                 }
 
                 // The manifest gate — the reason a CI-built index cannot mix

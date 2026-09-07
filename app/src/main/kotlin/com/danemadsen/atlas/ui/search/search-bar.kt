@@ -28,7 +28,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.danemadsen.atlas.ui.SearchUiState
 
 /**
  * The top search bar: rounded pill over the map. The right-hand button is
@@ -44,7 +43,6 @@ import com.danemadsen.atlas.ui.SearchUiState
 @Composable
 fun SearchBar(
     query: String,
-    searchState: SearchUiState,
     onQueryChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -129,25 +127,6 @@ fun SearchBar(
                     )
                 }
             }
-        }
-    }
-
-    // The index build can outlive the import (tens of seconds on a metro
-    // archive): say so in the bar's supporting line instead of silently
-    // returning zero hits.
-    if (searchState is SearchUiState.Indexing) {
-        Surface(
-            modifier = Modifier
-                .padding(top = 4.dp)
-                .fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        ) {
-            Text(
-                "Indexing places for search — one-time per archive",
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            )
         }
     }
 }

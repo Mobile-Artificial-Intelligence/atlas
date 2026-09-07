@@ -27,6 +27,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.danemadsen.atlas.routing.GraphBuildCoordinator
+import com.danemadsen.atlas.services.GraphBuildService
 import com.danemadsen.atlas.ui.AtlasUiState
 import com.danemadsen.atlas.ui.RouteUiState
 import kotlinx.coroutines.delay
@@ -135,14 +136,19 @@ fun GraphPrepFlow(state: AtlasUiState, routeState: RouteUiState) {
         onPauseOrDispose { }
     }
 
-    if (routeState !is RouteUiState.Preparing) {
-        BuildStatusBanner()
+    if (routeState is RouteUiState.Preparing) {
+        // The route's own "Preparing route" panel names the very bucket a
+        // routing banner would describe — suppress only that kind. A
+        // search build's banner is a different job and stays visible.
+        BuildStatusBanner(suppress_routing = true)
+    } else {
+        BuildStatusBanner(suppress_routing = false)
     }
 }
 
 /** Polls the `:graph` service's status file while it is alive. */
 @Composable
-private fun BuildStatusBanner() {
+private fun BuildStatusBanner(suppress_routing: Boolean) {
     val context = LocalContext.current
     var status by remember { mutableStateOf<GraphBuildCoordinator.BuildStatus?>(null) }
 
@@ -169,6 +175,11 @@ private fun BuildStatusBanner() {
     // interrupted build, in the error style, with a way out.
     val interrupted = running && now_ms > 0L && now_ms - (status?.timestampMs ?: 0L) > STALE_MS
     val error = status?.error
+    val is_search = (status?.kind ?: GraphBuildService.KIND_ROUTING) == GraphBuildService.KIND_SEARCH
+    // A routing banner under a route mid-Preparation reports the same build
+    // twice with contradictory progress bars — suppressed there. A search
+    // banner is a different job and stays.
+    if (suppress_routing && !is_search) return
     if (!running && error == null) return
 
     Surface(
@@ -185,38 +196,59 @@ private fun BuildStatusBanner() {
                 Column(modifier = Modifier.weight(1f)) {
                     when {
                         interrupted -> {
-                            Text("Routing data preparation stopped", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                if (is_search) "Search index preparation stopped" else "Routing data preparation stopped",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
                             Text("The build process was interrupted.", style = MaterialTheme.typography.bodySmall)
                         }
                         error != null -> {
-                            Text("Routing data preparation failed", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                if (is_search) "Search index preparation failed" else "Routing data preparation failed",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
                             Text(error, style = MaterialTheme.typography.bodySmall)
                         }
                         else -> {
                             val s = status
-                            Text("Preparing routing data", style = MaterialTheme.typography.titleSmall)
-                            Text(
-                                if (s != null && s.total > 0 && s.label != null) {
-                                    // Bucket — step (NN%): the sub-step progress
-                                    // is the only honest signal during a
-                                    // minutes-long single-bucket build.
-                                    buildString {
-                                        append(s.bucket ?: "")
-                                        append(" — ").append(s.label)
-                                        s.fraction?.let {
-                                            append(" (").append((it * 100).toInt()).append("%)")
+                            if (is_search) {
+                                Text("Preparing search index", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    // Label plus a real percent when the sweep
+                                    // reports one; stage 1 has no honest
+                                    // fraction, so it reads label-only.
+                                    if (s?.fraction != null) {
+                                        "${s.label ?: "Indexing"} (${(s.fraction * 100).toInt()}%)"
+                                    } else {
+                                        s?.label ?: "reading the map archive…"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            } else {
+                                Text("Preparing routing data", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    if (s != null && s.total > 0 && s.label != null) {
+                                        // Bucket — step (NN%): the sub-step
+                                        // progress is the only honest signal
+                                        // during a minutes-long single-bucket build.
+                                        buildString {
+                                            append(s.bucket ?: "")
+                                            append(" — ").append(s.label)
+                                            s.fraction?.let {
+                                                append(" (").append((it * 100).toInt()).append("%)")
+                                            }
                                         }
-                                    }
-                                } else if (s != null && s.total > 0) {
-                                    // built + 1 = "the bucket now building",
-                                    // but never past total (the final tick
-                                    // lands after the last bucket's done).
-                                    "${s.bucket ?: ""} (${minOf(s.built + 1, s.total)}/${s.total})"
-                                } else {
-                                    "reading the map archive…"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                                    } else if (s != null && s.total > 0) {
+                                        // built + 1 = "the bucket now building",
+                                        // but never past total (the final tick
+                                        // lands after the last bucket's done).
+                                        "${s.bucket ?: ""} (${minOf(s.built + 1, s.total)}/${s.total})"
+                                    } else {
+                                        "reading the map archive…"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         }
                     }
                 }
@@ -242,15 +274,24 @@ private fun BuildStatusBanner() {
             }
             if (running && !interrupted) {
                 val s = status
-                // Determinate only when the current sub-step reports a real
-                // fraction — the old (built + 1)/total bar sat pinned at
-                // 100% through the whole minutes-long single-bucket build.
-                // A fraction inside bucket `built` of `total` is the honest
-                // overall position; a label-only phase is indeterminate.
+                // Determinate only when a real fraction exists. For routing,
+                // a fraction inside bucket `built` of `total` is the honest
+                // overall position; for search, the sweep's fraction IS the
+                // overall one. Label-only phases stay indeterminate.
                 val fraction = s?.fraction
-                if (fraction != null && s.total > 0) {
+                val determinate = if (is_search) {
+                    fraction != null
+                } else {
+                    fraction != null && s.total > 0
+                }
+                if (determinate) {
+                    val overall = if (is_search) {
+                        fraction ?: 0f
+                    } else {
+                        ((s!!.built + fraction!!) / s.total).coerceIn(0f, 1f)
+                    }
                     LinearProgressIndicator(
-                        progress = { ((s.built + fraction) / s.total).coerceIn(0f, 1f) },
+                        progress = { overall },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     )
                 } else {

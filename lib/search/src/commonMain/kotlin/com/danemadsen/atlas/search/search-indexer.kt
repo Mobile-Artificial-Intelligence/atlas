@@ -4,6 +4,7 @@ import com.danemadsen.atlas.pmtiles.PmtilesReader
 import com.danemadsen.atlas.pmtiles.archiveHeaderBytes
 import com.danemadsen.atlas.pmtiles.mvt.MvtGeomType
 import com.danemadsen.atlas.pmtiles.mvt.MvtTile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -73,8 +74,19 @@ class SearchIndexer(
      * minutes walking z14 tiles to find no `address` layer). The sweep
      * bounds come from the reader's own header bbox — the same box the
      * graph build walks — so the pass needs nothing but the archive.
+     *
+     * [onProgress] reports (label, overall 0..1 fraction-or-null) at every
+     * stage boundary and, during the address sweep, at the tile probe
+     * cadence the reader already emits — the progress surface a
+     * background-service run renders. [isCancelled] is checked at the same
+     * brackets as coroutine cancellation: the caller in the `:graph`
+     * service cancels through a flag, not through the job.
      */
-    suspend fun indexCheapPass(reader: PmtilesReader): PassResult = withContext(Dispatchers.IO) {
+    suspend fun indexCheapPass(
+        reader: PmtilesReader,
+        onProgress: (label: String, fraction: Float?) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ): PassResult = withContext(Dispatchers.IO) {
         val bounds = reader.header.bounds()
         val db = open()
         try {
@@ -84,6 +96,13 @@ class SearchIndexer(
             var inserted = 0
             val batch = ArrayList<PlaceEntity>(BATCH_ROWS)
             val max_zoom = minOf(reader.header.maxZoom, MAX_CHEAP_ZOOM)
+            // Stage 1 is tens of seconds, stage 2 minutes-to-hours: the
+            // overall fraction reserves a stage-1 slice only when an address
+            // sweep follows — without an address layer the place pass IS
+            // the whole job and gets the full range.
+            val has_addresses = archiveHasAddressLayer(reader)
+            val zoom_span = max_zoom - MIN_INDEX_ZOOM + 1
+            onProgress("Indexing places", null)
             for (zoom in MIN_INDEX_ZOOM..max_zoom) {
                 reader.forEachTileInBounds(zoom, bounds) { _, x, y, bytes ->
                     for (candidate in placeCandidates(MvtTile.decode(bytes), zoom, x, y)) {
@@ -96,9 +115,17 @@ class SearchIndexer(
                 }
                 // Cancellation checks bracket each zoom level: the reader's
                 // visitor cannot suspend, and one zoom is the bounded window
-                // a cancelled import waits out.
+                // a cancelled import waits out. The flag check rides the
+                // same bracket for the service's flag-based cancel.
                 currentCoroutineContext().ensureActive()
+                if (isCancelled()) throw SearchIndexCancelledException()
                 inserted += flushPlaces(db, batch)
+                if (has_addresses) {
+                    onProgress(
+                        "Indexing places",
+                        STAGE1_FRACTION * (zoom - MIN_INDEX_ZOOM + 1) / zoom_span,
+                    )
+                }
             }
             // Stage 1 commits (and its FTS rows) BEFORE the address sweep:
             // Room creates the DB file at open(), so search is already
@@ -107,7 +134,7 @@ class SearchIndexer(
 
             var addresses_seen = 0
             var addresses_inserted = 0
-            if (archiveHasAddressLayer(reader)) {
+            if (has_addresses) {
                 // Stage 2: the address sweep at one zoom — the tile visitor
                 // cannot suspend, so batching and cancellation both happen
                 // off-visitor: candidates stream through an unbounded channel
@@ -129,7 +156,17 @@ class SearchIndexer(
                     }
                     drain.start()
                     var since_check = 0
-                    reader.forEachTileInBounds(ADDRESS_INDEX_ZOOM, bounds) { zoom, x, y, bytes ->
+                    reader.forEachTileInBounds(
+                        ADDRESS_INDEX_ZOOM,
+                        bounds,
+                        onCellsProbed = { probed, total ->
+                            onProgress(
+                                "Indexing addresses",
+                                STAGE1_FRACTION + (1f - STAGE1_FRACTION) *
+                                    (if (total > 0) probed.toFloat() / total else 0f),
+                            )
+                        },
+                    ) { zoom, x, y, bytes ->
                         for (candidate in addressCandidates(MvtTile.decode(bytes), zoom, x, y)) {
                             addresses_seen++
                             channel.trySend(candidate)
@@ -137,6 +174,7 @@ class SearchIndexer(
                         if (++since_check >= CANCEL_CHECK_TILES) {
                             since_check = 0
                             job?.ensureActive()
+                            if (isCancelled()) throw SearchIndexCancelledException()
                         }
                     }
                     channel.close()
@@ -267,6 +305,9 @@ class SearchIndexer(
          * `address` layer — see [archiveHasAddressLayer].
          */
         const val ADDRESS_LAYER_NEEDLE = "\"id\":\"address\""
+
+        /** Overall fraction reserved for stage 1 when an address sweep follows. */
+        const val STAGE1_FRACTION = 0.15f
 
         /**
          * Bumped whenever the extraction or schema rules change in a way an
@@ -420,3 +461,11 @@ class SearchIndexer(
         }
     }
 }
+
+/**
+ * The flag-based cancellation [indexCheapPass]'s [isCancelled] hook throws —
+ * a [CancellationException] subclass so a cancelled pass is treated as an
+ * aborted run, not a failure, in the `:graph` service's terminal-status
+ * logic.
+ */
+class SearchIndexCancelledException : CancellationException("search index build cancelled")

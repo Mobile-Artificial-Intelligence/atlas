@@ -11,6 +11,7 @@ import androidx.core.content.PermissionChecker
 import com.danemadsen.atlas.data.ArchiveInfo
 import com.danemadsen.atlas.data.ArchiveStore
 import com.danemadsen.atlas.graph.GraphBuildManager
+import com.danemadsen.atlas.search.SearchCoordinator
 import com.danemadsen.atlas.services.GraphBuildService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -48,6 +49,8 @@ object GraphBuildCoordinator {
         val label: String? = null,
         /** 0..1 through [label]'s step, or null while its size is unknown. */
         val fraction: Float? = null,
+        /** What the run is building — [GraphBuildService.KIND_ROUTING] or [KIND_SEARCH]. */
+        val kind: String = GraphBuildService.KIND_ROUTING,
         /** When the service last wrote the status (0 when the field is absent). */
         val timestampMs: Long = 0,
     ) {
@@ -131,6 +134,56 @@ object GraphBuildCoordinator {
     }
 
     /**
+     * Starts the on-device search-index build, honoring the product order:
+     * routing data first, search second. Called from the import flow and
+     * the resume hook — the places where a brand-new archive needs its
+     * index.
+     *
+     * The decision tree, in order:
+     * - Index already complete → nothing to do.
+     * - A build is live (any kind) → send the intent anyway; the service
+     *   queues it in its pending-intent slot and runs it after the current
+     *   run finishes.
+     * - No routing buckets prepared AND location permission granted →
+     *   hold off: the location-triggered build is about to run and the
+     *   service chains the search pass onto it itself. Starting search
+     *   here would either interleave (two foreground runs) or pre-empt the
+     *   queue with the lesser job.
+     * - Otherwise (permission denied — no location build will ever trigger
+     *   — or buckets already prepared) → start the search run now.
+     */
+    suspend fun triggerSearchIndex(context: Context, force: Boolean = false) {
+        // The search-cancel tombstone: a cancelled pass must not restart
+        // behind the user's back — unless this call is the user's own
+        // explicit rebuild.
+        if (!force && isSearchDismissed(context)) return
+        if (force) setSearchDismissed(context, false)
+        val archive_file = ArchiveStore.archiveFile(context)
+        if (SearchCoordinator.indexExists(context, archive_file)) return
+        val status = readStatus(context)
+        if (status?.running == true) {
+            start(context, serviceIntent(context, GraphBuildService.ACTION_INDEX_SEARCH))
+            return
+        }
+        if (!hasLocationPermission(context) || hasPreparedBuckets(context)) {
+            start(context, serviceIntent(context, GraphBuildService.ACTION_INDEX_SEARCH))
+        }
+        // else: the location build will chain the search pass service-side.
+    }
+
+    /** Whether any routing buckets are already prepared for this archive. */
+    private suspend fun hasPreparedBuckets(context: Context): Boolean =
+        withContext(Dispatchers.IO) {
+            val manager = GraphBuildManager(
+                archiveFile = ArchiveStore.archiveFile(context),
+                segmentsDir = File(File(context.filesDir, "graph"), "segments"),
+                workRoot = File(context.cacheDir, "graph-work"),
+                assetsDir = ensureBuildAssets(context),
+            )
+            manager.builtBuckets().isNotEmpty()
+        }
+
+    /**
      * A recent fix inside the archive, for routing origins — the same
      * bounds-checked lookup the build trigger uses. Null when location
      * permission is denied (per the offline product rule, routes do not
@@ -212,6 +265,19 @@ object GraphBuildCoordinator {
     fun isBuildDismissed(context: Context): Boolean =
         File(File(context.filesDir, "graph"), DISMISSED_FLAG).isFile
 
+    /**
+     * The search run's cancel tombstone — see [GraphBuildService.SEARCH_DISMISSED_FLAG].
+     * Gates the auto-trigger so a cancelled pass stays cancelled; [force]
+     * callers (explicit rebuild) clear it.
+     */
+    fun isSearchDismissed(context: Context): Boolean =
+        File(File(context.filesDir, "graph"), GraphBuildService.SEARCH_DISMISSED_FLAG).isFile
+
+    fun setSearchDismissed(context: Context, dismissed: Boolean) {
+        val flag = File(File(context.filesDir, "graph"), GraphBuildService.SEARCH_DISMISSED_FLAG)
+        if (dismissed) flag.writeText("dismissed") else flag.delete()
+    }
+
     /** The service's last written status, or null when it never ran. */
     fun readStatus(context: Context): BuildStatus? {
         val file = statusFile(context)
@@ -228,6 +294,7 @@ object GraphBuildCoordinator {
                 // The service writes -1.0 for "no fraction"; a status file
                 // from an older build omits the field entirely.
                 fraction = json.optDouble("fraction", -1.0).takeIf { it >= 0.0 }?.toFloat(),
+                kind = json.optString("kind").ifEmpty { GraphBuildService.KIND_ROUTING },
                 timestampMs = json.optLong("ts"),
             )
         }.getOrNull()
