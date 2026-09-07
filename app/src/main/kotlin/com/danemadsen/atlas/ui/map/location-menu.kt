@@ -9,8 +9,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Work
@@ -35,9 +35,9 @@ import java.util.Locale
  * The map's long-press menu: what the user can do with a chosen point.
  * Route is the primary action; Home/Work saves land in their slots (the
  * one place slots are set from, per the saved tab's redesign); Save
- * location appends a plain pin; Open with… and Share hand the point to
- * the rest of the device — and the menu is also the landing surface of an
- * external geo: intent's coordinate target.
+ * location appends a plain pin; Share hands the point to the rest of the
+ * device — and the menu is also the landing surface of an external geo:
+ * intent's coordinate target.
  */
 @Composable
 fun LocationMenuPanel(
@@ -47,7 +47,6 @@ fun LocationMenuPanel(
     onRoute: (GeoPoint) -> Unit,
     onSetSlot: (SavedSlot) -> Unit,
     onSave: () -> Unit,
-    onOpenWith: (GeoPoint) -> Unit = {},
     onShare: (GeoPoint) -> Unit = {},
 ) {
     point ?: return
@@ -85,11 +84,8 @@ fun LocationMenuPanel(
             MenuRow("Set as Work", Icons.Filled.Work) {
                 onSetSlot(WORK)
             }
-            MenuRow("Save location", Icons.Filled.Place) {
+            MenuRow("Save location", Icons.Filled.BookmarkAdd) {
                 onSave()
-            }
-            MenuRow("Open with…", Icons.Filled.OpenInNew) {
-                onOpenWith(point)
             }
             MenuRow("Share", Icons.Filled.Share) {
                 onShare(point)

@@ -284,7 +284,7 @@ fun MapScreen() {
                     Tab.MAP -> {
                         // The long-press location menu: route, save as
                         // Home/Work, save as a plain location, or hand the
-                        // point to another map app / the Sharesheet.
+                        // point to the rest of the device via the Sharesheet.
                         LocationMenuPanel(
                             point = location_menu_point,
                             label = location_menu_label,
@@ -292,7 +292,6 @@ fun MapScreen() {
                             onRoute = view_model::routeHere,
                             onSetSlot = view_model::setSlotFromMenu,
                             onSave = view_model::saveMenuPoint,
-                            onOpenWith = { view_model.openLocationWith(it) },
                             onShare = { view_model.shareLocation(it) },
                         )
                         // Navigation owns the drawer from Start until it

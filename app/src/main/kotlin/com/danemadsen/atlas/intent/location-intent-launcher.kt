@@ -3,31 +3,17 @@ package com.danemadsen.atlas.intent
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import java.util.Locale
 
 /**
  * The outbound side of external map integration: hands the chosen point
- * to OTHER installed mapping apps through the standard Android surface —
- * an `ACTION_VIEW geo:` for "Open with…", the system Sharesheet for
- * "Share". Never names a specific app: whatever the device has installed
- * shows up in the chooser.
+ * to the rest of the device through the system Sharesheet — whatever the
+ * device has installed (other map apps included) shows up in the chooser.
  *
  * Shared text is deliberately plain coordinates (plus a name when one is
  * known) — useful to a recipient without Atlas, with no URLs of any kind.
  */
 object LocationIntentLauncher {
-
-    /**
-     * Opens the system chooser offering [latitude], [longitude] to every
-     * installed app that handles `geo:` URIs. False (with nothing
-     * launched) when no handler exists at all — the chooser itself covers
-     * the "installed but disabled" middle ground with its own empty state.
-     */
-    fun openWith(context: Context, latitude: Double, longitude: Double): Boolean {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("geo:$latitude,$longitude"))
-        return launch(context, Intent.createChooser(intent, null))
-    }
 
     /**
      * Shares the location as plain text through the Sharesheet:
@@ -52,10 +38,13 @@ object LocationIntentLauncher {
     }
 
     private fun launch(context: Context, chooser: Intent): Boolean = try {
-        context.startActivity(chooser)
+        // The caller is the application context, not an Activity — without
+        // the new-task flag startActivity throws AndroidRuntimeException,
+        // which took down the menu the tap came from.
+        context.startActivity(chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         true
     } catch (_: ActivityNotFoundException) {
-        // No app on the device handles geo:/text shares at all.
+        // No app on the device handles text shares at all.
         false
     }
 }

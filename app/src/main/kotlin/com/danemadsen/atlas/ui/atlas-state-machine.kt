@@ -483,16 +483,6 @@ class AtlasViewModel(
     }
 
     /**
-     * The location menu's "Open with…": the long-press point (or the
-     * geo-intent target) offered to every installed geo: handler through
-     * the system chooser. A toast keeps the no-handler case honest.
-     */
-    fun openLocationWith(point: GeoPoint) {
-        val ok = LocationIntentLauncher.openWith(app, point.lat, point.lon)
-        if (!ok) toast("No other map app can open that location")
-    }
-
-    /**
      * The location menu's "Share": the point (named when it came from a
      * labeled geo: link) out through the Android Sharesheet as plain text.
      */
