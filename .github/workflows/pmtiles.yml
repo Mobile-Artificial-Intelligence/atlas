@@ -1,42 +1,53 @@
 name: PMTiles
 
-# Builds OpenMapTiles-schema PMTiles archives from Geofabrik country extracts
-# with the SAME pinned Planetiler (0.10.2) and arguments used to mint the
-# original atlas australia.pmtiles — Atlas's import, search, and routing
-# pipelines are calibrated against exactly this output (MVT tiles, gzip,
-# z0-14).
+# Builds OpenMapTiles-schema PMTiles archives from Geofabrik extracts with
+# the SAME pinned Planetiler (0.10.2) and arguments used to mint the original
+# atlas australia.pmtiles — Atlas's import, search, and routing pipelines are
+# calibrated against exactly this output (MVT tiles, gzip, z0-14).
 #
-# Every country — monaco included — is one matrix entry under the `countries`
+# Every region — monaco included — is one matrix entry under the `countries`
 # job, and every workflow run builds the full matrix: a manual dispatch
 # produces exactly what the daily schedule produces, so artifacts from every
 # run are complete.
 #
-# After Planetiler, countries with an oa_cc merge OpenAddresses address
-# points into the archive (one file to download, one search index over it):
-# the felt/tippecanoe fork's tile-join clips the OA archive to z14, drops
-# the bulk properties, renames its `data` layer to `address`, joins it with
-# the base, and the header's geography block (which tile-join widens to the
+# canada and united-states as whole-country extracts blow the 6h hosted-job
+# cap (6.0 / 11.3 GB pbf), so they are split along Geofabrik's own regional
+# extracts: canada/* into its 13 provinces and territories, us/* into its 51
+# states, DC, and territories. Geofabrik's coarser US groupings (us-south
+# 3.8 GB, us-west 3.2 GB) still exceed the cap — great-britain at 2.0 GB is
+# already borderline — so the states are the finest split that fits. Every
+# split entry is <=1.4 GB pbf, on par with great-britain. The cost is matrix
+# volume (~70 entries) and one archive per region instead of one per country;
+# the app installs each region's archive independently, nothing else changes.
+#
+# After Planetiler, regions with an oa_cc merge OpenAddresses address points
+# into the archive (one file to download, one search index over it): the
+# felt/tippecanoe fork's tile-join clips the OA archive to z14, drops the
+# bulk properties, renames its `data` layer to `address`, joins it with the
+# base, and the header's geography block (which tile-join widens to the
 # whole world) is patched back to the base's — the app bounds its tile
-# sweeps by the archive bbox. GB (closed address data) and US (2295
-# per-source files, no countrywide) carry no address layer — search there
-# stays place/POI.
+# sweeps by the archive bbox. GB, monaco, and the US states carry no address
+# layer — search there stays place/POI (GB: no OA data exists; monaco: none
+# either — the sg code it once carried merged Singapore's addresses into a
+# Monaco archive, dead tiles the bbox patch then hid; US: no countrywide
+# archive, 2295 per-source files would blow the cap even split by state).
 #
 # After the archive, each leg replays the app's own graph build over the
 # file it just produced — every 5° bucket the bbox touches, via the same
 # graphBuildCli Gradle task that proves the device heap — and uploads the
-# segments dir as the `atlas-routing-<country>` artifact alongside the map
+# segments dir as the `atlas-routing-<region>` artifact alongside the map
 # archive (upload-artifact zips the dir, so the artifact zip carries the
 # .rd5s at its root — Installing that zip in the app, Settings → Install
 # routing data, which runs adoptPrebuiltSegments, gives instant routing:
 # no ~50-minute on-device build). The manifest pins the archive
 # fingerprint, so routing data only adopts against the archive from the
-# same run — the two artifacts are a pair. This runs INSIDE the country's
-# leg, right after the archive upload: routing for a country must not
+# same run — the two artifacts are a pair. This runs INSIDE the region's
+# leg, right after the archive upload: routing for a region must not
 # wait out the slowest sibling's archive build, and the archive is
 # already on disk — no artifact re-download.
 #
 # The search index gets the same treatment: searchIndexCli replays the app's
-# own indexing pass over the archive and uploads the `atlas-search-<country>`
+# own indexing pass over the archive and uploads the `atlas-search-<region>`
 # artifact (index DB + completion marker + manifest, root-level in the zip —
 # Settings → Load search index / the import dialog's third row, which runs
 # adoptPrebuiltIndex, turns the minutes-to-hours post-import address sweep
@@ -48,13 +59,13 @@ name: PMTiles
 #
 # Hosted-runner reality check (2026-09 calibration: 0.9 GB australia pbf ->
 # 1.3 GB pmtiles, ~1h45m on a fast dev machine; a 4-vcpu runner is slower):
+#   monaco / small states/provinces  -> minutes
 #   new-zealand   0.4 GB pbf -> fits comfortably
 #   australia     0.9 GB pbf -> fits
 #   great-britain 2.0 GB pbf -> borderline against the 6h hosted-job cap
-#   canada        6.0 GB pbf -> will likely hit the 6h cap
-#   united-states 11.3 GB pbf -> will hit the 6h cap (needs a larger or
-#     self-hosted runner — the disk math fits after freeing ~30 GB, the
-#     wall-clock does not)
+#   canada-* max  nunavut 1.4 GB pbf -> GB-scale, fits (coastline-heavy, the
+#     pbf overstates its node count)
+#   us-* max      california 1.2 GB pbf -> GB-scale, fits
 on:
   schedule:
     # Daily at midnight UTC, when Geofabrik's daily updates are ready.
@@ -66,60 +77,64 @@ on:
 # per-run namespaced (artifacts, summary, caches), so nothing collides.
 jobs:
   countries:
-    name: pmtiles-${{ matrix.country }}
+    name: pmtiles-${{ matrix.region }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
       contents: read
     strategy:
-      # One country failing (disk, timeout) must not kill the others.
+      # One region failing (disk, timeout) must not kill the others.
       fail-fast: false
-      max-parallel: 5
+      # 8 concurrent legs: the split put ~70 entries on the matrix, most of
+      # them minutes-long — 5 would stretch a run past twice that. Well
+      # inside both the 20-job free-plan limit and Geofabrik's tolerance.
+      max-parallel: 8
       matrix:
-        country: ["monaco", "new-zealand", "australia", "great-britain", "canada", "united-states", "malaysia-singapore-brunei"]
-        # oa_cc: the country's OpenAddresses code — empty means the country
-        #   gets no address merge (GB: no OA data exists; US: no countrywide
-        #   archive, 2295 per-source files would blow the 6h cap).
+        region: ["monaco", "new-zealand", "australia", "great-britain", "malaysia-singapore-brunei"]
+        # oa_cc: the region's OpenAddresses code — empty means the region
+        #   gets no address merge.
+        # oa_clip: when set (minlon,minlat,maxlon,maxlat), the OA archive is
+        #   clipped to this bbox before the merge. Required for the canada-*
+        #   split: the ca countrywide archive covers the whole country, and
+        #   tile-join unions its inputs' tile coverage — unclipped, every
+        #   province archive would carry every other province's address
+        #   tiles. Bboxes are deliberately generous: an under-covering clip
+        #   silently drops edge address tiles, while the overlap is empty
+        #   ocean/tundra that costs nothing.
         # address_at: a city center whose z14 tile must carry the merged
-        #   address layer — the verify step's proof the merge landed.
+        #   address layer — the verify step's proof the merge landed. Every
+        #   province with an address_at has an OpenAddresses source covering
+        #   that city (nunavut has no OA sources at all).
         include:
-          - country: monaco
+          - region: monaco
             url: https://download.geofabrik.de/europe/monaco-latest.osm.pbf
             heap: 2g
             free_disk: false
-            oa_cc: sg
-            address_at: "103.8495,1.2900"
-          - country: new-zealand
+            oa_cc: ''
+            oa_clip: ''
+            address_at: ''
+          - region: new-zealand
             url: https://download.geofabrik.de/australia-oceania/new-zealand-latest.osm.pbf
             heap: 6g
             free_disk: false
             oa_cc: nz
+            oa_clip: ''
             address_at: "174.7645,-36.8509"
-          - country: australia
+          - region: australia
             url: https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf
             heap: 8g
             free_disk: false
             oa_cc: au
+            oa_clip: ''
             address_at: "144.9631,-37.8142"
-          - country: great-britain
+          - region: great-britain
             url: https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
             heap: 10g
             free_disk: false
             oa_cc: ''
+            oa_clip: ''
             address_at: ''
-          - country: canada
-            url: https://download.geofabrik.de/north-america/canada-latest.osm.pbf
-            heap: 12g
-            free_disk: true
-            oa_cc: ca
-            address_at: "-79.3832,43.6532"
-          - country: united-states
-            url: https://download.geofabrik.de/north-america/us-latest.osm.pbf
-            heap: 12g
-            free_disk: true
-            oa_cc: ''
-            address_at: ''
-          - country: malaysia-singapore-brunei
+          - region: malaysia-singapore-brunei
             # Geofabrik has no standalone Singapore extract — the trio comes
             # as one 238 MB file (a lone `asia/singapore-...` URL 302s to the
             # homepage, whose HTML then dies in Planetiler). The sg
@@ -128,7 +143,82 @@ jobs:
             heap: 2g
             free_disk: false
             oa_cc: sg
+            oa_clip: ''
             address_at: "103.8495,1.2900"
+
+          # ── Canada: 13 provinces/territories ────────────────────────────
+          # The ca countrywide OpenAddresses archive is clipped to each
+          # province's bbox (oa_clip) before the merge.
+          - {region: canada-alberta, url: "https://download.geofabrik.de/north-america/canada/alberta-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-120.1,48.9,-109.9,60.1", address_at: "-114.0719,51.0447"}
+          - {region: canada-british-columbia, url: "https://download.geofabrik.de/north-america/canada/british-columbia-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-141.0,48.2,-113.9,60.1", address_at: "-123.1207,49.2827"}
+          - {region: canada-manitoba, url: "https://download.geofabrik.de/north-america/canada/manitoba-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-102.1,48.9,-88.8,60.1", address_at: "-97.1385,49.8951"}
+          - {region: canada-new-brunswick, url: "https://download.geofabrik.de/north-america/canada/new-brunswick-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-67.8,44.9,-63.5,48.2", address_at: "-64.7951,46.0975"}
+          - {region: canada-newfoundland-and-labrador, url: "https://download.geofabrik.de/north-america/canada/newfoundland-and-labrador-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-68.0,46.5,-52.3,60.8", address_at: "-52.7121,47.5312"}
+          - {region: canada-northwest-territories, url: "https://download.geofabrik.de/north-america/canada/northwest-territories-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-137.0,59.8,-100.0,79.0", address_at: "-114.3718,62.4540"}
+          - {region: canada-nova-scotia, url: "https://download.geofabrik.de/north-america/canada/nova-scotia-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-67.2,43.2,-59.5,47.2", address_at: "-63.5756,44.6488"}
+          - {region: canada-nunavut, url: "https://download.geofabrik.de/north-america/canada/nunavut-latest.osm.pbf", heap: 10g, free_disk: false, oa_cc: ca, oa_clip: "-125.0,59.5,-55.0,84.0", address_at: ''}
+          - {region: canada-ontario, url: "https://download.geofabrik.de/north-america/canada/ontario-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-95.5,41.5,-78.8,57.2", address_at: "-79.3832,43.6532"}
+          - {region: canada-prince-edward-island, url: "https://download.geofabrik.de/north-america/canada/prince-edward-island-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-64.8,45.4,-61.8,47.3", address_at: "-63.1311,46.2360"}
+          - {region: canada-quebec, url: "https://download.geofabrik.de/north-america/canada/quebec-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-80.2,44.9,-56.2,62.8", address_at: "-73.5674,45.5019"}
+          - {region: canada-saskatchewan, url: "https://download.geofabrik.de/north-america/canada/saskatchewan-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-110.1,48.9,-101.9,60.1", address_at: "-104.6067,50.4498"}
+          - {region: canada-yukon, url: "https://download.geofabrik.de/north-america/canada/yukon-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: ca, oa_clip: "-141.1,59.9,-123.9,70.1", address_at: "-135.0565,60.7247"}
+
+          # ── United States: 50 states + DC + territories ─────────────────
+          # No address merge: OpenAddresses has no US countrywide archive
+          # and its 2295 per-source files would blow the cap even split.
+          - {region: us-alabama, url: "https://download.geofabrik.de/north-america/us/alabama-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-alaska, url: "https://download.geofabrik.de/north-america/us/alaska-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-arizona, url: "https://download.geofabrik.de/north-america/us/arizona-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-arkansas, url: "https://download.geofabrik.de/north-america/us/arkansas-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-california, url: "https://download.geofabrik.de/north-america/us/california-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-colorado, url: "https://download.geofabrik.de/north-america/us/colorado-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-connecticut, url: "https://download.geofabrik.de/north-america/us/connecticut-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-delaware, url: "https://download.geofabrik.de/north-america/us/delaware-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-district-of-columbia, url: "https://download.geofabrik.de/north-america/us/district-of-columbia-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-florida, url: "https://download.geofabrik.de/north-america/us/florida-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-georgia, url: "https://download.geofabrik.de/north-america/us/georgia-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-hawaii, url: "https://download.geofabrik.de/north-america/us/hawaii-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-idaho, url: "https://download.geofabrik.de/north-america/us/idaho-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-illinois, url: "https://download.geofabrik.de/north-america/us/illinois-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-indiana, url: "https://download.geofabrik.de/north-america/us/indiana-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-iowa, url: "https://download.geofabrik.de/north-america/us/iowa-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-kansas, url: "https://download.geofabrik.de/north-america/us/kansas-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-kentucky, url: "https://download.geofabrik.de/north-america/us/kentucky-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-louisiana, url: "https://download.geofabrik.de/north-america/us/louisiana-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-maine, url: "https://download.geofabrik.de/north-america/us/maine-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-maryland, url: "https://download.geofabrik.de/north-america/us/maryland-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-massachusetts, url: "https://download.geofabrik.de/north-america/us/massachusetts-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-michigan, url: "https://download.geofabrik.de/north-america/us/michigan-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-minnesota, url: "https://download.geofabrik.de/north-america/us/minnesota-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-mississippi, url: "https://download.geofabrik.de/north-america/us/mississippi-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-missouri, url: "https://download.geofabrik.de/north-america/us/missouri-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-montana, url: "https://download.geofabrik.de/north-america/us/montana-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-nebraska, url: "https://download.geofabrik.de/north-america/us/nebraska-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-nevada, url: "https://download.geofabrik.de/north-america/us/nevada-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-new-hampshire, url: "https://download.geofabrik.de/north-america/us/new-hampshire-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-new-jersey, url: "https://download.geofabrik.de/north-america/us/new-jersey-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-new-mexico, url: "https://download.geofabrik.de/north-america/us/new-mexico-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-new-york, url: "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-north-carolina, url: "https://download.geofabrik.de/north-america/us/north-carolina-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-north-dakota, url: "https://download.geofabrik.de/north-america/us/north-dakota-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-ohio, url: "https://download.geofabrik.de/north-america/us/ohio-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-oklahoma, url: "https://download.geofabrik.de/north-america/us/oklahoma-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-oregon, url: "https://download.geofabrik.de/north-america/us/oregon-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-pennsylvania, url: "https://download.geofabrik.de/north-america/us/pennsylvania-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-puerto-rico, url: "https://download.geofabrik.de/north-america/us/puerto-rico-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-rhode-island, url: "https://download.geofabrik.de/north-america/us/rhode-island-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-south-carolina, url: "https://download.geofabrik.de/north-america/us/south-carolina-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-south-dakota, url: "https://download.geofabrik.de/north-america/us/south-dakota-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-tennessee, url: "https://download.geofabrik.de/north-america/us/tennessee-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-texas, url: "https://download.geofabrik.de/north-america/us/texas-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-utah, url: "https://download.geofabrik.de/north-america/us/utah-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-vermont, url: "https://download.geofabrik.de/north-america/us/vermont-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-virginia, url: "https://download.geofabrik.de/north-america/us/virginia-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-washington, url: "https://download.geofabrik.de/north-america/us/washington-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-west-virginia, url: "https://download.geofabrik.de/north-america/us/west-virginia-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-wisconsin, url: "https://download.geofabrik.de/north-america/us/wisconsin-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-wyoming, url: "https://download.geofabrik.de/north-america/us/wyoming-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
+          - {region: us-virgin-islands, url: "https://download.geofabrik.de/north-america/us/us-virgin-islands-latest.osm.pbf", heap: 8g, free_disk: false, oa_cc: '', oa_clip: '', address_at: ''}
 
     steps:
       - name: Checkout scripts
@@ -137,9 +227,11 @@ jobs:
       - name: Free disk space
         if: matrix.free_disk
         run: |
-          # ubuntu-latest ships ~14 GB free; the two multi-GB extracts need
-          # more than that. The Android SDK (~9 GB), .NET, and Haskell
-          # toolchains are dead weight for this job.
+          # The two multi-GB extracts would need more than ubuntu-latest's
+          # ~14 GB free. The Android SDK (~9 GB), .NET, and Haskell
+          # toolchains are dead weight for this job. (No current matrix
+          # entry sets free_disk — the split left nothing this big — but
+          # the lever stays for the next one that does.)
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
           df -h /
 
@@ -169,19 +261,19 @@ jobs:
           mkdir -p data/sources out
           bash .github/scripts/fetch-extract.sh \
                "${{ matrix.url }}" \
-               "data/sources/${{ matrix.country }}.osm.pbf"
+               "data/sources/${{ matrix.region }}.osm.pbf"
 
       - name: Build PMTiles
         run: |
           java -Xmx${{ matrix.heap }} -jar planetiler.jar \
-            --osm_path="data/sources/${{ matrix.country }}.osm.pbf" \
-            --output="out/atlas-${{ matrix.country }}.pmtiles" \
+            --osm_path="data/sources/${{ matrix.region }}.osm.pbf" \
+            --output="out/atlas-${{ matrix.region }}.pmtiles" \
             --tmpdir="data/tmp" \
             --download \
             --force
           # Free the pbf before the address merge — the extract is the
           # single biggest disk consumer and the archive is already written.
-          rm -f "data/sources/${{ matrix.country }}.osm.pbf"
+          rm -f "data/sources/${{ matrix.region }}.osm.pbf"
 
       - name: Cache tile-join build
         if: matrix.oa_cc != ''
@@ -216,12 +308,34 @@ jobs:
         if: matrix.oa_cc != ''
         run: python3 .github/scripts/fetch-openaddresses.py "${{ matrix.oa_cc }}" out/oa
 
+      # Split-region legs only: `pmtiles extract --bbox` clips the OA
+      # archive to this region before the merge (see oa_clip in the matrix).
+      # Local input, so the "must be clustered" caveat of extract costs only
+      # disk reads, and an empty clip (nunavut — no OA sources inside its
+      # bbox) yields an empty archive tile-join absorbs as a no-op.
+      - name: Fetch pmtiles CLI
+        if: matrix.oa_clip != ''
+        run: |
+          mkdir -p pmtiles-bin
+          curl -sSfL https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz \
+            | tar -xz -C pmtiles-bin
+          pmtiles-bin/pmtiles version
+
       - name: Merge address layer
         if: matrix.oa_cc != ''
         env:
-          COUNTRY: ${{ matrix.country }}
+          REGION: ${{ matrix.region }}
+          OA_CLIP: ${{ matrix.oa_clip }}
         run: |
-          mv "out/atlas-$COUNTRY.pmtiles" "out/atlas-$COUNTRY-base.pmtiles"
+          if [ -n "$OA_CLIP" ]; then
+            mkdir -p out/oa-clip
+            for f in out/oa/*.pmtiles; do
+              pmtiles-bin/pmtiles extract "$f" "out/oa-clip/${f##*/}" --bbox="$OA_CLIP"
+            done
+            rm -rf out/oa
+            mv out/oa-clip out/oa
+          fi
+          mv "out/atlas-$REGION.pmtiles" "out/atlas-$REGION-base.pmtiles"
           # Clip the OA archive(s) to z14 (the only zoom the app indexes
           # the address layer at) and drop the bulk properties (accuracy,
           # hash, id, postcode, ...) — search reads number/street/unit/city
@@ -232,40 +346,40 @@ jobs:
           # search indexer reads; zoom flags are per-invocation, so the base
           # needs its own join without them.
           tippecanoe/tile-join -R data:address -pk \
-            -o "out/atlas-$COUNTRY.pmtiles" "out/atlas-$COUNTRY-base.pmtiles" out/addr-z14.pmtiles
+            -o "out/atlas-$REGION.pmtiles" "out/atlas-$REGION-base.pmtiles" out/addr-z14.pmtiles
           # tile-join widens the bbox to its inputs' union (the OA archive's
           # own header is global); the app bounds its tile sweeps with the
           # archive bbox (its z14 address sweep enumerates the bbox's tile
           # grid), so it must stay the base's.
           python3 .github/scripts/patch-pmtiles-bbox.py \
-            "out/atlas-$COUNTRY-base.pmtiles" "out/atlas-$COUNTRY.pmtiles"
+            "out/atlas-$REGION-base.pmtiles" "out/atlas-$REGION.pmtiles"
           # The intermediates are the archive's size all over again — free
           # them before the upload.
-          rm -f "out/atlas-$COUNTRY-base.pmtiles" out/addr-z14.pmtiles
+          rm -f "out/atlas-$REGION-base.pmtiles" out/addr-z14.pmtiles
 
       - name: Verify PMTiles
         env:
-          COUNTRY: ${{ matrix.country }}
+          REGION: ${{ matrix.region }}
           ADDRESS_AT: ${{ matrix.address_at }}
         run: |
           if [ -n "$ADDRESS_AT" ]; then
             # --address-at= (not --address-at with a space): canada's
             # ADDRESS_AT starts with a minus (-79.38…), which argparse
             # would otherwise read as an unknown option.
-            python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles" --address-at="$ADDRESS_AT"
+            python3 .github/scripts/verify-pmtiles.py "out/atlas-$REGION.pmtiles" --address-at="$ADDRESS_AT"
           else
-            python3 .github/scripts/verify-pmtiles.py "out/atlas-$COUNTRY.pmtiles"
+            python3 .github/scripts/verify-pmtiles.py "out/atlas-$REGION.pmtiles"
           fi
 
       - name: Upload PMTiles
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-pmtiles-${{ matrix.country }}
+          name: atlas-pmtiles-${{ matrix.region }}
           # Tiles are already gzip-compressed inside the archive; storing
           # beats re-deflating multiple GiB.
           compression-level: 0
           retention-days: 7
-          path: out/atlas-${{ matrix.country }}.pmtiles
+          path: out/atlas-${{ matrix.region }}.pmtiles
           if-no-files-found: error
 
       # ── Prebuilt routing ZIP ─────────────────────────────────────────
@@ -311,10 +425,10 @@ jobs:
       # reach.
       - name: Build routing buckets
         env:
-          COUNTRY: ${{ matrix.country }}
+          REGION: ${{ matrix.region }}
         run: |
           ./gradlew :app:graphBuildCli \
-            -Parchive="$GITHUB_WORKSPACE/out/atlas-$COUNTRY.pmtiles" \
+            -Parchive="$GITHUB_WORKSPACE/out/atlas-$REGION.pmtiles" \
             -Pbucket=all \
             -Pout="$GITHUB_WORKSPACE/out/segments" \
             -Pheap=4g
@@ -326,7 +440,7 @@ jobs:
 
       - name: Show routing segments
         env:
-          COUNTRY: ${{ matrix.country }}
+          REGION: ${{ matrix.region }}
         run: |
           # End-to-end proof the dir is adoptable: the manifest names this
           # very archive and its bucket list parses.
@@ -337,7 +451,7 @@ jobs:
       - name: Upload routing artifact
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-routing-${{ matrix.country }}
+          name: atlas-routing-${{ matrix.region }}
           # The .rd5 segments are dense binary; storing beats re-deflating.
           compression-level: 0
           retention-days: 7
@@ -358,10 +472,10 @@ jobs:
       # minutes-to-hours post-import address sweep with a copy.
       - name: Build search index
         env:
-          COUNTRY: ${{ matrix.country }}
+          REGION: ${{ matrix.region }}
         run: |
           ./gradlew :lib:search:searchIndexCli \
-            -Parchive="$GITHUB_WORKSPACE/out/atlas-$COUNTRY.pmtiles" \
+            -Parchive="$GITHUB_WORKSPACE/out/atlas-$REGION.pmtiles" \
             -Pout="$GITHUB_WORKSPACE/out/search" \
             -Pheap=4g
 
@@ -394,7 +508,7 @@ jobs:
       - name: Upload search artifact
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-search-${{ matrix.country }}
+          name: atlas-search-${{ matrix.region }}
           # The index DB is dense binary SQLite; storing beats re-deflating.
           compression-level: 0
           retention-days: 7
