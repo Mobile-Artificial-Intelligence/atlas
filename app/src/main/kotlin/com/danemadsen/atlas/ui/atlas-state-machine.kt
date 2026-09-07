@@ -451,7 +451,10 @@ class AtlasViewModel(
                     zoom = request.zoom,
                 )
                 _locationMenuLabel.value = request.label
-                _locationMenuPoint.value = GeoPoint(request.latitude, request.longitude)
+                // GeoPoint is (lon, lat) — the parser's fields arrive the
+                // other way round, and a swapped pair here lands the menu
+                // point (and the pin) off the map entirely.
+                _locationMenuPoint.value = GeoPoint(request.longitude, request.latitude)
             }
             is MapIntentRequest.Search -> {
                 _pendingSearchQuery.value = request.query

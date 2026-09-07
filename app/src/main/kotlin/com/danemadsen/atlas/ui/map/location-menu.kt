@@ -67,7 +67,9 @@ fun LocationMenuPanel(
             // map behind it does not reach a dismissal handler.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    label ?: "%.5f, %.5f".format(Locale.US, point.lon, point.lat),
+                    // lat, lon — the conventional human-readable coordinate
+                    // order (matches what the user reads off other maps).
+                    label ?: "%.5f, %.5f".format(Locale.US, point.lat, point.lon),
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f),
                 )

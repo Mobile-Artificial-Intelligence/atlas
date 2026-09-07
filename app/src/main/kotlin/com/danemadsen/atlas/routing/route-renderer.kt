@@ -35,8 +35,11 @@ object RouteRenderer {
 
     private const val ROUTE_WIDTH_DP = 5f
     private const val CASING_WIDTH_DP = 9f
-    private const val ENDPOINT_RADIUS_DP = 6f
-    private const val ENDPOINT_STROKE_DP = 2f
+
+    /** Public so the selection pin can render the SAME marker, exactly —
+     * the end-of-route marker and the selection pin are one visual. */
+    const val ENDPOINT_RADIUS_DP = 6f
+    const val ENDPOINT_STROKE_DP = 2f
 
     /** Puts [result]'s line and endpoints on the style; idempotent. */
     fun showRoute(style: Style, result: RouteResult, accentColor: Int, casingColor: Int) {

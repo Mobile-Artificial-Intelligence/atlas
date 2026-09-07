@@ -44,6 +44,7 @@ import com.danemadsen.atlas.nav.NavigationCoordinator
 import com.danemadsen.atlas.routing.GeoPoint
 import com.danemadsen.atlas.routing.LocationPuck
 import com.danemadsen.atlas.routing.RouteRenderer
+import com.danemadsen.atlas.routing.SelectionPin
 import com.danemadsen.atlas.search.PlaceHit
 import com.danemadsen.atlas.ui.AtlasUiState
 import com.danemadsen.atlas.ui.CameraSnapshot
@@ -91,6 +92,9 @@ fun MapScreen() {
     val search_state by view_model.searchState.collectAsStateWithLifecycle()
     val nav_state by view_model.navState.collectAsStateWithLifecycle()
     val selected_place by view_model.selectedPlace.collectAsStateWithLifecycle()
+    // The long-press / search-candidate / geo-intent selection: the pin and
+    // the location menu share this one point, so they can never disagree.
+    val location_menu_point by view_model.locationMenuPoint.collectAsStateWithLifecycle()
     var search_query by remember { mutableStateOf("") }
     val navigating = nav_state is NavigationCoordinator.NavState.Navigating
     // External geo: intents (see ExternalMapIntentHandler): the camera fly
@@ -132,6 +136,7 @@ fun MapScreen() {
                 selectedPlace = selected_place,
                 intentCamera = intent_camera,
                 savedCamera = view_model.savedCamera,
+                selectionPoint = if (navigating) null else location_menu_point,
                 onPlaceShown = view_model::onPlaceShown,
                 onIntentCameraShown = view_model::onIntentCameraShown,
                 onLongPress = view_model::onMapLongPress,
@@ -174,7 +179,6 @@ fun MapScreen() {
             onRetry = view_model::dismissError,
         )
         val active_tab by view_model.activeTab.collectAsStateWithLifecycle()
-        val location_menu_point by view_model.locationMenuPoint.collectAsStateWithLifecycle()
         val location_menu_label by view_model.locationMenuLabel.collectAsStateWithLifecycle()
         val saved_locations by view_model.savedLocations.collectAsStateWithLifecycle()
         val tts_muted by view_model.ttsMuted.collectAsStateWithLifecycle()
@@ -360,6 +364,8 @@ fun AtlasMap(
     selectedPlace: PlaceHit?,
     intentCamera: IntentCameraTarget?,
     savedCamera: CameraSnapshot?,
+    /** The long-press / search-candidate selection to pin, null when none. */
+    selectionPoint: GeoPoint?,
     onPlaceShown: () -> Unit,
     onIntentCameraShown: () -> Unit,
     onLongPress: (GeoPoint) -> Unit,
@@ -600,6 +606,21 @@ fun AtlasMap(
     val map_theme =
         (if (dark_theme) Themes.DARK else Themes.LIGHT).withMaterialAccent(material_accent_argb)
     val casing_argb = themeColorArgb(map_theme.colors.getValue("background"))
+
+    // The selection pin: parked on the long-press / search-candidate point
+    // for exactly as long as the location menu stands open on it. Keyed on
+    // the style too, so a theme restyle (which rebuilds the style from JSON
+    // and silently drops the layer) re-arms it — and on the colors, so the
+    // pin recolors with the theme the way the route line and the
+    // end-of-route marker do.
+    LaunchedEffect(loaded_style, selectionPoint, accent_argb, casing_argb) {
+        val style = loaded_style ?: return@LaunchedEffect
+        if (selectionPoint == null) {
+            SelectionPin.clear(style)
+        } else {
+            SelectionPin.show(style, selectionPoint, accent_argb, casing_argb)
+        }
+    }
 
     LaunchedEffect(map_libre, map_theme, regions) {
         val map = map_libre ?: return@LaunchedEffect
