@@ -18,6 +18,9 @@ enum class RouteProfile(val assetName: String, val label: String) {
 /** A WGS84 position in degrees. */
 data class GeoPoint(val lon: Double, val lat: Double)
 
+/** The selected stop and its exact position in the engine's joined route. */
+data class RouteWaypoint(val point: GeoPoint, val pointIndex: Int)
+
 /**
  * The maneuver kinds the banner/TTS speak, distilled from the engine's
  * own turn commands. `ARRIVE` is the terminal hint at the destination.
@@ -67,6 +70,8 @@ data class RouteResult(
     val points: List<GeoPoint>,
     /** The announced maneuvers, ordered origin -> destination. */
     val turns: List<TurnPoint> = emptyList(),
+    /** Intermediate stops in visit order, excluding origin and destination. */
+    val waypoints: List<RouteWaypoint> = emptyList(),
 )
 
 /** Distance the way Google Maps says it: "850 m", "73.5 km". */

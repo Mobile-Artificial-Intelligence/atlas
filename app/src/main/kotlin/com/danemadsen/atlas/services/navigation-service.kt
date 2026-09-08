@@ -403,6 +403,7 @@ class NavigationService : Service() {
         speaker.speak("Recalculating.")
         cues.play(SoundPlayer.Sound.TURN_MISSED)
         val previous_route = currentRoute
+        val remaining_waypoints = progressEngine?.remainingWaypoints().orEmpty()
         rerouteJob = scope.launch {
             val destination = previous_route?.destination ?: return@launch
             val rerouted = try {
@@ -411,6 +412,7 @@ class NavigationService : Service() {
                     profile = previous_route.profile,
                     origin = from,
                     destination = destination,
+                    waypoints = remaining_waypoints,
                 )
             } catch (e: CancellationException) {
                 throw e
@@ -429,7 +431,22 @@ class NavigationService : Service() {
                 return@launch
             }
             currentRoute = rerouted
-            progressEngine = NavigationProgress(rerouted)
+            // The fix collector kept driving the OLD engine while this
+            // recalculation ran — it can take minutes on a corridor build,
+            // and updates never pause (the shade must keep showing honest
+            // progress). Any stop the old engine consumed in that window
+            // must not resurrect: the captured list routed through it, but
+            // the fresh progress starts over its stops at zero, so it would
+            // guide back and announce "You have reached stop N" twice.
+            val still_remaining = progressEngine?.remainingWaypoints().orEmpty()
+            val fresh = if (still_remaining.size < remaining_waypoints.size) {
+                rerouted.copy(waypoints = rerouted.waypoints.filter { wp ->
+                    still_remaining.any { it == wp.point }
+                })
+            } else {
+                rerouted
+            }
+            progressEngine = NavigationProgress(fresh)
             recalculating = false
             // Refresh the shade right away: it was showing "Recalculating
             // route…" and the next fix could be seconds away.

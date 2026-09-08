@@ -8,6 +8,7 @@ import com.danemadsen.atlas.graph.GraphBuildManager
 import com.danemadsen.atlas.graph.GraphPipeline
 import com.danemadsen.atlas.graph.MultiDirMapSource
 import com.danemadsen.atlas.services.GraphBuildService
+import com.danemadsen.atlas.beerouter.map.MatchedWaypoint
 import com.danemadsen.atlas.beerouter.geo.Position
 import com.danemadsen.atlas.beerouter.router.OsmNodeNamed
 import com.danemadsen.atlas.beerouter.router.OsmTrack
@@ -138,7 +139,17 @@ object RouterGateway {
         origin: GeoPoint,
         destination: GeoPoint,
         onPreparing: suspend (bucket: String?) -> Unit = {},
+        waypoints: List<GeoPoint> = emptyList(),
     ): RouteResult {
+        val route_points = listOf(origin) + waypoints + destination
+        if (route_points.size > MAX_ROUTE_STOPS) throw RouteException("Use at most nine stops")
+        if (route_points.any { !it.lon.isFinite() || it.lon !in -180.0..180.0 ||
+                !it.lat.isFinite() || it.lat !in -90.0..90.0 }) {
+            throw RouteException("Choose valid locations for every stop")
+        }
+        if (route_points.zipWithNext().any { (a, b) -> a == b }) {
+            throw RouteException("Choose different locations for consecutive stops")
+        }
         val app_context = context.applicationContext
         val profile_content: String
         val lookup_content: String
@@ -182,8 +193,12 @@ object RouterGateway {
         // as built and silently steer over the old archive's roads (or
         // fail fast on its built-empty records).
         withContext(Dispatchers.IO) { managers.values.forEach { it.wipeIfArchiveChanged() } }
-        val origin_bucket = GraphPipeline.bucketNameFor(origin.lon, origin.lat)
-        val destination_bucket = GraphPipeline.bucketNameFor(destination.lon, destination.lat)
+        val waypoint_buckets = route_points.map { GraphPipeline.bucketNameFor(it.lon, it.lat) }
+        fun pointLabel(index: Int) = when (index) {
+            0 -> "starting point"
+            route_points.lastIndex -> "destination"
+            else -> "stop $index"
+        }
 
         // The engine only ever names WAYPOINT buckets as missing (its
         // first-file-access check fires in waypoint matching, never during
@@ -192,20 +207,21 @@ object RouterGateway {
         // So the gateway derives the corridor itself — every 5° bucket the
         // straight line origin -> destination passes through — and grows
         // the graph for all of them before the first engine run.
-        val corridor = corridorBuckets(origin, destination)
+        val corridor = route_points.zipWithNext().flatMap { (a, b) -> corridorBuckets(a, b) }.distinct()
 
         // Waypoint buckets first: an origin/destination bucket recorded
         // built-empty (ocean, no routable ways) fails fast and friendly —
         // the engine can never match a waypoint inside such a bucket —
         // before minutes of corridor building.
-        for ((bucket, label) in listOf(origin_bucket to "origin", destination_bucket to "destination")) {
+        for ((index, bucket) in waypoint_buckets.withIndex()) {
+            val label = pointLabel(index)
             val recorded = recordedBucketState(app_context, regions, managers, bucket)
             if (ownerRegion(bucket, regions) == null) throw RouteException(ROUTE_LEAVES)
             if (recorded != null && recorded.rd5 == null) {
                 throw RouteException("no road near the $label")
             }
         }
-        val missing = (listOf(origin_bucket, destination_bucket) + corridor)
+        val missing = (waypoint_buckets + corridor)
             .filter { recordedBucketState(app_context, regions, managers, it) == null }
             .distinct()
         if (missing.size > MAX_BUCKET_BUILDS) {
@@ -227,14 +243,14 @@ object RouterGateway {
             // An empty waypoint bucket is an honest terminal failure —
             // without this check the engine would re-report the bucket as
             // missing forever (an empty bucket never produces an .rd5).
-            if (bucket == origin_bucket || bucket == destination_bucket) {
+            if (bucket in waypoint_buckets) {
                 val built = withContext(Dispatchers.IO) {
                     managers.getValue(owner.id).bucketState(bucket)
                 }
                 if (built?.rd5 == null) {
                     throw RouteException(
                         "no road near the " +
-                            if (bucket == origin_bucket) "origin" else "destination",
+                            pointLabel(waypoint_buckets.indexOf(bucket)),
                     )
                 }
             }
@@ -246,20 +262,20 @@ object RouterGateway {
         // retry once; if that still fails, the destination genuinely is
         // unreachable on this road network.
         var halo_expanded = false
-        var waypoint_neighbors_expanded = false
+        val expanded_waypoint_neighbors = HashSet<GeoPoint>()
         val named_missing = HashSet<String>()
         while (true) {
             try {
                 val result = enrichTurnNames(
                     app_context,
                     regions,
-                    calculate(profile, profile_content, lookup_content, map_source, context_key, origin, destination),
+                    calculate(profile, profile_content, lookup_content, map_source, context_key, origin, destination, waypoints),
                 )
                 // A route that succeeded is the best warmup recipe there
                 // is: its exact waypoint pair is known to match and to
                 // search, so the next process start replays it (see
                 // [warmEngine]) instead of gambling on a bucket center.
-                rememberWarmRoute(app_context, profile, origin, destination)
+                rememberWarmRoute(app_context, profile, origin, route_points[1])
                 return result
             } catch (e: WaypointUnmappedException) {
                 // The engine matches waypoints against segments in the
@@ -272,16 +288,16 @@ object RouterGateway {
                 // close to an edge; an interior miss is a genuine
                 // no-road and must fail fast, not build 8 buckets.
                 currentCoroutineContext().ensureActive()
-                if (waypoint_neighbors_expanded || !nearBucketEdge(e.point)) {
+                if (!expanded_waypoint_neighbors.add(e.point) || !nearBucketEdge(e.point)) {
                     throw RouteException(
-                        if (e.point == origin) "no road near the origin" else "no road near the destination",
+                        "no road near the ${pointLabel(route_points.indexOf(e.point))}",
                     )
                 }
-                waypoint_neighbors_expanded = true
-                val neighbors = haloBuckets(setOf(origin_bucket, destination_bucket))
-                    .filter { recordedBucketState(app_context, regions, managers, it) == null }
+                val neighbors = haloBuckets(setOf(GraphPipeline.bucketNameFor(e.point.lon, e.point.lat)))
+                    .filter { ownerRegion(it, regions) != null &&
+                        recordedBucketState(app_context, regions, managers, it) == null }
                 if (neighbors.isEmpty() || builds + neighbors.size > MAX_BUCKET_BUILDS) {
-                    throw RouteException("no road near the origin or the destination")
+                    throw RouteException("no road near the ${pointLabel(route_points.indexOf(e.point))}")
                 }
                 builds += neighbors.size
                 for (bucket in neighbors) {
@@ -330,7 +346,7 @@ object RouterGateway {
                 // one outside every installed region is simply not
                 // buildable and cannot help the search, so it is skipped
                 // rather than failing the whole route on it.
-                val halo = haloBuckets((corridor + listOf(origin_bucket, destination_bucket)).toSet())
+                val halo = haloBuckets((corridor + waypoint_buckets).toSet())
                     .filter {
                         ownerRegion(it, regions) != null &&
                             recordedBucketState(app_context, regions, managers, it) == null
@@ -370,7 +386,12 @@ object RouterGateway {
         val buckets = LinkedHashSet<String>()
         for (i in 0..steps) {
             val t = i.toDouble() / steps
-            buckets.add(GraphPipeline.bucketNameFor(origin.lon + dlon * t, origin.lat + dlat * t))
+            // The unwrapped dlon carries samples past ±180 (origin 170°E
+            // to destination 170°W samples 170..190); bucketNameFor would
+            // mint phantom "E185"/"E190" names the grid has no cells for
+            // while the real far-side buckets (W180, W175, …) are never
+            // derived. Wrap every sample back into [-180, 180).
+            buckets.add(GraphPipeline.bucketNameFor(wrapLon(origin.lon + dlon * t), origin.lat + dlat * t))
         }
         return buckets.toList()
     }
@@ -639,13 +660,15 @@ object RouterGateway {
         key: ContextKey,
         origin: GeoPoint,
         destination: GeoPoint,
+        waypoints: List<GeoPoint> = emptyList(),
     ): RouteResult = withContext(engine_dispatcher) {
         val routing_context = contextFor(profile, profileContent, lookupContent, mapSource, key)
         val track = try {
-            RoutingEngine(routing_context).doRouting(listOf(
-                waypoint(origin, "from"),
-                waypoint(destination, "to"),
-            ))
+            RoutingEngine(routing_context).doRouting(
+                listOf(waypoint(origin, "from")) + waypoints.mapIndexed { index, point ->
+                    waypoint(point, "stop-${index + 1}").apply { type = MatchedWaypoint.Type.MEETING }
+                } + waypoint(destination, "to"),
+            )
         } catch (e: CancellationException) {
             // No eviction: the engine pairs every per-route mutation with
             // a finally that runs even while the CancellationException
@@ -674,7 +697,20 @@ object RouterGateway {
                 // near a bucket edge whose roads lie across the border) or
                 // terminal (a long-press on a lake).
                 throw WaypointUnmappedException(
-                    if (message.startsWith("from")) origin else destination
+                    when {
+                        message.startsWith("from") -> origin
+                        message.startsWith("stop-") -> waypoints.getOrNull(
+                            // The engine's text is "stop-1-position not
+                            // mapped…": the number ends at the hyphen, not
+                            // a space (substringBefore(" ") keeps
+                            // "1-position", toIntOrNull() fails, and the
+                            // stop would be misattributed to the
+                            // destination — disabling the edge-bucket
+                            // retry for every intermediate stop).
+                            message.substringAfter("stop-").substringBefore("-").toIntOrNull()?.minus(1) ?: -1,
+                        ) ?: destination
+                        else -> destination
+                    }
                 )
             }
             // The island pre-check ("start/target island detected for
@@ -746,6 +782,11 @@ object RouterGateway {
                 GeoPoint(it.position.longitudeDegree, it.position.latitudeDegree)
             },
             turns = turnsOf(track),
+            waypoints = waypoints.mapIndexed { index, point ->
+                val matched = track.matchedWaypoints.firstOrNull { it.name == "stop-${index + 1}" }
+                    ?: throw RouteException("The route could not include stop ${index + 1}")
+                RouteWaypoint(point, matched.indexInTrack.coerceIn(track.nodes.indices))
+            },
         )
     }
 

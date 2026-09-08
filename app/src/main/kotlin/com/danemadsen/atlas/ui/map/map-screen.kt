@@ -1,5 +1,20 @@
 package com.danemadsen.atlas.ui.map
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.material3.Button
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalFocusManager
+import com.danemadsen.atlas.ui.route.DirectionsPanel
+import com.danemadsen.atlas.ui.route.RouteStopPicker
 import android.content.Context
 import android.os.Build
 import android.view.Gravity
@@ -89,6 +104,12 @@ fun MapScreen() {
     val view_model = rememberAtlasViewModel()
     val state by view_model.state.collectAsStateWithLifecycle()
     val route_state by view_model.routeState.collectAsStateWithLifecycle()
+    val route_plan by view_model.routePlan.collectAsStateWithLifecycle()
+    val editing_stop by view_model.editingRouteStop.collectAsStateWithLifecycle()
+    val choosing_on_map by view_model.choosingRoutePointOnMap.collectAsStateWithLifecycle()
+    var top_overlay_height by remember { mutableIntStateOf(0) }
+    var bottom_overlay_height by remember { mutableIntStateOf(0) }
+    val focus_manager = LocalFocusManager.current
     val search_state by view_model.searchState.collectAsStateWithLifecycle()
     val nav_state by view_model.navState.collectAsStateWithLifecycle()
     val selected_place by view_model.selectedPlace.collectAsStateWithLifecycle()
@@ -123,6 +144,20 @@ fun MapScreen() {
         view_model.onPendingSearchQueryShown()
     }
 
+    LaunchedEffect(route_plan != null, editing_stop) {
+        search_query = ""
+        view_model.onSearchQueryChange("")
+        focus_manager.clearFocus()
+    }
+    BackHandler(enabled = route_plan != null && nav_state is NavigationCoordinator.NavState.Idle) {
+        when {
+            choosing_on_map -> view_model.cancelRoutePointOnMap()
+            editing_stop != null -> view_model.cancelRouteStopEdit()
+            location_menu_point != null -> view_model.dismissLocationMenu()
+            else -> view_model.dismissRoute()
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         val ready = state as? AtlasUiState.MapReady
         val regions = ready?.regions ?: emptyList()
@@ -141,6 +176,9 @@ fun MapScreen() {
                 onIntentCameraShown = view_model::onIntentCameraShown,
                 onLongPress = view_model::onMapLongPress,
                 onCameraSettled = view_model::onCameraSettled,
+                onMapPick = if (choosing_on_map) view_model::onMapLongPress else null,
+                routeTopPadding = top_overlay_height,
+                routeBottomPadding = bottom_overlay_height,
             )
         }
         if (ready != null) {
@@ -191,6 +229,7 @@ fun MapScreen() {
                     .fillMaxWidth()
                     // Edge-to-edge: the bar and the results popover under
                     // it must clear the status bar.
+                    .onSizeChanged { top_overlay_height = it.height }
                     .statusBarsPadding()
                     .padding(horizontal = 12.dp),
             ) {
@@ -199,12 +238,39 @@ fun MapScreen() {
                     // what the user needs at a glance is the next maneuver,
                     // not a search field.
                     TurnBanner(snapshot = (nav_state as NavigationCoordinator.NavState.Navigating).snapshot)
+                } else if (active_tab == Tab.MAP && route_plan != null &&
+                    // A session's terminal states (Arrived, Failed) own the
+                    // screen like a live one does — the itinerary editor's
+                    // Reverse / profile chips / Close (which stops the
+                    // session) have no business hovering over them.
+                    nav_state is NavigationCoordinator.NavState.Idle
+                ) {
+                    if (choosing_on_map) {
+                        Surface(shape = MaterialTheme.shapes.large) {
+                            Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = view_model::cancelRoutePointOnMap) { Text("Cancel") }
+                                Text("Tap the map to choose a location", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                    } else if (location_menu_point == null) {
+                        DirectionsPanel(
+                            plan = route_plan!!,
+                            onEdit = view_model::editRouteStop,
+                            onAdd = view_model::addRouteStop,
+                            onRemove = view_model::removeRouteStop,
+                            onMove = view_model::moveRouteStop,
+                            onReverse = view_model::reverseRoute,
+                            onProfile = view_model::selectProfile,
+                            onClose = view_model::dismissRoute,
+                        )
+                    }
                 } else if (active_tab == Tab.MAP) {
                     // The Settings and Saved tabs own the whole screen — a
                     // search field floating over the opaque panel behind
                     // them would be an interactive hole in that panel.
                     SearchBar(
                         query = search_query,
+                        onDirections = view_model::openDirections,
                         onQueryChange = { query ->
                             search_query = query
                             view_model.onSearchQueryChange(query)
@@ -217,7 +283,12 @@ fun MapScreen() {
                     SearchResultsPanel(
                         searchState = search_state,
                         savedLocations = saved_locations,
-                        onOpenRouteMenu = view_model::openPlaceMenu,
+                        onOpenRouteMenu = { place ->
+                            view_model.openPlaceMenu(place)
+                            search_query = ""
+                            view_model.onSearchQueryChange("")
+                            focus_manager.clearFocus()
+                        },
                         onToggleSave = view_model::togglePlaceSaved,
                         modifier = Modifier.padding(top = 4.dp),
                     )
@@ -236,7 +307,8 @@ fun MapScreen() {
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .fillMaxWidth(),
+                        .fillMaxWidth()
+                        .onSizeChanged { bottom_overlay_height = it.height },
                 ) {
                     when (active_tab) {
                         Tab.SETTINGS -> {
@@ -285,11 +357,26 @@ fun MapScreen() {
                         // The long-press location menu: route, save as
                         // Home/Work, save as a plain location, or hand the
                         // point to the rest of the device via the Sharesheet.
-                        LocationMenuPanel(
+                        if (choosing_on_map) {
+                            Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surface) {
+                                Column(Modifier.padding(16.dp)) {
+                                    Text(location_menu_label ?: location_menu_point?.let {
+                                        "%.5f, %.5f".format(java.util.Locale.US, it.lat, it.lon)
+                                    } ?: "Tap a place on the map", style = MaterialTheme.typography.titleMedium)
+                                    Button(
+                                        onClick = view_model::confirmRoutePointOnMap,
+                                        enabled = location_menu_point != null,
+                                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                                    ) { Text("Use this location") }
+                                }
+                            }
+                        } else LocationMenuPanel(
                             point = location_menu_point,
                             label = location_menu_label,
                             onDismiss = view_model::dismissLocationMenu,
                             onRoute = view_model::routeHere,
+                            onRouteFrom = view_model::routeFrom,
+                            onAddStop = if (route_plan?.canAddStop == true) view_model::addMenuPointToRoute else null,
                             onSetSlot = view_model::setSlotFromMenu,
                             onSave = view_model::saveMenuPoint,
                             onShare = { view_model.shareLocation(it) },
@@ -299,9 +386,13 @@ fun MapScreen() {
                         // way out, never a route preview stacked under a
                         // live session.
                         Column {
-                            RoutePreviewPanel(
+                            if (route_plan != null && !choosing_on_map && location_menu_point == null) RoutePreviewPanel(
                                 routeState = route_state,
-                                onProfileSelected = view_model::selectProfile,
+                                canNavigate = route_plan!!.startsAtCurrentLocation,
+                                // Intermediate stops only — the destination
+                                // is not a "stop" the way Google Maps words it.
+                                stopCount = route_plan!!.stops.size - 2,
+                                onUseMyLocation = view_model::useCurrentLocationAsStart,
                                 onStart = {
                                     // Order is deliberate: the session goes
                                     // live first, then the once-per-install
@@ -319,7 +410,11 @@ fun MapScreen() {
                         }
                     }
                     }
-                    MainTabBar(
+                    if (route_plan != null && active_tab == Tab.MAP) {
+                        Surface(color = MaterialTheme.colorScheme.surface) {
+                            Box(Modifier.fillMaxWidth().navigationBarsPadding())
+                        }
+                    } else MainTabBar(
                         activeTab = active_tab,
                         onOpenMap = view_model::closeSettings,
                         onOpenSaved = view_model::openSavedLocations,
@@ -345,6 +440,29 @@ fun MapScreen() {
                 }
             }
         }
+        val editing = route_plan?.stops?.indexOfFirst { it.id == editing_stop } ?: -1
+        if (ready != null && editing >= 0 && !choosing_on_map && nav_state is NavigationCoordinator.NavState.Idle) {
+            key(editing_stop) {
+                // The appended row is the itinerary's last: it is the
+                // destination, whatever letters the rows above carry.
+                val title = when {
+                    editing == 0 -> "Choose starting point"
+                    route_plan != null && editing == route_plan!!.stops.lastIndex -> "Choose destination"
+                    else -> "Choose stop ${('A' + editing - 1)}"
+                }
+                RouteStopPicker(
+                    title = title,
+                    searchState = search_state,
+                    savedLocations = saved_locations,
+                    onQuery = view_model::onSearchQueryChange,
+                    onSelect = { point, label -> view_model.selectRouteStop(point, label) },
+                    onCurrentLocation = { view_model.selectRouteStop(null, currentLocation = true) },
+                    onChooseOnMap = view_model::chooseRoutePointOnMap,
+                    onBack = view_model::cancelRouteStopEdit,
+                )
+            }
+        }
+
     }
 }
 
@@ -370,9 +488,13 @@ fun AtlasMap(
     onLongPress: (GeoPoint) -> Unit,
     onCameraSettled: (CameraSnapshot, from_user_move: Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    onMapPick: ((GeoPoint) -> Unit)? = null,
+    routeTopPadding: Int = 0,
+    routeBottomPadding: Int = 0,
 ) {
     val context = LocalContext.current
     val lifecycle_owner = LocalLifecycleOwner.current
+    val currentMapPick by rememberUpdatedState(onMapPick)
     val map_view = remember { MapView(context) }
     var map_libre by remember { mutableStateOf<MapLibreMap?>(null) }
     // The loaded style instance: a theme restyle replaces it wholesale, and
@@ -466,6 +588,12 @@ fun AtlasMap(
     // arrive with M7).
     LaunchedEffect(map_libre) {
         val map = map_libre ?: return@LaunchedEffect
+        map.addOnMapClickListener { latLng ->
+            currentMapPick?.let { pick ->
+                pick(GeoPoint(latLng.longitude, latLng.latitude))
+                true
+            } ?: false
+        }
         map.addOnMapLongClickListener(MapLibreMap.OnMapLongClickListener { latLng ->
             onLongPress(GeoPoint(latLng.longitude, latLng.latitude))
             true
@@ -704,7 +832,7 @@ fun AtlasMap(
     // camera after a restyle). Keyed on the session boundary (not every
     // snapshot) so ending a session hands the preview route back here.
     val nav_active = navState != NavigationCoordinator.NavState.Idle
-    LaunchedEffect(loaded_style, routeState, nav_active) {
+    LaunchedEffect(loaded_style, routeState, nav_active, routeTopPadding, routeBottomPadding) {
         val style = loaded_style ?: return@LaunchedEffect
         val map = map_libre ?: return@LaunchedEffect
         if (nav_active) return@LaunchedEffect
@@ -738,9 +866,9 @@ fun AtlasMap(
                         bounds.build(),
                         intArrayOf(
                             ROUTE_BOUNDS_PADDING_PX,
+                            routeTopPadding + ROUTE_BOUNDS_PADDING_PX,
                             ROUTE_BOUNDS_PADDING_PX,
-                            ROUTE_BOUNDS_PADDING_PX,
-                            ROUTE_BOUNDS_PADDING_PX,
+                            routeBottomPadding + ROUTE_BOUNDS_PADDING_PX,
                         ),
                     )
                     if (fitted == null) {

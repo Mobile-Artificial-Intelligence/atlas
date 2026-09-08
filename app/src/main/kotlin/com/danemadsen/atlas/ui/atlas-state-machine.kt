@@ -21,6 +21,9 @@ import com.danemadsen.atlas.intent.ExternalMapIntentHandler
 import com.danemadsen.atlas.intent.MapIntentRequest
 import com.danemadsen.atlas.intent.LocationIntentLauncher
 import com.danemadsen.atlas.routing.GeoPoint
+import com.danemadsen.atlas.routing.RoutePlan
+import com.danemadsen.atlas.routing.RoutePlanStore
+import com.danemadsen.atlas.routing.RouteStop
 import com.danemadsen.atlas.routing.RouteProfile
 import com.danemadsen.atlas.routing.RouteResult
 import com.danemadsen.atlas.routing.RouterGateway
@@ -162,7 +165,12 @@ class AtlasViewModel(
     /** The in-flight route job; a new destination cancels the old one. */
     private var routeJob: Job? = null
     private var selectedProfile = RouteProfile.CAR
-    private var lastDestination: GeoPoint? = null
+    private val _routePlan = MutableStateFlow<RoutePlan?>(null)
+    val routePlan = _routePlan.asStateFlow()
+    private val _editingRouteStop = MutableStateFlow<String?>(null)
+    val editingRouteStop = _editingRouteStop.asStateFlow()
+    private val _choosingRoutePointOnMap = MutableStateFlow(false)
+    val choosingRoutePointOnMap = _choosingRoutePointOnMap.asStateFlow()
 
     /** Small persisted app settings (the TTS mute, overlay, saved places). */
     private val prefs =
@@ -300,33 +308,20 @@ class AtlasViewModel(
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
 
     init {
-        // Process death must not silently drop a route the user had:
-        // restore the destination + profile and re-request — the buckets
-        // are already on disk, so the recalculation is seconds, and a
-        // mid-build Preparing re-attaches to the still-running :graph
-        // service through the same ensure path. But NOT while a session
-        // is still driving: NavigationService keeps the process alive
-        // after the activity finishes, and this ViewModel is fresh — the
-        // restore's requestRoute would stop the live navigation.
         if (navState.value is NavigationCoordinator.NavState.Idle) {
-            val saved_lon = saved_state.get<Double>(KEY_DEST_LON)
-            val saved_lat = saved_state.get<Double>(KEY_DEST_LAT)
-            if (saved_lon != null && saved_lat != null) {
-                selectedProfile = saved_state.get<RouteProfile>(KEY_PROFILE) ?: RouteProfile.CAR
-                requestRoute(GeoPoint(saved_lon, saved_lat))
+            val restored = RoutePlanStore.decode(
+                saved_state.get<String>(KEY_ROUTE_PLAN) ?: prefs.getString(KEY_ROUTE_PLAN, null),
+            )
+            if (restored != null) {
+                updateRoutePlan(restored)
             } else {
-                // LMK kills the foreground app without ever running
-                // onSaveInstanceState, so saved_state can come back empty
-                // while prefs (written at request time) still carry the
-                // route the user was mid-way through.
-                val persisted_lon = readPersistedDouble(KEY_DEST_LON)
-                val persisted_lat = readPersistedDouble(KEY_DEST_LAT)
-                if (persisted_lon != null && persisted_lat != null) {
-                    selectedProfile = prefs.getString(KEY_PROFILE, null)
-                        ?.let { name -> RouteProfile.entries.firstOrNull { it.name == name } }
-                        ?: RouteProfile.CAR
-                    requestRoute(GeoPoint(persisted_lon, persisted_lat))
-                }
+                // Migrate older installs that persisted only the destination.
+                val lon = saved_state.get<Double>(KEY_DEST_LON) ?: readPersistedDouble(KEY_DEST_LON)
+                val lat = saved_state.get<Double>(KEY_DEST_LAT) ?: readPersistedDouble(KEY_DEST_LAT)
+                selectedProfile = prefs.getString(KEY_PROFILE, null)
+                    ?.let { name -> RouteProfile.entries.firstOrNull { it.name == name } }
+                    ?: RouteProfile.CAR
+                if (lon != null && lat != null) requestRoute(GeoPoint(lon, lat))
             }
         }
         // Arrival is a terminal state: a kill while sitting on the Arrived
@@ -377,6 +372,7 @@ class AtlasViewModel(
             return
         }
         searchJob?.cancel()
+        _searchState.value = SearchUiState.Idle
         searchJob = viewModelScope.launch {
             delay(SEARCH_DEBOUNCE_MS)
             val ready = state.value as? AtlasUiState.MapReady ?: return@launch
@@ -515,72 +511,163 @@ class AtlasViewModel(
         viewModelScope.launch { GraphBuildCoordinator.triggerSearchIndex(app, force) }
     }
 
-    /**
-     * Long-press destination: routes from the user's current fix to
-     * [destination]. Per the offline product rule, the origin needs
-     * location permission actually granted — denied permission or no fix
-     * means no route, surfaced as Failed rather than silently skipped.
-     */
-    fun requestRoute(destination: GeoPoint) {
-        // A new destination mid-navigation ends the running session: its
-        // route is about to be replaced, and the service's fix loop must
-        // not keep announcing the abandoned one.
-        if (navState.value !is NavigationCoordinator.NavState.Idle) {
-            stopNavigation()
-        }
+    /** Opens the editor with current location and a chosen destination. */
+    fun requestRoute(destination: GeoPoint, label: String? = null) {
+        updateRoutePlan(RoutePlan(
+            stops = listOf(RouteStop(isCurrentLocation = true), RouteStop(point = destination, name = label.orEmpty())),
+            profile = selectedProfile,
+        ))
+    }
+
+    fun openDirections() {
+        dismissLocationMenu()
+        updateRoutePlan(RoutePlan(profile = selectedProfile))
+    }
+
+    fun routeFrom(point: GeoPoint) {
+        val start = RouteStop(point = point, name = _locationMenuLabel.value.orEmpty())
+        val plan = _routePlan.value ?: RoutePlan(profile = selectedProfile)
+        dismissLocationMenu()
+        updateRoutePlan(plan.replace(plan.stops.first().id, start))
+    }
+
+    fun addMenuPointToRoute(point: GeoPoint) {
+        val plan = _routePlan.value ?: return
+        val stop = RouteStop(point = point, name = _locationMenuLabel.value.orEmpty())
+        dismissLocationMenu()
+        updateRoutePlan(plan.add(stop))
+    }
+
+    fun editRouteStop(id: String) {
+        if (_routePlan.value?.stops?.none { it.id == id } != false) return
+        dismissLocationMenu()
+        onSearchQueryChange("")
+        _editingRouteStop.value = id
+        _choosingRoutePointOnMap.value = false
+    }
+
+    fun cancelRouteStopEdit() {
+        _editingRouteStop.value = null
+        _choosingRoutePointOnMap.value = false
+        dismissLocationMenu()
+        onSearchQueryChange("")
+    }
+
+    fun chooseRoutePointOnMap() {
+        _choosingRoutePointOnMap.value = true
+        onSearchQueryChange("")
+    }
+
+    /** Exits map-pick mode but keeps the row being edited open — back and
+     * the picker's Cancel return to the place search, not out of it. */
+    fun cancelRoutePointOnMap() {
+        _choosingRoutePointOnMap.value = false
+        dismissLocationMenu()
+    }
+
+    fun selectRouteStop(point: GeoPoint?, label: String = "", currentLocation: Boolean = false) {
+        val id = _editingRouteStop.value ?: return
+        val plan = _routePlan.value ?: return
+        cancelRouteStopEdit()
+        updateRoutePlan(plan.replace(id, RouteStop(point = point, name = label, isCurrentLocation = currentLocation)))
+    }
+
+    fun confirmRoutePointOnMap() {
+        val point = _locationMenuPoint.value ?: return
+        selectRouteStop(point, _locationMenuLabel.value.orEmpty())
+    }
+
+    fun useCurrentLocationAsStart() {
+        val plan = _routePlan.value ?: return
+        updateRoutePlan(plan.replace(plan.stops.first().id, RouteStop(isCurrentLocation = true)))
+    }
+
+    fun addRouteStop() {
+        val plan = _routePlan.value ?: return
+        if (!plan.canAddStop) return
+        val stop = RouteStop()
+        updateRoutePlan(plan.add(stop))
+        editRouteStop(stop.id)
+    }
+
+    fun removeRouteStop(id: String) {
+        _routePlan.value?.let { updateRoutePlan(it.remove(id)) }
+    }
+
+    fun moveRouteStop(id: String, index: Int) {
+        _routePlan.value?.let { updateRoutePlan(it.move(id, index)) }
+    }
+
+    fun reverseRoute() {
+        _routePlan.value?.let { updateRoutePlan(it.reversed()) }
+    }
+
+    private fun updateRoutePlan(plan: RoutePlan) {
+        if (navState.value !is NavigationCoordinator.NavState.Idle) NavigationCoordinator.stop(app)
         routeJob?.cancel()
-        lastDestination = destination
-        saved_state[KEY_DEST_LON] = destination.lon
-        saved_state[KEY_DEST_LAT] = destination.lat
-        saved_state[KEY_PROFILE] = selectedProfile
-        // The prefs mirror: same data, but it survives the LMK-style
-        // kill that never saves instance state (see init). The
-        // destination persists as its Double's string form — a Float
-        // round-trip loses ~0.2 m, and a long-press within that margin
-        // of the archive boundary would pass insideArchive when pressed
-        // but fail it after restore, stranding a Failed drawer for a
-        // point this app itself accepted.
-        prefs.edit()
-            .putString(KEY_DEST_LON, destination.lon.toString())
-            .putString(KEY_DEST_LAT, destination.lat.toString())
-            .putString(KEY_PROFILE, selectedProfile.name)
-            .apply()
+        // The menu belongs to a point the new plan knows nothing about:
+        // every path that reaches here without dismissing first (a saved
+        // row's Route button while the long-press menu is open, a profile
+        // chip, Retry) would otherwise leave it floating over the new
+        // plan, where "Add stop" / "Directions from here" would act on
+        // the abandoned point.
+        dismissLocationMenu()
+        _activeTab.value = Tab.MAP
+        _routePlan.value = plan
+        selectedProfile = plan.profile
+        val json = RoutePlanStore.encode(plan)
+        saved_state[KEY_ROUTE_PLAN] = json
+        prefs.edit().putString(KEY_ROUTE_PLAN, json)
+            .remove(KEY_DEST_LON).remove(KEY_DEST_LAT).remove(KEY_PROFILE).apply()
+        saved_state.remove<Double>(KEY_DEST_LON)
+        saved_state.remove<Double>(KEY_DEST_LAT)
+        _routeState.value = RouteUiState.Idle
+        if (!plan.isComplete) return
+        _routeState.value = RouteUiState.Preparing(null)
         routeJob = viewModelScope.launch {
-            _routeState.value = RouteUiState.Preparing(null)
-            // A long-press on the gray void beyond every installed region's
-            // tiles can never route — fail before spending a build on it.
-            val regions = repository.loadRegions()
-            if (RegionStore.regionForPoint(regions, destination.lon, destination.lat) == null) {
-                failRoute("the destination is outside the loaded map areas")
-                return@launch
-            }
-            val origin = GraphBuildCoordinator.currentLocationInRegions(app)
-                ?: run {
-                    failRoute(
-                        "no location fix for the origin — grant location permission and wait for a GPS fix",
-                    )
-                    return@launch
-                }
             try {
+                // Debounce rapid reorders; cancellation also invalidates stale results.
+                delay(250)
+                val regions = repository.loadRegions()
+                for ((index, stop) in plan.stops.withIndex()) {
+                    val point = stop.point?.takeUnless { stop.isCurrentLocation } ?: continue
+                    if (RegionStore.regionForPoint(regions, point.lon, point.lat) == null) {
+                        failRoute(
+                            when {
+                                index == 0 -> "The starting point"
+                                index == plan.stops.lastIndex -> "The destination"
+                                else -> "Stop $index"
+                            } + " is outside the loaded map areas",
+                        )
+                        return@launch
+                    }
+                }
+                val current = if (plan.stops.any { it.isCurrentLocation }) {
+                    GraphBuildCoordinator.currentLocationInRegions(app)?.let { GeoPoint(it.longitude, it.latitude) }
+                        ?: run {
+                            failRoute("Your location is unavailable. Choose a starting point, or enable location and wait for a GPS fix.")
+                            return@launch
+                        }
+                } else null
+                val points = plan.resolve(current)
                 val result = RouterGateway.route(
                     context = app,
-                    profile = selectedProfile,
-                    origin = GeoPoint(origin.longitude, origin.latitude),
-                    destination = destination,
-                    onPreparing = { bucket -> _routeState.value = RouteUiState.Preparing(bucket) },
+                    profile = plan.profile,
+                    origin = points.first(),
+                    destination = points.last(),
+                    waypoints = points.drop(1).dropLast(1),
+                    onPreparing = { bucket ->
+                        currentCoroutineContext().ensureActive()
+                        _routeState.value = RouteUiState.Preparing(bucket)
+                    },
                 )
+                currentCoroutineContext().ensureActive()
                 _routeState.value = RouteUiState.Previewing(result)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                // A cancelled job (user long-pressed a new destination, or
-                // pressed Close) must never write terminal state over its
-                // replacement's: the engine runs on Dispatchers.Default
-                // and its failures are delivered into this coroutine even
-                // after cancel, with no suspension point left to re-check.
-                // The explicit check here is the last line of defense.
                 currentCoroutineContext().ensureActive()
-                failRoute(e.message ?: "route failed")
+                failRoute(e.message ?: "Route failed")
             }
         }
     }
@@ -603,10 +690,12 @@ class AtlasViewModel(
      * route can leave it behind for a future launch to resurrect.
      */
     private fun clearPersistedRoute() {
+        saved_state.remove<String>(KEY_ROUTE_PLAN)
         saved_state.remove<Double>(KEY_DEST_LON)
         saved_state.remove<Double>(KEY_DEST_LAT)
         saved_state.remove<RouteProfile>(KEY_PROFILE)
         prefs.edit()
+            .remove(KEY_ROUTE_PLAN)
             .remove(KEY_DEST_LON)
             .remove(KEY_DEST_LAT)
             .remove(KEY_PROFILE)
@@ -631,14 +720,13 @@ class AtlasViewModel(
 
     /** The profile chips: re-run the current route on [profile]. */
     fun selectProfile(profile: RouteProfile) {
-        selectedProfile = profile
-        saved_state[KEY_PROFILE] = profile
-        prefs.edit().putString(KEY_PROFILE, profile.name).apply()
-        lastDestination?.let { requestRoute(it) }
+        val plan = _routePlan.value ?: return
+        if (profile != plan.profile) updateRoutePlan(plan.copy(profile = profile))
     }
 
     /** The preview drawer's Start: hands the route to the navigation runtime. */
     fun startNavigation() {
+        if (_routePlan.value?.startsAtCurrentLocation != true) return
         val result = (_routeState.value as? RouteUiState.Previewing)?.result ?: return
         // Navigation owns the whole screen (banner + panel, no tab bar);
         // leaving whichever tab was open behind it would resurface the
@@ -741,14 +829,16 @@ class AtlasViewModel(
      * save as a location) is the one place slots get set from.
      */
     fun onMapLongPress(point: GeoPoint) {
+        _locationMenuLabel.value = null
         _locationMenuPoint.value = point
     }
 
     /** The menu's Route button: the same choke point every destination
      * uses, then the menu goes away. */
     fun routeHere(point: GeoPoint) {
-        _locationMenuPoint.value = null
-        requestRoute(point)
+        val label = _locationMenuLabel.value
+        dismissLocationMenu()
+        requestRoute(point, label)
     }
 
     /**
@@ -839,7 +929,7 @@ class AtlasViewModel(
      */
     fun goToSavedLocation(location: SavedLocation) {
         _activeTab.value = Tab.MAP
-        requestRoute(GeoPoint(location.lon, location.lat))
+        requestRoute(GeoPoint(location.lon, location.lat), location.name)
     }
 
     /**
@@ -873,7 +963,8 @@ class AtlasViewModel(
         // tears the map's state down, and a later process death must
         // not resurrect the route against the freshly-wiped data.
         routeJob?.cancel()
-        lastDestination = null
+        _routePlan.value = null
+        cancelRouteStopEdit()
         clearPersistedRoute()
         _routeState.value = RouteUiState.Idle
         viewModelScope.launch {
@@ -1002,7 +1093,7 @@ class AtlasViewModel(
 
     /** The Failed drawer's Retry: same destination, fresh attempt. */
     fun reRoute() {
-        lastDestination?.let { requestRoute(it) }
+        _routePlan.value?.let { updateRoutePlan(it) }
     }
 
     fun dismissRoute() {
@@ -1012,7 +1103,8 @@ class AtlasViewModel(
             NavigationCoordinator.stop(app)
         }
         routeJob?.cancel()
-        lastDestination = null
+        _routePlan.value = null
+        cancelRouteStopEdit()
         clearPersistedRoute()
         _routeState.value = RouteUiState.Idle
     }
@@ -1440,6 +1532,7 @@ fun rememberAtlasViewModel(): AtlasViewModel {
     )
 }
 
+private const val KEY_ROUTE_PLAN = "route.plan"
 private const val KEY_DEST_LON = "route.destination.lon"
 private const val KEY_DEST_LAT = "route.destination.lat"
 private const val KEY_PROFILE = "route.profile"

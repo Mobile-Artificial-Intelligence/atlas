@@ -9,6 +9,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddLocationAlt
+import androidx.compose.material.icons.filled.TripOrigin
+import androidx.compose.material.icons.filled.Directions
 import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Place
@@ -45,6 +48,8 @@ fun LocationMenuPanel(
     label: String? = null,
     onDismiss: () -> Unit,
     onRoute: (GeoPoint) -> Unit,
+    onRouteFrom: (GeoPoint) -> Unit,
+    onAddStop: ((GeoPoint) -> Unit)? = null,
     onSetSlot: (SavedSlot) -> Unit,
     onSave: () -> Unit,
     onShare: (GeoPoint) -> Unit = {},
@@ -75,9 +80,11 @@ fun LocationMenuPanel(
                 TextButton(onClick = onDismiss) { Text("Cancel") }
             }
             HorizontalDivider()
-            MenuRow("Route here", Icons.Filled.Place) {
+            MenuRow("Directions", Icons.Filled.Directions) {
                 onRoute(point)
             }
+            MenuRow("Directions from here", Icons.Filled.TripOrigin) { onRouteFrom(point) }
+            onAddStop?.let { add -> MenuRow("Add stop", Icons.Filled.AddLocationAlt) { add(point) } }
             MenuRow("Set as Home", Icons.Filled.Home) {
                 onSetSlot(HOME)
             }

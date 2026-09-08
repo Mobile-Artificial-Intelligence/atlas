@@ -1,6 +1,7 @@
 package com.danemadsen.atlas.beerouter.map.generator
 
 import com.danemadsen.atlas.beerouter.geo.Position
+import com.danemadsen.atlas.beerouter.map.MatchedWaypoint
 import com.danemadsen.atlas.beerouter.map.MapSource
 import com.danemadsen.atlas.beerouter.map.RandomAccessReader
 import com.danemadsen.atlas.beerouter.router.OsmNodeNamed
@@ -49,6 +50,33 @@ class EngineRoutingTest {
             assertTrue(track.distance in 1500..9000, "foot distance ${track.distance}m")
             assertTrue(track.totalSeconds > 300, "foot ETA ${track.totalSeconds}s")
         }
+    }
+
+    @Test
+    fun routesThroughOrderedStopsAndReturnsToTheChosenStart() {
+        val minted = mintSegments()
+        val profileDir = findProfileDir()
+        val context = RoutingContext(
+            profileContent = File(profileDir, "car-vario.brf").readText(),
+            lookupContent = minted.lookupFile.readText(),
+            mapSource = FileMapSource(minted.segments),
+            generateTurns = true,
+        )
+        val points = listOf(
+            OsmNodeNamed(Position.fromDegrees(startLon, startLat)).apply { name = "from" },
+            OsmNodeNamed(Position.fromDegrees(endLon, endLat)).apply {
+                name = "stop-1"
+                type = MatchedWaypoint.Type.MEETING
+            },
+            OsmNodeNamed(Position.fromDegrees(startLon, startLat)).apply { name = "to" },
+        )
+        val track = assertNotNull(kotlinx.coroutines.runBlocking { RoutingEngine(context).doRouting(points) })
+        val via = assertNotNull(track.matchedWaypoints.firstOrNull { it.name == "stop-1" })
+        assertTrue(via.indexInTrack in 1 until track.nodes.lastIndex)
+        assertTrue(track.distance > 3000, "round trip should include both legs: ${track.distance}")
+        assertTrue(track.totalSeconds > 120)
+        assertTrue(track.nodes[via.indexInTrack].distanceTo(points[1]) < 250)
+        assertTrue(track.voiceHints.list.all { it.indexInTrack in track.nodes.indices })
     }
 
     @Test

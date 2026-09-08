@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Directions
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Search
@@ -45,6 +46,7 @@ fun SearchBar(
     query: String,
     onQueryChange: (String) -> Unit,
     modifier: Modifier = Modifier,
+    onDirections: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
 
@@ -82,6 +84,9 @@ fun SearchBar(
                     unfocusedIndicatorColor = Color.Transparent,
                 ),
             )
+            onDirections?.let { open ->
+                IconButton(onClick = open) { Icon(Icons.Default.Directions, "Plan a route", tint = MaterialTheme.colorScheme.primary) }
+            }
             // With text in the field the button clears it (the common
             // next action while typing); the empty field keeps the mic.
             if (query.isNotEmpty()) {

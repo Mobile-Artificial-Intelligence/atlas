@@ -24,6 +24,9 @@ if any dependency ever smuggles one back in through its manifest.
   index (Room FTS) at archive import and as routing data is prepared.
 - **Offline routing** — [BeeRouter](https://codeberg.org/jgillich/beerouter)
   (a BRouter descendant) drives turn-by-turn car, bike, and walking routes.
+  Plan between searched, saved, or map-selected places, with up to nine
+  stops. Edit either endpoint, swap the route, and drag stops into order.
+  Chosen endpoints work without GPS; use **Your location** to start navigation.
   The routing graph is built on demand per 5° region from the same PMTiles
   archive, in a separate process so a heavy build can't disturb navigation.
 - **Turn-by-turn navigation** — GPS (no Play Services), voice guidance via the

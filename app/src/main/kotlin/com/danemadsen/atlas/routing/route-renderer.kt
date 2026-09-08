@@ -1,6 +1,7 @@
 package com.danemadsen.atlas.routing
 
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
@@ -32,6 +33,7 @@ object RouteRenderer {
     private const val ROUTE_LINE_ID = "atlas-route-line"
     private const val ENDPOINT_SOURCE_ID = "atlas-route-endpoint-source"
     private const val ENDPOINT_ID = "atlas-route-endpoint"
+    private const val STOP_LABEL_ID = "atlas-route-stop-label"
 
     private const val ROUTE_WIDTH_DP = 5f
     private const val CASING_WIDTH_DP = 9f
@@ -85,7 +87,7 @@ object RouteRenderer {
             // would put it on top of everything, and the destination is
             // exactly where the user arrives — the puck must win that spot.
             val endpoint = CircleLayer(ENDPOINT_ID, ENDPOINT_SOURCE_ID).withProperties(
-                PropertyFactory.circleRadius(ENDPOINT_RADIUS_DP),
+                PropertyFactory.circleRadius(11f),
                 PropertyFactory.circleColor(accentColor),
                 PropertyFactory.circleStrokeWidth(ENDPOINT_STROKE_DP),
                 PropertyFactory.circleStrokeColor(casingColor),
@@ -105,19 +107,31 @@ object RouteRenderer {
                 ))
             ))
         )
-        // Only the destination gets a marker: every route originates at the
-        // user's live location, where the puck already is — an origin marker
-        // would land on it and paint the dot over.
+        if (style.getLayer(STOP_LABEL_ID) == null) {
+            val labels = SymbolLayer(STOP_LABEL_ID, ENDPOINT_SOURCE_ID).withProperties(
+                PropertyFactory.textField(Expression.get("label")),
+                PropertyFactory.textSize(12f),
+                PropertyFactory.textFont(arrayOf("Roboto-Medium")),
+                PropertyFactory.textColor(casingColor),
+                PropertyFactory.textAllowOverlap(true),
+                PropertyFactory.textIgnorePlacement(true),
+            )
+            val puck = LocationPuck.bottomLayerId(style)
+            if (puck != null) style.addLayerBelow(labels, puck) else style.addLayer(labels)
+        }
+        val stops = listOf(result.origin) + result.waypoints.map { it.point } + result.destination
         (style.getSource(ENDPOINT_SOURCE_ID) as? GeoJsonSource)?.setGeoJson(
-            FeatureCollection.fromFeatures(listOf(
-                Feature.fromGeometry(Point.fromLngLat(result.destination.lon, result.destination.lat)),
-            ))
+            FeatureCollection.fromFeatures(stops.mapIndexed { index, point ->
+                Feature.fromGeometry(Point.fromLngLat(point.lon, point.lat)).apply {
+                    addStringProperty("label", if (index == 0) "●" else ('A' + index - 1).toString())
+                }
+            }),
         )
     }
 
     /** Drops the route layers and sources; safe on a freshly restyled style. */
     fun clear(style: Style) {
-        for (id in listOf(ENDPOINT_ID, ROUTE_LINE_ID, ROUTE_CASING_ID)) {
+        for (id in listOf(STOP_LABEL_ID, ENDPOINT_ID, ROUTE_LINE_ID, ROUTE_CASING_ID)) {
             style.getLayer(id)?.let { style.removeLayer(it) }
         }
         for (id in listOf(ENDPOINT_SOURCE_ID, ROUTE_SOURCE_ID)) {

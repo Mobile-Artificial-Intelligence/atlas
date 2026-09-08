@@ -98,6 +98,13 @@ class NavigationProgress(route: RouteResult) {
             }
         }
 
+    private val waypoints = route.waypoints
+    var completedStops: Int = 0
+        private set
+
+    /** Re-routing must retain every stop the active leg has not reached. */
+    fun remainingWaypoints(): List<GeoPoint> = waypoints.drop(completedStops).map { it.point }
+
     private val destination = route.destination
 
     // ---- per-session state, mutated by update() ----
@@ -167,7 +174,16 @@ class NavigationProgress(route: RouteResult) {
         // loop route, right next to the origin — where a raw-distance gate
         // would "arrive" before the user has moved at all).
         val remaining = (total_along() - along_meters).coerceAtLeast(0.0)
-        val transitioned = remaining <= ARRIVAL_METERS && !arrived
+        if (snap_distance <= OFF_ROUTE_LIMIT_METERS) {
+            while (completedStops < waypoints.size &&
+                along_meters >= cumulative_meters[waypoints[completedStops].pointIndex] - ARRIVAL_METERS
+            ) {
+                completedStops++
+                announcements.add("You have reached stop $completedStops.")
+            }
+        }
+        val transitioned = remaining <= ARRIVAL_METERS && !arrived &&
+            completedStops == waypoints.size && snap_distance <= OFF_ROUTE_LIMIT_METERS
         if (transitioned) {
             arrived = true
             announcements.add("You have arrived.")
@@ -266,10 +282,15 @@ class NavigationProgress(route: RouteResult) {
             val only = points.firstOrNull() ?: fix
             return Triple(0.0, only, metersBetween(fix, only))
         }
-        var best_along = 0.0
-        var best_point = points[0]
-        var best_distance = Double.MAX_VALUE
-        for (i in 0 until points.size - 1) {
+        val legStart = if (completedStops == 0) 0 else waypoints[completedStops - 1].pointIndex
+        var best_along = cumulative_meters[legStart]
+        var best_point = points[legStart]
+        var best_distance = metersBetween(fix, best_point)
+        // Only snap to the active leg. A later leg can share the very same
+        // road (out-and-back trips); searching the whole route skips stops.
+        val startIndex = if (completedStops == 0) 0 else waypoints[completedStops - 1].pointIndex
+        val endIndex = waypoints.getOrNull(completedStops)?.pointIndex ?: points.lastIndex
+        for (i in startIndex until endIndex) {
             val a = points[i]
             val b = points[i + 1]
             val segment_length = metersBetween(a, b)
