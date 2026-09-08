@@ -85,6 +85,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flowOf
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -906,6 +907,12 @@ fun AtlasMap(
         }
     }
 
+    // Camera-session gate: the 10 Hz livePosition effect below owns the
+    // camera while a session runs; this flag lets the per-snapshot effect
+    // move it only for the session's FIRST fix (so the camera lands even
+    // before the first tick arrives), then hands off.
+    var first_nav_camera_done = remember { mutableStateOf(false) }
+
     // Navigation rendering + camera follow: keyed on the whole nav state so
     // every published snapshot (≈1/s) re-renders. The route comes from the
     // NAVIGATING result, not the preview state — a re-route swaps the line
@@ -918,7 +925,8 @@ fun AtlasMap(
             is NavigationCoordinator.NavState.Navigating -> {
                 RouteRenderer.showRoute(style, ns.result, accent_argb, casing_argb)
                 val snapshot = ns.snapshot
-                if (snapshot?.snapped != null) {
+                if (snapshot?.snapped != null && !first_nav_camera_done.value) {
+                    first_nav_camera_done.value = true
                     // cancelTransitions first: a queued preview fit-bounds
                     // (or a stale follow animator) must not fight this move.
                     map.cancelTransitions()
@@ -939,6 +947,7 @@ fun AtlasMap(
 
             is NavigationCoordinator.NavState.Arrived -> {
                 // Keep the completed route visible at the destination.
+                first_nav_camera_done.value = false
                 RouteRenderer.showRoute(style, ns.result, accent_argb, casing_argb)
             }
 
@@ -950,7 +959,35 @@ fun AtlasMap(
                 ns.result?.let { RouteRenderer.showRoute(style, it, accent_argb, casing_argb) }
             }
 
-            NavigationCoordinator.NavState.Idle -> Unit
+            NavigationCoordinator.NavState.Idle -> {
+                first_nav_camera_done.value = false
+            }
+        }
+    }
+
+    // The tick-rate camera: while a session runs and the fix stream is
+    // fresh, the fused position (dead-reckoned between fixes) drives the
+    // camera continuously — gliding between fixes instead of stepping
+    // once a second. Collected INSIDE the effect, never collectAsState:
+    // 10 Hz must not recompose the panel. Bearing comes from the fusion's
+    // drift-corrected heading, keeping the previous camera bearing when
+    // stationary (no arrow to trust yet).
+    LaunchedEffect(loaded_style) {
+        val map = map_libre ?: return@LaunchedEffect
+        NavigationCoordinator.livePosition.filterNotNull().collect { fused ->
+            val ns = NavigationCoordinator.navState.value
+            if (ns !is NavigationCoordinator.NavState.Navigating) return@collect
+            if (!fused.fix_fresh) return@collect
+            map.cancelTransitions()
+            map.moveCamera(
+                CameraUpdateFactory.newCameraPosition(
+                    CameraPosition.Builder()
+                        .target(LatLng(fused.point.lat, fused.point.lon))
+                        .zoom(NAV_ZOOM)
+                        .bearing(fused.heading_deg ?: map.cameraPosition.bearing)
+                        .build(),
+                )
+            )
         }
     }
 
@@ -969,13 +1006,15 @@ fun AtlasMap(
                 val point =
                     ns.snapshot?.snapped ?: (presence as? LocationPresence.Active)?.point
                 val active = presence is LocationPresence.Active
-                LocationPuck.show(style, point, active)
+                // The puck leads with the fused position's heading — the
+                // cone and the camera share one bearing source.
+                LocationPuck.show(style, point, active, heading_deg = NavigationCoordinator.livePosition.value?.heading_deg)
                 if (point != null && active) LocationPuck.startPulse(style)
             }
 
             else -> when (presence) {
                 is LocationPresence.Active -> {
-                    LocationPuck.show(style, presence.point, active = true)
+                    LocationPuck.show(style, presence.point, active = true, heading_deg = presence.heading_deg)
                     LocationPuck.startPulse(style)
                 }
                 is LocationPresence.Lost ->

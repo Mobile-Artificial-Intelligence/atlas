@@ -13,7 +13,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
-import com.danemadsen.atlas.location.LocationTracker
+import com.danemadsen.atlas.location.FusedPositionTracker
 import com.danemadsen.atlas.nav.NavigationCoordinator
 import com.danemadsen.atlas.nav.NavigationProgress
 import com.danemadsen.atlas.nav.SoundPlayer
@@ -292,69 +292,83 @@ class NavigationService : Service() {
                     }
                 }
                 var last_notification_at = 0L
-                // conflate: while a fix is being processed the stream can
-                // produce more; only the newest matters (it is the
-                // position, not an event).
-                LocationTracker.fixes(this@NavigationService).conflate().collect { fix ->
+                // conflate: while a fix-confirmed emission is being
+                // processed the fused stream can produce more; only the
+                // newest matters (it is the position, not an event). The
+                // service's collection is also what keeps the sensors
+                // registered for the whole session — screen off included.
+                FusedPositionTracker.fused(this@NavigationService).conflate().collect { fused ->
                     if (sessionOver) return@collect
 
-                    if (signalLost) {
-                        signalLost = false
-                        cues.play(SoundPlayer.Sound.GPS_CONNECTED)
-                    }
-                    latest_fix_ms.set(System.currentTimeMillis())
+                    if (fused.fix_confirmed) {
+                        // Fix-paced body: exactly what a raw fix used to
+                        // drive, but from the blended estimate at fix time
+                        // — smoother TTS cadence, drift-corrected heading
+                        // instead of the noisy chip bearing.
+                        if (signalLost) {
+                            signalLost = false
+                            cues.play(SoundPlayer.Sound.GPS_CONNECTED)
+                        }
+                        latest_fix_ms.set(System.currentTimeMillis())
 
-                    val engine = progressEngine ?: return@collect
-                    val current = currentRoute ?: return@collect
-                    val step = engine.update(fix.point, fix.bearing)
-                    for (announcement in step.events.announcements) {
-                        speaker.speak(announcement)
-                    }
-                    for (turn in step.events.turnsConsumed) {
-                        cues.play(SoundPlayer.Sound.TURN_NOW)
-                    }
+                        val engine = progressEngine ?: return@collect
+                        val current = currentRoute ?: return@collect
+                        val step = engine.update(fused.point, fused.heading_deg)
+                        for (announcement in step.events.announcements) {
+                            speaker.speak(announcement)
+                        }
+                        for (turn in step.events.turnsConsumed) {
+                            cues.play(SoundPlayer.Sound.TURN_NOW)
+                        }
 
-                    if (step.events.arrived) {
-                        sessionOver = true
-                        NavigationCoordinator.publishArrived(session, current)
-                        // The ongoing notification dies with the service;
-                        // this transient one is what the shade still shows
-                        // afterwards.
-                        notifyNavEnded("Arrived at your destination")
-                        stopSelf()
-                        return@collect
-                    }
+                        if (step.events.arrived) {
+                            sessionOver = true
+                            NavigationCoordinator.publishArrived(session, current)
+                            // The ongoing notification dies with the service;
+                            // this transient one is what the shade still shows
+                            // afterwards.
+                            notifyNavEnded("Arrived at your destination")
+                            stopSelf()
+                            return@collect
+                        }
 
-                    if (sessionOver) return@collect
-                    val coordinator_state =
-                        NavigationCoordinator.navState.value as? NavigationCoordinator.NavState.Navigating
-                    val muted = coordinator_state?.muted ?: false
-                    speaker.muted = muted
-                    NavigationCoordinator.publishProgress(
-                        session = session,
-                        result = current,
-                        snapshot = step.snapshot,
-                        muted = muted,
-                        ttsAvailable = speaker.available,
-                        recalculating = recalculating,
-                    )
-                    // The banner renders exactly what was published —
-                    // reading the coordinator back keeps the overlay, the
-                    // notification, and the banner one-render-stale
-                    // consistently.
-                    overlay?.update(NavigationCoordinator.navState.value)
+                        if (sessionOver) return@collect
+                        val coordinator_state =
+                            NavigationCoordinator.navState.value as? NavigationCoordinator.NavState.Navigating
+                        val muted = coordinator_state?.muted ?: false
+                        speaker.muted = muted
+                        NavigationCoordinator.publishProgress(
+                            session = session,
+                            result = current,
+                            snapshot = step.snapshot,
+                            muted = muted,
+                            ttsAvailable = speaker.available,
+                            recalculating = recalculating,
+                        )
+                        // The banner renders exactly what was published —
+                        // reading the coordinator back keeps the overlay, the
+                        // notification, and the banner one-render-stale
+                        // consistently.
+                        overlay?.update(NavigationCoordinator.navState.value)
 
-                    if (step.events.recalculate && !recalculating && mayReroute(fix.point)) {
-                        startReroute(session, fix.point, speaker, cues)
-                    }
+                        if (step.events.recalculate && !recalculating && mayReroute(fused.point)) {
+                            startReroute(session, fused.point, speaker, cues)
+                        }
 
-                    val now = System.currentTimeMillis()
-                    if (now - last_notification_at > NOTIFICATION_UPDATE_MS) {
-                        last_notification_at = now
-                        // The explicit step.snapshot, not the coordinator's
-                        // published copy — the publish may be one fix stale
-                        // and the shade should match the banner exactly.
-                        updateNotification(current, step.snapshot, arrived = false)
+                        val now = System.currentTimeMillis()
+                        if (now - last_notification_at > NOTIFICATION_UPDATE_MS) {
+                            last_notification_at = now
+                            // The explicit step.snapshot, not the coordinator's
+                            // published copy — the publish may be one fix stale
+                            // and the shade should match the banner exactly.
+                            updateNotification(current, step.snapshot, arrived = false)
+                        }
+                    } else {
+                        // Tick-paced: 10 Hz camera/puck fuel. NO engine
+                        // update here — NavigationProgress stays fix-paced;
+                        // extrapolated ticks must not double-integrate
+                        // along-route distance or advance turns on a fiction.
+                        NavigationCoordinator.publishLivePosition(session, fused)
                     }
                 }
             } finally {

@@ -17,6 +17,11 @@
 
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- The step detector is gated behind ACTIVITY_RECOGNITION on API 29+.
+         Optional at runtime — a denial only drops walking-mode dead
+         reckoning to the driving-style extrapolator — but the manifest
+         entry must exist for the runtime request to be grantable. -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
     <!-- The :graph process holds the whole bucket in memory during builds. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />

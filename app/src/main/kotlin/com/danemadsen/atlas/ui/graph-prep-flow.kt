@@ -105,6 +105,13 @@ fun GraphPrepFlow(state: AtlasUiState, routeState: RouteUiState) {
             if (Build.VERSION.SDK_INT >= 33) {
                 wanted.add(Manifest.permission.POST_NOTIFICATIONS)
             }
+            // Step-detector gate (API 29+). Asked alongside location but
+            // NOT checked in the launcher callback — a denial here only
+            // degrades walking dead reckoning to the driving-style
+            // extrapolator; location remains the sole blocker.
+            if (Build.VERSION.SDK_INT >= 29) {
+                wanted.add(Manifest.permission.ACTIVITY_RECOGNITION)
+            }
             launcher.launch(wanted.toTypedArray())
         }
     }

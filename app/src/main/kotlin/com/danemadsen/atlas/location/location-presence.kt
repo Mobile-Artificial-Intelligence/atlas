@@ -4,13 +4,10 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import com.danemadsen.atlas.routing.GeoPoint
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.emitAll
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.transformLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 /**
  * The user's location as the map sees it: every fix becomes
@@ -29,7 +26,11 @@ import kotlinx.coroutines.flow.transformLatest
 sealed interface LocationPresence {
 
     /** A fresh fix landed; the puck is blue and pulsing. */
-    data class Active(val point: GeoPoint, val at_ms: Long) : LocationPresence
+    data class Active(
+        val point: GeoPoint,
+        val at_ms: Long,
+        val heading_deg: Double? = null,
+    ) : LocationPresence
 
     /** The stream went quiet; the puck goes grey at the last fix. */
     data class Lost(val point: GeoPoint) : LocationPresence
@@ -45,35 +46,35 @@ object LocationPresenceTracker {
             PackageManager.PERMISSION_GRANTED
 
     /**
-     * The catch is load-bearing: [LocationTracker.fixes] closes with an
+     * The catch is load-bearing: the fused stream closes with an
      * exception when the GPS provider is missing outright (a GPS-less
      * device) — an uncaught failure would take down whichever coroutine
      * collects this. Swallowing it just ends the stream early: no more
      * presence, the puck stays at whatever it last showed, and no crash.
+     *
+     * distinctUntilChanged keeps the map-side collector from redrawing
+     * the puck between real changes — ticks differ only in position
+     * fractions, and Lost repeats its point forever.
      */
     fun observe(context: Context): Flow<LocationPresence> =
-        LocationTracker.fixes(context)
-            .withLossThreshold(SIGNAL_LOST_MS)
+        FusedPositionTracker.fused(context)
+            .map(::toPresence)
+            .distinctUntilChanged()
             .catch { }
 }
 
 /**
- * The [LocationPresence] state machine over any fix stream, top-level for
- * the unit tests: each fix re-arms a loss timeout at its own position, so
- * the timeout that fires is always the newest one's. The last fix's
- * timeout outlives upstream completion — a stream that ends emits Lost
- * exactly once more.
+ * The [LocationPresence] mapping over the fused position: a fresh fix
+ * stream means Active at the fused estimate (the puck leads and glides
+ * with dead reckoning), a stale one means Lost at the same point — the
+ * puck goes grey but does not jump back to the last raw fix. The wall
+ * clock of the LAST FIX rides along in Active.at_ms so the resume
+ * re-judge (map-screen) can re-judge staleness after a lifecycle pause,
+ * when this flow's loss timer is dead.
  */
-@OptIn(ExperimentalCoroutinesApi::class)
-internal fun Flow<LocationTracker.Fix>.withLossThreshold(
-    lostMs: Long,
-): Flow<LocationPresence> =
-    transformLatest { fix ->
-        emit(LocationPresence.Active(fix.point, fix.at_ms))
-        emitAll(
-            flow {
-                delay(lostMs)
-                emit(LocationPresence.Lost(fix.point))
-            }
-        )
+internal fun toPresence(pos: PositionFusion.FusedPosition): LocationPresence =
+    if (pos.fix_fresh) {
+        LocationPresence.Active(pos.point, pos.last_fix_at_ms, pos.heading_deg)
+    } else {
+        LocationPresence.Lost(pos.point)
     }

@@ -40,6 +40,9 @@ object LocationTracker {
                 Fix(
                     point = GeoPoint(location.longitude, location.latitude),
                     bearing = if (location.hasBearing()) location.bearing.toDouble() else null,
+                    accuracy_m = if (location.hasAccuracy()) location.accuracy else null,
+                    speed_mps = if (location.hasSpeed()) location.speed else null,
+                    at_elapsed_ms = (location.elapsedRealtimeNanos / 1_000_000L),
                 ),
             )
         }
@@ -60,10 +63,21 @@ object LocationTracker {
      * one, and the wall clock it landed — the puck's staleness check reads
      * it after a lifecycle pause (the loss timer does not survive
      * backgrounding, so resume re-judges the last fix by its age).
+     *
+     * The dead-reckoning fusion reads three more fields, all nullable/
+     * defaulted so existing constructors keep compiling: the chip's own
+     * error estimate, its Doppler speed, and the monotonic measurement
+     * time (fixes land up to a second stale; blending an extrapolation
+     * against wall-clock receipt time would corrupt the residual). The
+     * pure-JVM fusion tests pass 0 and null — a default would throw
+     * `Stub!` on SystemClock, so no default is taken from the device here.
      */
     data class Fix(
         val point: GeoPoint,
         val bearing: Double?,
         val at_ms: Long = System.currentTimeMillis(),
+        val accuracy_m: Float? = null,
+        val speed_mps: Float? = null,
+        val at_elapsed_ms: Long = 0L,
     )
 }

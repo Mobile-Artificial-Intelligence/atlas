@@ -1,10 +1,19 @@
 package com.danemadsen.atlas.routing
 
 import android.animation.ValueAnimator
+import android.content.res.Resources
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Path
 import android.view.animation.LinearInterpolator
+import com.google.gson.JsonObject
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.PropertyFactory
+import org.maplibre.android.style.layers.Property
+import org.maplibre.android.style.expressions.Expression
+import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
@@ -29,6 +38,8 @@ object LocationPuck {
     private const val SOURCE_ID = "atlas-location-source"
     private const val PULSE_ID = "atlas-location-pulse"
     private const val HALO_ID = "atlas-location-halo"
+    private const val HEADING_ID = "atlas-location-heading"
+    private const val HEADING_IMAGE_ID = "atlas-location-heading-cone"
     private const val DOT_ID = "atlas-location-dot"
 
     private const val ACTIVE_COLOR = 0xFF1A73E8.toInt()
@@ -42,6 +53,8 @@ object LocationPuck {
     private const val PULSE_MAX_DP = 26f
     private const val PULSE_PERIOD_MS = 2_400L
     private const val PULSE_MAX_OPACITY = 0.35f
+    private const val HEADING_SIZE_DP = 28
+    private const val HEADING_OPACITY = 0.55f
 
     /** The running echo animator plus the style it talks to. */
     private var pulse_animator: ValueAnimator? = null
@@ -61,7 +74,7 @@ object LocationPuck {
      * and resets its layer: the echo must not freeze mid-ring at the loss
      * moment.
      */
-    fun show(style: Style, point: GeoPoint?, active: Boolean) {
+    fun show(style: Style, point: GeoPoint?, active: Boolean, heading_deg: Double? = null) {
         if (!active) stopPulse()
         if (style.getLayer(DOT_ID) == null) {
             if (style.getSource(SOURCE_ID) == null) {
@@ -86,6 +99,27 @@ object LocationPuck {
                 PropertyFactory.circleStrokeWidth(STROKE_WIDTH_DP),
                 PropertyFactory.circleStrokeColor(STROKE_COLOR),
             ))
+            // The heading cone rides the same source, rotated per feature
+            // property so 10 Hz updates only repaint the source, never
+            // touch layer properties. Added below the dot so the dot
+            // stays readable on top; armed on every arm pass so a restyle
+            // re-adds it before the next fix lands.
+            style.addImage(
+                HEADING_IMAGE_ID,
+                headingConeBitmap(),
+            )
+            style.addLayerBelow(
+                SymbolLayer(HEADING_ID, SOURCE_ID).withProperties(
+                    PropertyFactory.iconImage(HEADING_IMAGE_ID),
+                    PropertyFactory.iconRotate(Expression.get("heading")),
+                    PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_MAP),
+                    PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_MAP),
+                    PropertyFactory.iconAllowOverlap(true),
+                    PropertyFactory.iconIgnorePlacement(true),
+                    PropertyFactory.iconOpacity(0f),
+                ),
+                DOT_ID,
+            )
         }
         val dot_color = if (active) ACTIVE_COLOR else LOST_COLOR
         style.getLayer(DOT_ID)?.setProperties(PropertyFactory.circleColor(dot_color))
@@ -110,9 +144,23 @@ object LocationPuck {
                 PropertyFactory.circleOpacity(0f),
             )
         }
+        // The cone is visible only while active AND with a heading; a
+        // grey puck hides it (the flat-grey design carries no arrow).
+        style.getLayer(HEADING_ID)?.setProperties(
+            PropertyFactory.iconOpacity(
+                if (active && heading_deg != null) HEADING_OPACITY else 0f,
+            ),
+        )
         val features = point?.let {
-            listOf(Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)))
-        } ?: emptyList()
+            val geometry = Point.fromLngLat(it.lon, it.lat)
+            if (heading_deg != null) {
+                val props = JsonObject()
+                props.addProperty("heading", heading_deg)
+                Feature.fromGeometry(geometry, props)
+            } else {
+                Feature.fromGeometry(geometry)
+            }
+        }?.let(::listOf) ?: emptyList()
         (style.getSource(SOURCE_ID) as? GeoJsonSource)?.setGeoJson(
             FeatureCollection.fromFeatures(features)
         )
@@ -170,4 +218,28 @@ object LocationPuck {
 
     private fun emptyCollection(): FeatureCollection =
         FeatureCollection.fromFeatures(emptyList())
+
+    /**
+     * A 120° wedge pointing up (iconRotate turns it clockwise to the
+     * heading): canvas-drawn so there's no drawable asset and no theme
+     * coupling. 28 dp square, active blue at cone opacity.
+     */
+    private fun headingConeBitmap(): Bitmap {
+        val density = Resources.getSystem().displayMetrics.density
+        val size_px = (HEADING_SIZE_DP * density).toInt()
+        val bitmap = Bitmap.createBitmap(size_px, size_px, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = ACTIVE_COLOR
+            style = Paint.Style.FILL
+        }
+        val path = Path()
+        // A 120° wedge: apex low, wings 120° apart at the top.
+        path.moveTo(size_px / 2f, size_px * 0.93f)
+        path.lineTo(size_px / 2f - size_px * 0.49f, size_px * 0.07f)
+        path.lineTo(size_px / 2f + size_px * 0.49f, size_px * 0.07f)
+        path.close()
+        canvas.drawPath(path, paint)
+        return bitmap
+    }
 }

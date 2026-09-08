@@ -2,6 +2,7 @@ package com.danemadsen.atlas.nav
 
 import android.content.Context
 import android.content.Intent
+import com.danemadsen.atlas.location.PositionFusion
 import com.danemadsen.atlas.routing.RouteResult
 import com.danemadsen.atlas.services.NavigationService
 import java.util.concurrent.atomic.AtomicLong
@@ -58,6 +59,22 @@ object NavigationCoordinator {
 
     private val _navState = MutableStateFlow<NavState>(NavState.Idle)
     val navState: StateFlow<NavState> = _navState.asStateFlow()
+
+    /**
+     * The fused position at tick rate (10 Hz), deliberately separate from
+     * navState: navState recomposes the banner, notification, and Auto at
+     * fix pace, while livePosition must never recompose the map panel —
+     * the camera effect collects it inside a LaunchedEffect and moves the
+     * camera directly. Session-token-checked like every other publish.
+     */
+    private val _livePosition = MutableStateFlow<PositionFusion.FusedPosition?>(null)
+    val livePosition: StateFlow<PositionFusion.FusedPosition?> = _livePosition.asStateFlow()
+
+    /** Tick-rate position publish; a stale session's ticks are dropped. */
+    fun publishLivePosition(session: Long, pos: PositionFusion.FusedPosition) {
+        if (session != active_session) return
+        _livePosition.value = pos
+    }
 
     /**
      * The route to navigate, handed to the service before its start
@@ -132,6 +149,7 @@ object NavigationCoordinator {
         val stopping = active_session
         active_session = 0L
         _navState.value = NavState.Idle
+        _livePosition.value = null
         context.startService(
             Intent(context, NavigationService::class.java)
                 .setAction(NavigationService.ACTION_STOP)
@@ -176,6 +194,7 @@ object NavigationCoordinator {
     fun clearTerminalState() {
         if (_navState.value is NavState.Arrived || _navState.value is NavState.Failed) {
             _navState.value = NavState.Idle
+            _livePosition.value = null
         }
     }
 
@@ -216,5 +235,6 @@ object NavigationCoordinator {
         if (session != 0L && session != active_session) return
         active_session = 0L
         _navState.value = NavState.Idle
+        _livePosition.value = null
     }
 }
