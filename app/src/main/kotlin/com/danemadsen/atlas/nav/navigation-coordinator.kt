@@ -62,7 +62,7 @@ object NavigationCoordinator {
 
     /**
      * The fused position at tick rate (10 Hz), deliberately separate from
-     * navState: navState recomposes the banner, notification, and Auto at
+     * navState: navState updates the banner and notification at
      * fix pace, while livePosition must never recompose the map panel —
      * the camera effect collects it inside a LaunchedEffect and moves the
      * camera directly. Session-token-checked like every other publish.
@@ -158,8 +158,8 @@ object NavigationCoordinator {
     }
 
     /**
-     * One mute path for three callers (phone panel, shade action, Android
-     * Auto action): flips the live session's mute and persists it, so the
+     * One mute path for the phone panel and notification shade action:
+     * flips the live session's mute and persists it, so the
      * state the UI mirrors, what the speaker reads, and the NEXT session's
      * seed all agree — a shade mute survives process death like a panel
      * mute always did.
@@ -183,19 +183,6 @@ object NavigationCoordinator {
         if (!startArmed) return null
         startArmed = false
         return pendingRoute
-    }
-
-    /**
-     * Non-service consumers (the Android Auto screen) closing a terminal
-     * state the service already retired: arrival and re-route failure
-     * reset the token themselves, so no token check and no service intent
-     * here — purely a state flip. No-op for non-terminal states.
-     */
-    fun clearTerminalState() {
-        if (_navState.value is NavState.Arrived || _navState.value is NavState.Failed) {
-            _navState.value = NavState.Idle
-            _livePosition.value = null
-        }
     }
 
     // ---- service-side publishers (single writer: the fix loop) ----

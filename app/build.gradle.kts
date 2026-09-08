@@ -72,12 +72,6 @@ android {
             if (release_signing_complete) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            // Sideloading gate: Android Auto's phone host hides any app not
-            // from the Play Store unless the APK is debuggable (plus the
-            // "Unknown sources" toggle in AA's developer settings). Without
-            // this flag Atlas never shows in the AA app menu — silent, no
-            // error. TODO(release): flip off for store builds.
-            isDebuggable = true
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -112,10 +106,6 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.savedstate)
 
     implementation(libs.maplibre.android)
-    // Car-app library: Android Auto projection of the live session. AAR
-    // verified to declare zero permissions; NoNetworkPermissionCheck keeps
-    // the offline guarantee structural if a future bump changes that.
-    implementation(libs.androidx.car.app)
 
     implementation(project(":lib:pmtiles"))
     implementation(project(":lib:map-style"))
@@ -139,9 +129,6 @@ dependencies {
     // throw "not mocked", and the region registry persists its index
     // through JSONObject/JSONArray.
     testImplementation("org.json:json:20240303")
-    // Session-level car tests later if wanted; plain-JVM model tests below
-    // need only the main artifact.
-    testImplementation(libs.androidx.car.app.testing)
     testImplementation(libs.coroutines.core)
     testImplementation(libs.coroutines.test)
     androidTestImplementation(libs.androidx.test.junit)
